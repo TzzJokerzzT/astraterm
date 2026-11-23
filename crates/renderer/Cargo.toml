@@ -1,0 +1,21 @@
+[package]
+name = "astraterm-renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+astraterm-core = { workspace = true }
+astraterm-config = { workspace = true }
+astraterm-terminal = { workspace = true }
+bytemuck = { version = "1", features = ["derive"] }
+cosmic-text = { workspace = true }
+glyphon = { workspace = true }
+pollster = "0.4"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }
+
+[dev-dependencies]
+alacritty_terminal = { workspace = true }
