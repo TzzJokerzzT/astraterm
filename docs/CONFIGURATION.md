@@ -288,7 +288,7 @@ Every action is configurable in `[keys]`. Defaults:
 | `search-next` | `ctrl+g` | Jumps to the next match |
 | `search-previous` | `ctrl+shift+g` | Jumps to the previous match |
 | `copy` | `ctrl+shift+c` | Copies the current selection to the clipboard |
-| `paste` | `ctrl+shift+v` | Pastes, honouring bracketed paste |
+| `paste` | `ctrl+shift+v` | Pastes, honouring bracketed paste; refuses payloads over 8 MiB |
 | `scroll-page-up` | `shift+pageup` | Scrolls the viewport one page into the scrollback |
 | `scroll-page-down` | `shift+pagedown` | Scrolls one page back towards the prompt |
 | `scroll-to-top` | `ctrl+shift+home` | Scrolls to the oldest line |

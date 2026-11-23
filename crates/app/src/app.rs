@@ -20,9 +20,7 @@ use astraterm_platform::linux;
 use astraterm_platform::paths::StatePaths;
 use astraterm_platform::system::SystemMonitor;
 use astraterm_settings_ui::panel::{PanelAction, PanelKey, SettingsPanel};
-use astraterm_terminal::input::{
-    self, MouseEvent, MouseKind, encode_key, encode_mouse, encode_paste,
-};
+use astraterm_terminal::input::{self, MouseEvent, MouseKind, encode_key, encode_mouse};
 use astraterm_workspace::snapshot::{WorkspaceSnapshot, restore_window, snapshot_window};
 use astraterm_workspace::{Pane, Tab, WindowState};
 use winit::application::ApplicationHandler;
@@ -34,6 +32,7 @@ use winit::window::{Window, WindowId as WinitWindowId};
 
 use crate::cli::Cli;
 use crate::keys;
+use crate::paste;
 use crate::prefs::{FONT_SIZE_STEP, Preferences, next_font_size};
 use crate::ui::{
     ClickInfo, ConfirmDialog, DragState, ExitCleanup, Overlay, PendingAction, RenameOverlay,
@@ -47,6 +46,12 @@ pub enum UserEvent {
     Wake,
     /// The configuration file changed on disk.
     ConfigChanged,
+    /// A clipboard read finished off the event loop and is ready to send.
+    PasteReady {
+        window: WinitWindowId,
+        pane: PaneId,
+        result: Result<String, String>,
+    },
 }
 
 /// Application state shared by all windows.
@@ -1279,11 +1284,37 @@ impl Application {
         else {
             return;
         };
-        let Some(text) = self.clipboard.get(ClipboardSelection::Clipboard) else {
-            self.with_window(window_id, |ui| {
-                ui.set_status("clipboard is unavailable (install wl-clipboard or xclip)");
+        // Reading the selection spawns a helper process and waits for the owner to
+        // answer, so it runs off the event loop; the text comes back as an event.
+        let clipboard = self.clipboard.clone();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let result = clipboard
+                .get(ClipboardSelection::Clipboard)
+                .ok_or_else(|| {
+                    "clipboard is unavailable (install wl-clipboard or xclip)".to_owned()
+                });
+            let _ = proxy.send_event(UserEvent::PasteReady {
+                window: window_id,
+                pane,
+                result,
             });
-            return;
+        });
+    }
+
+    /// Sends a clipboard payload that was read off the event loop.
+    fn finish_paste(
+        &mut self,
+        window_id: WinitWindowId,
+        pane: PaneId,
+        result: Result<String, String>,
+    ) {
+        let text = match result {
+            Ok(text) => text,
+            Err(message) => {
+                self.with_window(window_id, |ui| ui.set_status(message));
+                return;
+            }
         };
         let Some(modes) = self
             .sessions
@@ -1292,9 +1323,15 @@ impl Application {
         else {
             return;
         };
-        let bytes = encode_paste(&text, modes);
-        if let Some(session) = self.sessions.for_pane_mut(pane) {
-            session.write(&bytes);
+        match paste::encode_pasted_text(&text, modes) {
+            Ok(bytes) => {
+                if let Some(session) = self.sessions.for_pane_mut(pane) {
+                    session.write(&bytes);
+                }
+            }
+            Err(error) => {
+                self.with_window(window_id, |ui| ui.set_status(error.message()));
+            }
         }
     }
 
@@ -2293,6 +2330,11 @@ impl ApplicationHandler<UserEvent> for Application {
             UserEvent::ConfigChanged => {
                 self.watcher_deadline = Some(Instant::now() + Duration::from_millis(250));
             }
+            UserEvent::PasteReady {
+                window,
+                pane,
+                result,
+            } => self.finish_paste(window, pane, result),
         }
     }
 
