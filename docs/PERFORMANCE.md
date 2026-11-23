@@ -35,6 +35,20 @@ Structural tests that pin these rules:
 - `crates/renderer/src/text.rs`: `shaping_populates_the_cache_and_is_reused`,
   `changed_content_reshapes_the_row`.
 
+## Timers
+
+Everything is event-driven except two deliberate timers, both of which stop when
+they are not needed:
+
+| Timer | Period | Runs when |
+|---|---|---|
+| Cursor blink | 530 ms | the window is focused, blinking is enabled and low-power mode is off |
+| Status bar readings | 1 s | `appearance.show_status_bar` is enabled |
+
+With the status bar hidden there is no sampling at all: `/proc/stat` and
+`/proc/meminfo` are read once per second only while the bar is on screen, and each
+reading requests exactly one redraw.
+
 ## Measured numbers (development machine)
 
 Machine: Intel UHD 630 (integrated GPU), Vulkan backend, Wayland session under

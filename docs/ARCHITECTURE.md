@@ -177,6 +177,16 @@ Notes:
 - A pump pass stops once the byte budget is reached, so it can overshoot its budget
   by at most one read chunk (`astraterm_pty::READ_CHUNK_BYTES`); `PumpReport`
   reports the exact number of bytes that reached the engine.
+- Window chrome geometry (strip position, status bar, tab hit testing, label
+  fitting) lives in `crates/app/src/chrome.rs` as pure functions, so layout rules are
+  unit-tested without a window.
+- The status bar samples `/proc/stat` and `/proc/meminfo` through
+  `astraterm_platform::system::SystemMonitor` at most once per second, and only
+  while the bar is visible; the clock is formatted through the C library so the
+  local timezone and locale are honoured.
+- Opacity is painted, not composited twice: the scene clear carries the configured
+  alpha (premultiplied for the surface) and the pane background is left transparent,
+  so a translucent window never compounds alpha into looking opaque.
 - `pump` also translates engine events (title, bell, OSC 52 store, colour
   queries, direct PTY replies) into `SessionEvent`s or `PumpReport` fields, and
   reports child exit exactly once. A colour query (OSC 4/10/11) becomes

@@ -43,6 +43,17 @@ about 1 % idle CPU with one pane and roughly 129 MB RSS in a debug build. See
 It is **not** a terminal emulator built on Electron or a webview, and it does
 **not** shell out to tmux for tabs or splits.
 
+Rendering and desktop niceties that ship today:
+
+- **Translucent background**: `[window] opacity` (0.1–1.0) applies live; only the
+  background fades, text stays crisp. Blur is a compositor rule.
+- **Status bar** with session information on the left and **CPU, RAM and the clock**
+  on the right, sampled from `/proc` once per second and only while it is visible.
+- **Tabs on top, bottom, hidden, or on the right** as a Warp-style vertical strip
+  with a configurable width.
+- **Theme editor** in the settings panel: adjust the palette with live preview, name
+  the result and save it to `~/.config/astraterm/themes/`.
+
 ## Requirements
 
 - Rust **1.85+** (the workspace uses edition 2024).
@@ -242,9 +253,10 @@ checksums before publishing** (see the comment at the top of the file).
   bounded, so a noisy process cannot exhaust memory or starve other panes.
 - **No automatic link opening.** URL detection only acts on an explicit user
   action.
-- **Minimal `unsafe`.** Exactly one place: the `SIGKILL` escalation that stops a
-  child which ignores the polite close (`crates/pty/src/lib.rs`, three lines, no
-  memory access). See [docs/SECURITY.md](docs/SECURITY.md).
+- **Minimal `unsafe`.** Two places: the `SIGKILL` escalation that stops a child
+  which ignores the polite close (`crates/pty/src/lib.rs`) and the `localtime_r` +
+  `strftime` call that formats the status-bar clock in the user's timezone
+  (`crates/platform/src/system.rs`). See [docs/SECURITY.md](docs/SECURITY.md).
 
 ## Known limitations
 
@@ -268,8 +280,8 @@ checksums before publishing** (see the comment at the top of the file).
   resulting PNGs.
 - Settings that are declared but not yet consumed: `word_delimiters`,
   `remember_geometry`, `appearance.style`, `appearance.show_window_controls`,
-  `background_blur`, `font.fallbacks`, `gpu_acceleration`, `max_fps_when_idle`
-  and per-profile `theme`/`font_size`. See
+  `background_blur` (a compositor rule), `font.fallbacks`, `gpu_acceleration`,
+  `max_fps_when_idle` and per-profile `theme`/`font_size`. See
   [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 ## License

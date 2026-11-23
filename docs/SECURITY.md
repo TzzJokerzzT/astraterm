@@ -14,6 +14,7 @@ input.
 | Terminal output and escape sequences | **untrusted** | Any program, file or remote host can emit them |
 | OSC 52 clipboard requests | **untrusted** | A remote process could read or overwrite the user's clipboard |
 | OSC 0/2 titles, bells, colour queries | untrusted | Titles and bells are displayed/reported; colour queries are answered with theme colours only; nothing from them is executed |
+| Status bar readings (`/proc/stat`, `/proc/meminfo`) | trusted, kernel-provided | Read locally, parsed with bounds, never logged; no process names or command lines are read |
 | Clipboard contents pasted by the user | untrusted | Pasted text may contain control characters; it is sent as input, not evaluated by AstraTerm |
 | Configuration file (`config.toml`, theme files) | trusted, user-owned | It selects shell, argument vectors and environment; anyone who can write it can run code as the user |
 | SSH sessions | untrusted output, user-authorised command | The remote side runs commands with the user's account on that host |
@@ -186,12 +187,20 @@ emulator.
 
 ## Unsafe code policy
 
-The workspace contains exactly **one** `unsafe` site, in
-`crates/pty/src/lib.rs` (`PtyHandle::kill_hard`): two `libc::kill(2)` calls that
-escalate to `SIGKILL` when a child ignores the polite close, each preceded by a
-`// SAFETY:` comment. There are no `unsafe fn`, `unsafe impl` or `unsafe trait`
-declarations. New `unsafe` code must be justified in review, kept minimal, and
-documented with a `// SAFETY:` comment.
+The workspace contains exactly **two** `unsafe` sites, both with `// SAFETY:`
+comments:
+
+- `crates/pty/src/lib.rs` (`PtyHandle::kill_hard`): two `libc::kill(2)` calls that
+  escalate to `SIGKILL` when a child ignores the polite close, guarded by the child's
+  `/proc` start time so a recycled pid is never signalled.
+- `crates/platform/src/system.rs` (`format_clock`): `localtime_r` + `strftime` on a
+  stack buffer, so the status-bar clock honours the user's timezone and locale
+  instead of reimplementing `TZif` parsing. The format string is length-capped and
+  NUL-checked before it reaches C.
+
+There are no `unsafe fn`, `unsafe impl` or `unsafe trait` declarations. New
+`unsafe` code must be justified in review, kept minimal, and documented with a
+`// SAFETY:` comment.
 
 Dependencies may use `unsafe` internally (wgpu, winit, alacritty_terminal,
 portable-pty, crossbeam-channel). That code is outside this workspace's policy

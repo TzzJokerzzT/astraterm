@@ -77,7 +77,7 @@ integer, float, string, array, table).
 |---|---|---|---|
 | `width` | u32 | `1280` | 200–16384 (error). Used when a window is created |
 | `height` | u32 | `800` | 120–16384 (error). Used when a window is created |
-| `opacity` | f32 | `1.0` | 0.1–1.0 (error); below 0.5 warns. Values below 1.0 request a transparent window at creation; it becomes translucent only when the surface supports a premultiplied alpha mode |
+| `opacity` | f32 | `1.0` | 0.1–1.0 (error); below 0.5 warns. Applies live: the surface is created with premultiplied alpha (falling back to opaque), and the painted background alpha follows this value. Only the background is translucent — glyphs, the cursor and explicit cell colours stay opaque |
 | `startup_maximized` | bool | `false` | Applied at window creation |
 | `show_window_controls` | bool | `true` | Passed to winit as client-side decorations at creation |
 | `remember_geometry` | bool | `true` | Accepted; not consumed today (window size is still stored in `workspace.toml`) |
@@ -141,9 +141,14 @@ the renderer recomputes cell metrics and drops the shaped-row cache.
 | `cursor_blink` | bool | `true` | Applies live; disabled by `performance.low_power_mode` |
 | `style` | String | `"minimal-dark"` | Stored only; kept for forward compatibility |
 | `show_status_bar` | bool | `false` | Applies live; `Ctrl+Shift+S` toggles and persists it |
+| `status_bar_cpu` | bool | `true` | CPU segment, sampled from `/proc/stat` at most once per second |
+| `status_bar_ram` | bool | `true` | RAM segment, from `/proc/meminfo` |
+| `status_bar_clock` | bool | `true` | Clock segment in the local timezone |
+| `clock_format` | string | `"%H:%M"` | strftime-style, non-empty and at most 64 characters; unsupported specifiers are printed literally |
 | `show_window_controls` | bool | `false` | Accepted; the window uses `[window] show_window_controls` |
 | `accent_color` | String | `"#8B9CFF"` | `#RGB` or `#RRGGBB` (error). Very dark values warn (<0.05 relative luminance). Validated but not applied today: the theme's `accent` colour is what the renderer uses |
-| `tab_bar_position` | `"top"`, `"bottom"`, `"hidden"` | `"top"` | Any other value is a TOML error. Applies live |
+| `tab_bar_position` | `"top"`, `"right"`, `"bottom"`, `"hidden"` | `"top"` | Any other value is a TOML error. `right` is the Warp-style vertical strip. Applies live |
+| `tab_strip_width` | integer | `180` | 120–480 device-independent pixels; only used when the tabs sit on the right |
 | `compact_tabs` | bool | `false` | Smaller tab labels. Applies live |
 | `divider_thickness` | u32 | `1` | 1–12 (error). Applies live |
 | `pane_gap` | u32 | `2` | ≤24 (error). Applies live |
@@ -343,7 +348,7 @@ created.
 
 Additionally, but not in `requires_restart()`: `window.show_window_controls` and
 whether the surface is created translucent are fixed when the window is created;
-changing opacity afterwards only changes the scene alpha, not the surface.
+changing opacity afterwards changes the painted alpha, which is what makes it live.
 
 Fields accepted by the schema but not consumed by today's code (setting them is
 harmless, and they are marked here so nobody expects an effect):
