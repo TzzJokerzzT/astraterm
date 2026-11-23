@@ -1,0 +1,17 @@
+[package]
+name = "astraterm-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+astraterm-core = { workspace = true }
+astraterm-config = { workspace = true }
+astraterm-pty = { workspace = true }
+astraterm-terminal = { workspace = true }
+crossbeam-channel = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
