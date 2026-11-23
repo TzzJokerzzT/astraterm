@@ -34,6 +34,7 @@ use winit::window::{Window, WindowId as WinitWindowId};
 
 use crate::cli::Cli;
 use crate::keys;
+use crate::prefs::{FONT_SIZE_STEP, Preferences, next_font_size};
 use crate::ui::{
     ClickInfo, ConfirmDialog, DragState, ExitCleanup, Overlay, PendingAction, RenameOverlay,
     SearchOverlay, SplitIdRef, WindowUi, plan_exit_cleanup, url_at,
@@ -131,6 +132,7 @@ impl Application {
         if let Err(error) = state_paths.ensure() {
             tracing::warn!(error = %error, "could not create the state directory");
         }
+        let preferences = Preferences::load(&state_paths.preferences_file());
 
         Ok(Self {
             config: service,
@@ -146,7 +148,7 @@ impl Application {
             state_paths,
             _config_watcher: config_watcher,
             watcher_deadline: None,
-            font_size_override: None,
+            font_size_override: preferences.sanitized_font_size(),
             quitting: false,
             started: false,
             cursor: None,
@@ -166,7 +168,7 @@ impl Application {
     // --- Window creation -----------------------------------------------------
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop, restore: bool) -> anyhow::Result<()> {
-        let config = self.config.config().clone();
+        let config = self.effective_config();
         let attributes = PlatformName::apply(Window::default_attributes())
             .with_title("AstraTerm")
             .with_inner_size(LogicalSize::new(
@@ -800,11 +802,12 @@ impl Application {
                 }
                 self.with_window(window_id, |ui| ui.window.request_redraw());
             }
-            AppCommand::IncreaseFontSize => self.change_font_size(0.5),
-            AppCommand::DecreaseFontSize => self.change_font_size(-0.5),
+            AppCommand::IncreaseFontSize => self.change_font_size(FONT_SIZE_STEP),
+            AppCommand::DecreaseFontSize => self.change_font_size(-FONT_SIZE_STEP),
             AppCommand::ResetFontSize => {
                 self.font_size_override = None;
                 self.apply_config();
+                self.persist_preferences();
             }
             AppCommand::OpenSettings => self.open_settings(window_id),
             AppCommand::ReloadConfig => self.reload_config(),
@@ -1299,11 +1302,10 @@ impl Application {
         let current = self
             .font_size_override
             .unwrap_or(self.config.config().font.size);
-        let next = (current + delta).clamp(4.0, 96.0);
+        let next = next_font_size(current, delta);
         self.font_size_override = Some(next);
-        let mut config = self.config.config().clone();
-        config.font.size = next;
-        self.apply_config_value(&config);
+        self.apply_config();
+        self.persist_preferences();
     }
 
     fn open_settings(&mut self, window_id: WinitWindowId) {
@@ -1354,8 +1356,28 @@ impl Application {
     }
 
     fn apply_config(&mut self) {
-        let config = self.config.config().clone();
+        let config = self.effective_config();
         self.apply_config_value(&config);
+    }
+
+    /// The live configuration with the zoom override applied.
+    ///
+    /// The override stays in memory: writing it into `config.toml` would retrigger
+    /// the file watcher and re-apply the configuration on every zoom step.
+    fn effective_config(&self) -> Config {
+        let mut config = self.config.config().clone();
+        if let Some(size) = self.font_size_override {
+            config.font.size = size;
+        }
+        config
+    }
+
+    /// Persists the zoom level in the state directory, reporting but not failing.
+    fn persist_preferences(&self) {
+        let preferences = Preferences::with_font_size(self.font_size_override);
+        if let Err(error) = preferences.save(&self.state_paths.preferences_file()) {
+            tracing::warn!(error = %error, "could not persist the zoom level");
+        }
     }
 
     fn apply_config_value(&mut self, config: &Config) {

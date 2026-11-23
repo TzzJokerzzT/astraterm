@@ -281,9 +281,9 @@ Every action is configurable in `[keys]`. Defaults:
 | `resize-left/right/up/down` | `ctrl+alt+left/right/up/down` | Moves the divider of the focused pane by 2% |
 | `equalize-splits` | `ctrl+shift+0` | Resets every divider in the tab to 50% |
 | `toggle-zoom` | `ctrl+shift+z` | Temporarily maximises the focused pane |
-| `increase-font-size` | `ctrl+= or ctrl+plus` | Grows the font by 0.5 pt, live |
-| `decrease-font-size` | `ctrl+minus` | Shrinks the font by 0.5 pt, live |
-| `reset-font-size` | `ctrl+0` | Returns to `font.size` |
+| `increase-font-size` | `ctrl+= or ctrl+plus` | Grows the font by 0.5 pt, live; the level survives a restart |
+| `decrease-font-size` | `ctrl+minus` | Shrinks the font by 0.5 pt, live; the level survives a restart |
+| `reset-font-size` | `ctrl+0` | Returns to `font.size` and forgets the zoom level |
 | `search` | `ctrl+shift+f` | Opens scrollback search for the focused pane |
 | `search-next` | `ctrl+g` | Jumps to the next match |
 | `search-previous` | `ctrl+shift+g` | Jumps to the previous match |

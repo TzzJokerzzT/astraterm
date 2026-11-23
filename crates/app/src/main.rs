@@ -7,6 +7,7 @@ mod app;
 mod chrome;
 mod cli;
 mod keys;
+mod prefs;
 mod ui;
 
 use anyhow::Context;
