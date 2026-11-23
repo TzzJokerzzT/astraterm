@@ -1,0 +1,59 @@
+# Maintainer: AstraTerm maintainers <maintainers@astraterm.invalid>
+#
+# Arch Linux PKGBUILD for AstraTerm.
+#
+# The `source` line points at the release tarball that `makepkg --allsource`
+# produces from this repository. Checksums are deliberately skipped here:
+#
+#   *** Fill in the real release tarball checksums before publishing. ***
+#
+# Replace `sha256sums=('SKIP')` with the output of
+# `updpkgsums` (or `sha256sum astraterm-$pkgver.tar.gz`) once the release
+# tarball exists. Publishing with `SKIP` defeats the point of a source hash.
+
+pkgname=astraterm
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Fast native terminal emulator with a built-in tab and split multiplexer"
+arch=('x86_64' 'aarch64')
+url="https://example.invalid/astraterm"
+license=('MIT')
+# Runtime libraries used by winit (Wayland/X11) and the wgpu/glyphon stack.
+# `mesa` provides the OpenGL/Vulkan driver used by wgpu on most systems; users of
+# a vendor Vulkan driver can satisfy that role with `vulkan-driver` instead.
+# The X11 backend of winit additionally loads libX11 at runtime.
+depends=('wayland' 'libxkbcommon' 'fontconfig' 'freetype2' 'mesa' 'libx11')
+makedepends=('cargo' 'rust')
+# The system-wide default configuration. Users' own configuration lives in
+# ~/.config/astraterm/config.toml and is never packaged.
+backup=('etc/astraterm/config.toml')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cd "$pkgname-$pkgver"
+    cargo build --release --locked
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+
+    install -Dm755 target/release/astraterm "$pkgdir/usr/bin/astraterm"
+    install -Dm644 packaging/desktop/astraterm.desktop \
+        "$pkgdir/usr/share/applications/astraterm.desktop"
+    install -Dm644 packaging/linux/config.toml "$pkgdir/etc/astraterm/config.toml"
+
+    # The repository ships the icon as SVG (see assets/icons/README.md); the
+    # freedesktop 128x128 icon slot takes a PNG, so rasterise it here. Without
+    # rsvg-convert (librsvg) the scalable SVG slot is used instead, which icon
+    # themes resolve just as well.
+    if command -v rsvg-convert >/dev/null 2>&1; then
+        rsvg-convert -w 128 -h 128 assets/icons/astraterm.svg -o astraterm.png
+        install -Dm644 astraterm.png "$pkgdir/usr/share/icons/hicolor/128x128/apps/astraterm.png"
+    else
+        warning "rsvg-convert not found; installing the scalable SVG icon instead of a 128x128 PNG"
+        warning "install librsvg as a build dependency to produce the PNG"
+        install -Dm644 assets/icons/astraterm.svg \
+            "$pkgdir/usr/share/icons/hicolor/scalable/apps/astraterm.svg"
+    fi
+}

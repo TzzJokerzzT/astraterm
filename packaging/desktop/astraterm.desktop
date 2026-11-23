@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=AstraTerm
+GenericName=Terminal
+Comment=Fast native terminal emulator
+Exec=astraterm %U
+Icon=astraterm
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;console;
+StartupWMClass=astraterm
+StartupNotify=true

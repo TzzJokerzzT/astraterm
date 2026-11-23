@@ -1,0 +1,141 @@
+# AstraTerm — system-wide default configuration.
+#
+# Installed by the distribution package to /etc/astraterm/config.toml and marked
+# as a backup file, so upgrades never overwrite local edits.
+#
+# AstraTerm itself reads the per-user file ~/.config/astraterm/config.toml
+# (respecting $XDG_CONFIG_HOME), not this one; when that file is missing the
+# values compiled into the application apply, and they are exactly the values
+# below. This file therefore documents the shipped defaults and gives a
+# starting point: copy it to ~/.config/astraterm/config.toml to customise.
+#
+# Every value here matches `Config::default()` in
+# crates/config/src/schema.rs and `default_keybindings()` in
+# crates/config/src/keys.rs. A partial file is valid — missing keys keep their
+# defaults. Unknown keys are reported as warnings and have no effect.
+
+[window]
+width = 1280
+height = 800
+opacity = 1.0
+startup_maximized = false
+show_window_controls = true
+remember_geometry = true
+
+[terminal]
+# "auto" resolves $SHELL; any other value is an executable name or path.
+shell = "auto"
+# Extra arguments for the shell, as an argument vector (never a shell string).
+shell_args = []
+# $TERM advertised to programs running inside the terminal.
+term = "xterm-256color"
+scrollback_lines = 10000
+# "home", "current", "inherit", or an absolute path.
+working_directory = "home"
+confirm_on_close = true
+copy_on_select = false
+open_urls_on_click = true
+word_delimiters = " /\\()\"'-.,:;<>~!@#$%^&*|+=[]{}~?"
+
+[font]
+family = "JetBrainsMono Nerd Font"
+size = 13.0
+weight = 400
+line_height = 1.15
+letter_spacing = 0.0
+fallbacks = [
+    "JetBrains Mono",
+    "Symbols Nerd Font",
+    "Noto Color Emoji",
+    "DejaVu Sans Mono",
+    "monospace",
+]
+
+[appearance]
+# Built-in themes are "midnight" (default, dark) and "dawn" (light).
+# Additional themes are read from ~/.config/astraterm/themes/*.toml.
+theme = "midnight"
+background_blur = false
+padding_x = 12
+padding_y = 10
+cursor = "block"
+cursor_blink = true
+style = "minimal-dark"
+show_status_bar = false
+show_window_controls = false
+accent_color = "#8B9CFF"
+tab_bar_position = "top"
+compact_tabs = false
+divider_thickness = 1
+pane_gap = 2
+
+[workspace]
+restore_on_startup = true
+close_pane_when_shell_exits = true
+
+[performance]
+gpu_acceleration = true
+low_power_mode = false
+max_fps_when_idle = 1
+
+# Action name to key chord. An empty value (or "none") unbinds an action.
+# Alternate chords are separated by "|".
+[keys]
+close-pane = "ctrl+shift+w"
+close-tab = "ctrl+shift+alt+w"
+copy = "ctrl+shift+c"
+decrease-font-size = "ctrl+minus"
+equalize-splits = "ctrl+shift+0"
+focus-down = "alt+down"
+focus-left = "alt+left"
+focus-right = "alt+right"
+focus-up = "alt+up"
+increase-font-size = "ctrl+=|ctrl+plus"
+new-split-horizontal = "ctrl+shift+d"
+new-split-vertical = "ctrl+shift+e"
+new-tab = "ctrl+shift+t"
+new-window = "ctrl+shift+n"
+next-tab = "ctrl+pagedown"
+open-settings = "ctrl+comma"
+paste = "ctrl+shift+v"
+previous-tab = "ctrl+pageup"
+quit = "ctrl+shift+q"
+reload-config = "ctrl+shift+comma"
+rename-tab = "ctrl+shift+r"
+reset-font-size = "ctrl+0"
+resize-down = "ctrl+alt+down"
+resize-left = "ctrl+alt+left"
+resize-right = "ctrl+alt+right"
+resize-up = "ctrl+alt+up"
+scroll-page-down = "shift+pagedown"
+scroll-page-up = "shift+pageup"
+scroll-to-bottom = "ctrl+shift+end"
+scroll-to-top = "ctrl+shift+home"
+search = "ctrl+shift+f"
+search-next = "ctrl+g"
+search-previous = "ctrl+shift+g"
+send-literal-next = "ctrl+shift+enter"
+tab-1 = "alt+1"
+tab-2 = "alt+2"
+tab-3 = "alt+3"
+tab-4 = "alt+4"
+tab-5 = "alt+5"
+tab-6 = "alt+6"
+tab-7 = "alt+7"
+tab-8 = "alt+8"
+tab-9 = "alt+9"
+toggle-status-bar = "ctrl+shift+s"
+toggle-zoom = "ctrl+shift+z"
+
+# Named launch profiles, for example:
+#
+# [[profiles]]
+# name = "work"
+# working_directory = "~/code"
+# theme = "dawn"
+# label = "work"
+#
+# [[profiles]]
+# name = "production"
+# command = ["ssh", "production"]
+# label = "prod"

@@ -1,0 +1,49 @@
+# AstraTerm theme — midnight (the default dark theme).
+#
+# This file is an export of `Palette::midnight()` from
+# `crates/config/src/palette.rs`, in the exact TOML shape produced by serde for
+# `astraterm_config::themes::Theme` (`name`, `light`, then the flattened
+# `Palette`).
+#
+# Copy it to `~/.config/astraterm/themes/midnight.toml` and select it with
+# `[appearance] theme = "midnight"` in `~/.config/astraterm/config.toml`.
+#
+# `ansi` is an array because `Palette::ansi` is a `[Rgb; 16]`: the first eight
+# entries are the normal colours 0-7, the last eight the bright colours 8-15.
+
+name = "midnight"
+light = false
+
+foreground = "#d4d8e0"
+background = "#1c1f26"
+cursor = "#8b9cff"
+cursor_text = "#16181d"
+selection_background = "#333d52"
+selection_foreground = "#f0f3f8"
+accent = "#8b9cff"
+tab_bar_background = "#171a20"
+tab_active_background = "#252a33"
+tab_active_foreground = "#e6eaf2"
+tab_inactive_foreground = "#8b92a2"
+pane_border = "#2c323c"
+pane_border_focused = "#8b9cff"
+
+# black, red, green, yellow, blue, magenta, cyan, white, then the bright set.
+ansi = [
+    "#2a2f39",
+    "#e06c75",
+    "#8fc07d",
+    "#e5c07b",
+    "#7da6f0",
+    "#c08ce0",
+    "#74c0c4",
+    "#c8cdd6",
+    "#4a515f",
+    "#f28b92",
+    "#a8d892",
+    "#f5d492",
+    "#9abcf5",
+    "#d4a6f0",
+    "#8fd6d9",
+    "#f0f3f8",
+]

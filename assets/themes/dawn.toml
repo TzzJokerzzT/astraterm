@@ -1,0 +1,50 @@
+# AstraTerm theme — dawn (the optional light theme).
+#
+# This file is an export of `Palette::dawn()` from
+# `crates/config/src/palette.rs`, in the exact TOML shape produced by serde for
+# `astraterm_config::themes::Theme` (`name`, `light`, then the flattened
+# `Palette`). `light = true` groups it with the light themes in the settings
+# panel.
+#
+# Copy it to `~/.config/astraterm/themes/dawn.toml` and select it with
+# `[appearance] theme = "dawn"` in `~/.config/astraterm/config.toml`.
+#
+# `ansi` is an array because `Palette::ansi` is a `[Rgb; 16]`: the first eight
+# entries are the normal colours 0-7, the last eight the bright colours 8-15.
+
+name = "dawn"
+light = true
+
+foreground = "#2b3038"
+background = "#f7f8fa"
+cursor = "#3f63d8"
+cursor_text = "#ffffff"
+selection_background = "#d3dff7"
+selection_foreground = "#1a1f27"
+accent = "#3f63d8"
+tab_bar_background = "#eceff4"
+tab_active_background = "#ffffff"
+tab_active_foreground = "#1a1f27"
+tab_inactive_foreground = "#666e7d"
+pane_border = "#d5dae2"
+pane_border_focused = "#3f63d8"
+
+# black, red, green, yellow, blue, magenta, cyan, white, then the bright set.
+ansi = [
+    "#2b3038",
+    "#c0394b",
+    "#2f7d4f",
+    "#9a6d14",
+    "#2f5fc0",
+    "#8a4ab8",
+    "#1f7a83",
+    "#555c68",
+    "#6b7380",
+    "#d9505f",
+    "#3f9463",
+    "#b48322",
+    "#4476d8",
+    "#a063cc",
+    "#2c939d",
+    "#f7f8fa",
+]
