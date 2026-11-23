@@ -4,6 +4,7 @@
 //! logging and hands control to the winit event loop.
 
 mod app;
+mod chrome;
 mod cli;
 mod keys;
 mod ui;

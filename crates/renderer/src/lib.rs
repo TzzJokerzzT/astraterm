@@ -282,9 +282,14 @@ impl Renderer {
     /// light first, so theme colours appear exactly as configured.
     pub fn render(&mut self, scene: &Scene) -> Result<(), RendererError> {
         let mut converted;
-        let scene = if target_expects_linear(self.format) {
+        let scene = if target_expects_linear(self.format) || self.transparent {
             converted = scene.clone();
-            converted.linearize();
+            if target_expects_linear(self.format) {
+                converted.linearize();
+            }
+            if self.transparent {
+                converted.premultiply_clear();
+            }
             &converted
         } else {
             scene

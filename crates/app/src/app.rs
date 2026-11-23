@@ -18,6 +18,7 @@ use astraterm_core::{PaneId, ProfileId, SessionId, Size, SplitAxis, TabId, Windo
 use astraterm_platform::clipboard::{Clipboard, Selection as ClipboardSelection};
 use astraterm_platform::linux;
 use astraterm_platform::paths::StatePaths;
+use astraterm_platform::system::SystemMonitor;
 use astraterm_settings_ui::panel::{PanelAction, PanelKey, SettingsPanel};
 use astraterm_terminal::input::{
     self, MouseEvent, MouseKind, encode_key, encode_mouse, encode_paste,
@@ -70,6 +71,10 @@ pub struct Application {
     cursor: Option<(f64, f64)>,
     /// When the cursor blink should toggle next.
     blink_deadline: Option<Instant>,
+    /// CPU/RAM/clock readings for the status bar, sampled at most once per second.
+    system: SystemMonitor,
+    /// When the status bar readings should be refreshed next.
+    system_deadline: Option<Instant>,
 }
 
 impl Application {
@@ -146,6 +151,8 @@ impl Application {
             started: false,
             cursor: None,
             blink_deadline: None,
+            system: SystemMonitor::new(),
+            system_deadline: None,
         })
     }
 
@@ -167,7 +174,10 @@ impl Application {
                 config.window.height as f64,
             ))
             .with_maximized(config.window.startup_maximized)
-            .with_transparent(config.window.opacity < 1.0)
+            // Always translucent: the surface alpha mode is fixed at creation, and the
+            // painted alpha (from `[window] opacity`) decides how much shows through,
+            // so the settings panel can change opacity without a new window.
+            .with_transparent(true)
             .with_decorations(config.window.show_window_controls);
         let window = Arc::new(event_loop.create_window(attributes)?);
         // IME preedit is not implemented yet; text input arrives through key events.
@@ -183,7 +193,7 @@ impl Application {
             astraterm_renderer::RendererOptions {
                 font: config.font.clone(),
                 scale: window.scale_factor() as f32,
-                transparent: config.window.opacity < 1.0,
+                transparent: true,
                 low_power: config.performance.low_power_mode,
             },
         )?;
@@ -1307,8 +1317,7 @@ impl Application {
             return;
         };
         let (themes, _errors) = available_themes(self.config.themes_dir());
-        let names: Vec<String> = themes.iter().map(|theme| theme.name.clone()).collect();
-        let mut panel = SettingsPanel::new(&config, names, self.config.issues().to_vec());
+        let mut panel = SettingsPanel::new(&config, themes, self.config.issues().to_vec());
         panel.set_paths(
             self.config.path().display().to_string(),
             self.config.themes_dir().display().to_string(),
@@ -1444,6 +1453,8 @@ impl Application {
             PanelAction::Consumed => {}
             PanelAction::Close => {
                 self.with_window(window_id, |ui| ui.overlay = Overlay::None);
+                // A previewed palette that was never saved must not survive the panel.
+                self.apply_config();
             }
             PanelAction::Revert => {
                 self.with_window(window_id, |ui| {
@@ -1451,6 +1462,58 @@ impl Application {
                         panel.revert();
                     }
                 });
+                // Undo any palette that was being previewed.
+                self.apply_config();
+            }
+            PanelAction::PreviewPalette(palette) => {
+                for ui in self.windows.values_mut() {
+                    ui.theme.palette = palette.as_ref().clone();
+                    ui.renderer.invalidate_text_cache();
+                    ui.window.request_redraw();
+                }
+            }
+            PanelAction::SaveTheme { name, palette } => {
+                let dir = self.config.themes_dir().to_path_buf();
+                match astraterm_config::save_theme(&dir, &name, *palette) {
+                    Ok((stem, path)) => {
+                        self.config.refresh_themes();
+                        match self
+                            .config
+                            .update(|config| config.appearance.theme = stem.clone())
+                        {
+                            Ok(_) => {
+                                self.apply_config();
+                                let themes = self.config.themes().to_vec();
+                                let issues = self.config.issues().to_vec();
+                                let config = self.config.config().clone();
+                                let message = format!("saved {}", path.display());
+                                self.with_window(window_id, |ui| {
+                                    if let Overlay::Settings(panel) = &mut ui.overlay {
+                                        panel.set_themes(themes);
+                                        panel.on_saved(&config, issues);
+                                        panel.set_message(message);
+                                    }
+                                });
+                            }
+                            Err(error) => {
+                                let message = format!("theme saved but not selected: {error}");
+                                self.with_window(window_id, |ui| {
+                                    if let Overlay::Settings(panel) = &mut ui.overlay {
+                                        panel.set_message(message);
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        self.with_window(window_id, |ui| {
+                            if let Overlay::Settings(panel) = &mut ui.overlay {
+                                panel.set_message(message);
+                            }
+                        });
+                    }
+                }
             }
             PanelAction::Message(message) => {
                 self.with_window(window_id, |ui| {
@@ -2267,7 +2330,7 @@ impl ApplicationHandler<UserEvent> for Application {
             WindowEvent::CursorLeft { .. } => self.cursor = None,
             WindowEvent::RedrawRequested => {
                 let scene = match self.windows.get_mut(&window_id) {
-                    Some(ui) => ui.compose(&mut self.sessions),
+                    Some(ui) => ui.compose(&mut self.sessions, &self.system.snapshot()),
                     None => return,
                 };
                 if let Some(ui) = self.windows.get_mut(&window_id)
@@ -2314,6 +2377,32 @@ impl ApplicationHandler<UserEvent> for Application {
             self.reload_config();
         }
 
+        // System readings for the status bar: one sample per second, and only while
+        // the bar is visible. With the bar hidden there is no timer for them at all.
+        let status_visible = self
+            .windows
+            .values()
+            .any(|ui| ui.config.appearance.show_status_bar);
+        let mut status_wait: Option<Duration> = None;
+        if status_visible {
+            let now = Instant::now();
+            let due = self.system_deadline.unwrap_or(now);
+            if now >= due {
+                if self.system.sample(Duration::from_millis(900)) {
+                    for ui in self.windows.values() {
+                        ui.window.request_redraw();
+                    }
+                }
+                let next = now + Duration::from_secs(1);
+                self.system_deadline = Some(next);
+                status_wait = Some(next.saturating_duration_since(now));
+            } else {
+                status_wait = Some(due.saturating_duration_since(now));
+            }
+        } else {
+            self.system_deadline = None;
+        }
+
         // Cursor blink is the only periodic timer, and only while blinking is on.
         let blink = self
             .focused
@@ -2331,7 +2420,15 @@ impl ApplicationHandler<UserEvent> for Application {
                 ui.toggle_cursor_phase();
             }
             let wait = next.saturating_duration_since(now);
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::wait_duration(wait));
+            if let Some(status_wait) = status_wait {
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::wait_duration(
+                    wait.min(status_wait),
+                ));
+            } else {
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::wait_duration(wait));
+            }
+        } else if let Some(status_wait) = status_wait {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::wait_duration(status_wait));
         } else if self.watcher_deadline.is_some() {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::wait_duration(
                 Duration::from_millis(100),

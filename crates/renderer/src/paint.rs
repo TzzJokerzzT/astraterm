@@ -88,6 +88,20 @@ pub struct Scene {
 }
 
 impl Scene {
+    /// Premultiplies the clear colour.
+    ///
+    /// A premultiplied surface (what Wayland compositors prefer) needs `rgb * a` in
+    /// the clear value, because clearing writes the value without blending. The
+    /// translucent background is painted exactly once, by the clear: the pane
+    /// background is left transparent by the caller, otherwise overlapping layers
+    /// would compound alpha and the window would look opaque again.
+    pub fn premultiply_clear(&mut self) {
+        let alpha = self.clear[3];
+        self.clear[0] *= alpha;
+        self.clear[1] *= alpha;
+        self.clear[2] *= alpha;
+    }
+
     /// Converts every colour in the scene to linear light, for sRGB targets.
     pub fn linearize(&mut self) {
         self.clear = linear_rgba(self.clear);
@@ -874,6 +888,20 @@ mod tests {
         let mut scene = Scene::default();
         paint_cell_backgrounds(&mut scene, (0, 0), &snapshot, &theme(), metrics(), 1);
         assert!(!scene.quads.is_empty());
+    }
+
+    #[test]
+    fn premultiplying_the_clear_scales_rgb_by_alpha() {
+        let mut scene = Scene::with_clear(Rgb::new(0x80, 0x40, 0x20), 0.5);
+        scene.premultiply_clear();
+        let expected = 0x80 as f32 / 255.0 * 0.5;
+        assert!((scene.clear[0] - expected).abs() < 1e-5);
+        assert!((scene.clear[3] - 0.5).abs() < 1e-5, "alpha is preserved");
+        // An opaque background is unchanged.
+        let mut opaque = Scene::with_clear(Rgb::new(0x80, 0x40, 0x20), 1.0);
+        let before = opaque.clear;
+        opaque.premultiply_clear();
+        assert_eq!(opaque.clear, before);
     }
 
     #[test]

@@ -12,18 +12,23 @@ use std::time::{Duration, Instant};
 use astraterm_config::schema::{Config, CursorStyle, TabBarPosition};
 use astraterm_config::themes::Theme;
 use astraterm_core::{CellMetrics, PaneId, Rect, Size, SplitAxis, TabId, WindowId};
+use astraterm_platform::system::SystemSnapshot;
 use astraterm_renderer::Renderer;
 use astraterm_renderer::paint::{self, PaintOptions, Scene, TextItem};
 use astraterm_session::SessionManager;
 use astraterm_settings_ui::panel::{PanelStyle, SettingsPanel};
 use astraterm_terminal::snapshot::{CursorVisual, Snapshot};
 use astraterm_workspace::{LayoutConfig, Pane, Tab, WindowState};
+
+use crate::chrome;
 use winit::window::Window;
 
 /// Height of the tab strip in cell rows.
 const TAB_STRIP_ROWS: f32 = 1.0;
 /// Base padding added to the tab strip and status bar, in device pixels.
 const CHROME_PADDING: u32 = 6;
+/// Width of the active-tab indicator, in device pixels.
+const TAB_INDICATOR_WIDTH: u32 = 3;
 
 /// Blink period of the text cursor.
 pub const CURSOR_BLINK_PERIOD: Duration = Duration::from_millis(530);
@@ -264,43 +269,55 @@ impl WindowUi {
         }
     }
 
+    /// Width of the vertical tab strip, zero for the other positions.
+    pub fn tab_strip_width(&self) -> u32 {
+        match self.config.appearance.tab_bar_position {
+            TabBarPosition::Right => {
+                let requested = (self.config.appearance.tab_strip_width as f32 * self.scale) as u32;
+                requested.min(self.size.width.saturating_sub(160))
+            }
+            _ => 0,
+        }
+    }
+
     /// Rectangle available to the terminal panes.
     pub fn terminal_rect(&self) -> Rect {
-        let tab = self.tab_strip_height();
-        let status = self.status_bar_height();
-        let height = self.size.height.saturating_sub(tab + status);
-        let y = match self.config.appearance.tab_bar_position {
-            TabBarPosition::Bottom => 0,
-            _ => tab as i32,
-        };
-        Rect::new(0, y, self.size.width, height)
+        chrome::terminal_rect(
+            self.config.appearance.tab_bar_position,
+            self.size,
+            self.tab_strip_height(),
+            self.tab_strip_width(),
+            self.status_bar_height(),
+        )
     }
 
     /// Rectangle of the tab strip.
     pub fn tab_strip_rect(&self) -> Rect {
-        match self.config.appearance.tab_bar_position {
-            TabBarPosition::Hidden => Rect::new(0, 0, 0, 0),
-            TabBarPosition::Bottom => Rect::new(
-                0,
-                self.size.height.saturating_sub(self.tab_strip_height()) as i32,
-                self.size.width,
-                self.tab_strip_height(),
-            ),
-            TabBarPosition::Top => Rect::new(0, 0, self.size.width, self.tab_strip_height()),
-        }
+        chrome::strip_rect(
+            self.config.appearance.tab_bar_position,
+            self.size,
+            self.tab_strip_height(),
+            self.tab_strip_width(),
+            self.status_bar_height(),
+        )
+    }
+
+    /// Height of one tab in the vertical strip.
+    pub fn tab_row_height(&self) -> u32 {
+        self.metrics.height + CHROME_PADDING
+    }
+
+    /// Cuts a label so it fits in `max_width` device pixels, with an ellipsis.
+    pub fn fit_label(&self, label: &str, max_width: u32) -> String {
+        chrome::fit_label(label, max_width, self.metrics.width)
     }
 
     /// Rectangle of the status bar.
     pub fn status_rect(&self) -> Rect {
-        if !self.config.appearance.show_status_bar {
-            return Rect::new(0, 0, 0, 0);
-        }
-        let height = self.status_bar_height();
-        Rect::new(
-            0,
-            self.size.height.saturating_sub(height) as i32,
-            self.size.width,
-            height,
+        chrome::status_rect(
+            self.config.appearance.show_status_bar,
+            self.size,
+            self.status_bar_height(),
         )
     }
 
@@ -357,15 +374,21 @@ impl WindowUi {
         if !strip.contains(x, y) {
             return None;
         }
-        let mut offset = strip.x as f64 + 8.0;
-        for (index, tab) in self.workspace.tabs.iter().enumerate() {
-            let width = self.tab_width(tab) as f64;
-            if x >= offset && x < offset + width {
-                return Some(index);
-            }
-            offset += width;
+        if self.config.appearance.tab_bar_position == TabBarPosition::Right {
+            return chrome::vertical_tab_hit(
+                strip,
+                self.tab_row_height(),
+                self.workspace.tabs.len(),
+                y,
+            );
         }
-        None
+        let widths: Vec<u32> = self
+            .workspace
+            .tabs
+            .iter()
+            .map(|tab| self.tab_width(tab))
+            .collect();
+        chrome::horizontal_tab_hit(strip, &widths, x)
     }
 
     /// Width of one tab label.
@@ -429,7 +452,7 @@ impl WindowUi {
     }
 
     /// Composes the frame.
-    pub fn compose(&mut self, sessions: &mut SessionManager) -> Scene {
+    pub fn compose(&mut self, sessions: &mut SessionManager, system: &SystemSnapshot) -> Scene {
         let opacity = self.config.window.opacity.clamp(0.1, 1.0);
         let mut scene = Scene::with_clear(self.theme.palette.background, opacity);
 
@@ -449,7 +472,10 @@ impl WindowUi {
                 padding: self.padding(),
                 draw_cursor: focused == Some(*pane) && self.cursor_phase,
                 cursor_override: Some(self.cursor_style()),
-                background_alpha: 1.0,
+                // The translucent terminal background is painted once by the scene
+                // clear; painting the pane background again would compound alpha and
+                // make the window look opaque.
+                background_alpha: 0.0,
                 focused: focused == Some(*pane),
                 show_border: rects.len() > 1,
             };
@@ -468,7 +494,7 @@ impl WindowUi {
             }
         }
 
-        self.compose_status_bar(&mut scene, sessions);
+        self.compose_status_bar(&mut scene, sessions, system);
         self.compose_overlay(&mut scene, sessions);
         scene
     }
@@ -480,29 +506,63 @@ impl WindowUi {
         }
         scene.push_quad(strip, self.theme.palette.tab_bar_background, 1.0);
 
-        let mut offset = strip.x + 8;
+        let vertical = self.config.appearance.tab_bar_position == TabBarPosition::Right;
+        let mut offset = if vertical { strip.y } else { strip.x + 8 };
         for tab in &self.workspace.tabs {
-            let width = self.tab_width(tab);
             let active = tab.id == self.workspace.active_tab;
+            let (tab_rect, label_rect, label_pos) = if vertical {
+                let height = self.tab_row_height() as i32;
+                let rect = Rect::new(strip.x, offset, strip.width, height as u32);
+                let label = Rect::new(
+                    strip.x + TAB_INDICATOR_WIDTH as i32 + 6,
+                    0,
+                    strip.width.saturating_sub(TAB_INDICATOR_WIDTH + 12),
+                    strip.height,
+                );
+                (
+                    rect,
+                    label,
+                    (
+                        rect.x + TAB_INDICATOR_WIDTH as i32 + 6,
+                        offset + CHROME_PADDING as i32 / 2,
+                    ),
+                )
+            } else {
+                let width = self.tab_width(tab);
+                let rect = Rect::new(offset, strip.y, width, strip.height);
+                let label = Rect::new(offset, strip.y, width, strip.height);
+                (
+                    rect,
+                    label,
+                    (offset + 8, strip.y + CHROME_PADDING as i32 / 2),
+                )
+            };
+
             if active {
-                scene.push_quad(
-                    Rect::new(offset, strip.y, width, strip.height),
-                    self.theme.palette.tab_active_background,
-                    1.0,
-                );
-                scene.push_quad(
-                    Rect::new(offset, strip.bottom() - 2, width, 2),
-                    self.theme.palette.accent,
-                    1.0,
-                );
+                scene.push_quad(tab_rect, self.theme.palette.tab_active_background, 1.0);
+                // The active marker follows the strip: a bar under a horizontal tab
+                // and a bar on the left edge of a vertical one.
+                if vertical {
+                    scene.push_quad(
+                        Rect::new(tab_rect.x, tab_rect.y, TAB_INDICATOR_WIDTH, tab_rect.height),
+                        self.theme.palette.accent,
+                        1.0,
+                    );
+                } else {
+                    scene.push_quad(
+                        Rect::new(tab_rect.x, tab_rect.bottom() - 2, tab_rect.width, 2),
+                        self.theme.palette.accent,
+                        1.0,
+                    );
+                }
             }
+
+            let label_text =
+                self.fit_label(&self.tab_label(tab), label_rect.width.saturating_sub(4));
             scene.push_text(TextItem::plain(
                 1_000_000 + tab.id.raw(),
-                (
-                    (offset + 8) as f32,
-                    (strip.y + CHROME_PADDING as i32 / 2) as f32,
-                ),
-                self.tab_label(tab),
+                (label_pos.0 as f32, label_pos.1 as f32),
+                label_text,
                 paint::rgba(
                     if active {
                         self.theme.palette.tab_active_foreground
@@ -511,19 +571,39 @@ impl WindowUi {
                     },
                     1.0,
                 ),
-                strip,
+                label_rect,
             ));
-            offset += width as i32;
+
+            if vertical {
+                offset += tab_rect.height as i32;
+                // A subtle separator between stacked tabs.
+                if !active {
+                    scene.push_quad(
+                        Rect::new(strip.x + 8, offset, strip.width.saturating_sub(16), 1),
+                        self.theme.palette.pane_border,
+                        1.0,
+                    );
+                }
+            } else {
+                offset += tab_rect.width as i32;
+            }
         }
     }
 
-    fn compose_status_bar(&self, scene: &mut Scene, sessions: &SessionManager) {
+    fn compose_status_bar(
+        &self,
+        scene: &mut Scene,
+        sessions: &SessionManager,
+        system: &SystemSnapshot,
+    ) {
         let rect = self.status_rect();
         if rect.is_empty() {
             return;
         }
         scene.push_quad(rect, self.theme.palette.tab_bar_background, 1.0);
+        let baseline = (rect.y + CHROME_PADDING as i32 / 2) as f32;
 
+        // Left: what the focused session is doing.
         let mut parts: Vec<String> = Vec::new();
         if let Some(pane) = self.focused_pane()
             && let Some(session) = sessions.for_pane(pane)
@@ -552,16 +632,43 @@ impl WindowUi {
             parts.push(message.clone());
         }
 
+        let right = self.status_bar_segments(system);
+        let left_text = parts.join("  ·  ");
+        // The left section never runs under the right one.
+        let right_width = right.chars().count() as f32 * self.metrics.width;
+        let left_available = (rect.width as f32 - right_width - 24.0).max(0.0) as u32;
+        let left_text = self.fit_label(&left_text, left_available);
+
         scene.push_text(TextItem::plain(
             1_100_000,
-            (
-                (rect.x + 8) as f32,
-                (rect.y + CHROME_PADDING as i32 / 2) as f32,
-            ),
-            parts.join("  ·  "),
+            ((rect.x + 8) as f32, baseline),
+            left_text,
             paint::rgba(self.theme.palette.tab_inactive_foreground, 1.0),
             rect,
         ));
+
+        if !right.is_empty() {
+            let text_width = right.chars().count() as f32 * self.metrics.width;
+            let x = (rect.right() as f32 - text_width - 10.0).max(rect.x as f32);
+            scene.push_text(TextItem::plain(
+                1_100_001,
+                (x, baseline),
+                right,
+                paint::rgba(self.theme.palette.foreground, 1.0),
+                rect,
+            ));
+        }
+    }
+
+    /// Right-hand status segments: CPU, RAM and the clock.
+    fn status_bar_segments(&self, system: &SystemSnapshot) -> String {
+        chrome::status_segments(
+            self.config.appearance.status_bar_cpu,
+            self.config.appearance.status_bar_ram,
+            self.config.appearance.status_bar_clock,
+            &self.config.appearance.clock_format,
+            system,
+        )
     }
 
     fn paint_search_highlights(
