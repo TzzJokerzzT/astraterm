@@ -1,0 +1,10 @@
+[package]
+name = "astraterm-workspace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+astraterm-core = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+toml = { workspace = true }
