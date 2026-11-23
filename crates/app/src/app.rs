@@ -20,7 +20,10 @@ use astraterm_platform::linux;
 use astraterm_platform::paths::StatePaths;
 use astraterm_platform::system::SystemMonitor;
 use astraterm_settings_ui::panel::{PanelAction, PanelKey, SettingsPanel};
-use astraterm_terminal::input::{self, MouseEvent, MouseKind, encode_key, encode_mouse};
+use astraterm_terminal::input::{
+    self, KeyEventType, MouseEvent, MouseKind, encode_key, encode_mouse,
+};
+use astraterm_terminal::snapshot::ModeFlags;
 use astraterm_workspace::snapshot::{WorkspaceSnapshot, restore_window, snapshot_window};
 use astraterm_workspace::{Pane, Tab, WindowState};
 use winit::application::ApplicationHandler;
@@ -1289,11 +1292,9 @@ impl Application {
         let clipboard = self.clipboard.clone();
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            let result = clipboard
-                .get(ClipboardSelection::Clipboard)
-                .ok_or_else(|| {
-                    "clipboard is unavailable (install wl-clipboard or xclip)".to_owned()
-                });
+            let result = clipboard.get(ClipboardSelection::Clipboard).ok_or_else(|| {
+                "clipboard is unavailable (install wl-clipboard or xclip)".to_owned()
+            });
             let _ = proxy.send_event(UserEvent::PasteReady {
                 window: window_id,
                 pane,
@@ -1457,6 +1458,9 @@ impl Application {
         event: &winit::event::KeyEvent,
     ) {
         if event.state != ElementState::Pressed {
+            // A release only has a meaning for an application that asked for event
+            // types; panels never see it and keep their own key handling.
+            self.handle_key_release(window_id, event);
             return;
         }
         let overlay = self.windows.get(&window_id).map(|ui| match ui.overlay {
@@ -1850,22 +1854,18 @@ impl Application {
         }
         self.literal_next = false;
 
+        let Some((pane, modes)) = self.focused_pane_modes(window_id) else {
+            return;
+        };
         let Some(press) = keys::key_press(event, self.mods) else {
             return;
         };
-        let Some(pane) = self
-            .windows
-            .get(&window_id)
-            .and_then(WindowUi::focused_pane)
-        else {
-            return;
-        };
-        let Some(modes) = self
-            .sessions
-            .for_pane(pane)
-            .map(|session| session.engine.modes())
-        else {
-            return;
+        // A held key is a repeat only for the Kitty protocol. Everywhere else a
+        // repeat is just another press, exactly as xterm always behaved.
+        let press = if event.repeat && keys::forwards_release(modes) {
+            press.with_event(KeyEventType::Repeat)
+        } else {
+            press
         };
         let bytes = encode_key(press, modes);
         if bytes.is_empty() {
@@ -1874,6 +1874,43 @@ impl Application {
         if let Some(session) = self.sessions.for_pane_mut(pane) {
             session.write(&bytes);
         }
+    }
+
+    /// Sends a key release to the focused PTY when the application asked for it.
+    ///
+    /// `REPORT_EVENT_TYPES` (Kitty flag 2) is the only mode that gives a release an
+    /// encoding; without it `encode_key` returns nothing, so an xterm session sees
+    /// exactly one event per key, as before.
+    fn handle_key_release(&mut self, window_id: WinitWindowId, event: &winit::event::KeyEvent) {
+        let Some(ui) = self.windows.get(&window_id) else {
+            return;
+        };
+        if !matches!(ui.overlay, Overlay::None) {
+            return;
+        }
+        let Some((pane, modes)) = self.focused_pane_modes(window_id) else {
+            return;
+        };
+        if !keys::forwards_release(modes) {
+            return;
+        }
+        let Some(press) = keys::key_press(event, self.mods) else {
+            return;
+        };
+        let bytes = encode_key(press.with_event(KeyEventType::Release), modes);
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(session) = self.sessions.for_pane_mut(pane) {
+            session.write(&bytes);
+        }
+    }
+
+    /// Focused pane of `window_id` plus the modes of its session.
+    fn focused_pane_modes(&self, window_id: WinitWindowId) -> Option<(PaneId, ModeFlags)> {
+        let pane = self.windows.get(&window_id)?.focused_pane()?;
+        let modes = self.sessions.for_pane(pane)?.engine.modes();
+        Some((pane, modes))
     }
 
     /// Replaces placeholder identifiers in a mapped command with the focused pane or

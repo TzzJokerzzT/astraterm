@@ -22,6 +22,7 @@ names the test that covers it.
 | Bracketed paste | mode `2004`, encoding of pasted text | `bracketed_paste_and_application_cursor_modes_are_tracked`, `bracketed_paste_encoding_follows_application_mode` |
 | Mouse reporting modes | `1000`, `1002`, `1003`, `1006` tracked; SGR and X10 encoding in `input.rs` tests | `mouse_reporting_modes_are_tracked`, `sgr_mouse_encoding_is_one_based`, `classic_mouse_encoding_uses_offset_bytes` |
 | Application cursor keys | mode `DECCKM` (`?1h`) changes arrow encoding to SS3 | `bracketed_paste_and_application_cursor_modes_are_tracked` |
+| Kitty keyboard protocol | flags 1/2/4/8/16; `CSI ? u` query, `CSI = u` set, `CSI > u` push, `CSI < u` pop; encoder in `input.rs` | `keyboard_mode_query_is_answered_when_the_protocol_is_enabled`, `keyboard_mode_query_is_silent_when_the_protocol_is_disabled`, `push_set_and_pop_update_the_reported_flags`, `disambiguate_turns_ctrl_letters_into_escape_codes`, `event_types_are_reported_only_when_requested` |
 | Cursor visibility and shape | `?25h/l`, DECSCUSR (`CSI n SP q`) | `cursor_visibility_and_shape_follow_decscusr` |
 | OSC title | OSC 0 and OSC 2, BEL and ST terminators | `osc_title_is_reported_as_an_event` |
 | Bell | BEL is reported as an event | `bell_is_reported` |
@@ -52,6 +53,7 @@ Beyond the grid, the application reads these mode flags from
 | `alt_screen` | Status bar indicator |
 | `show_cursor` | Cursor painting |
 | `focus_reporting` | `ESC[I` / `ESC[O` on window focus changes |
+| `kitty` (`disambiguate`, `report_event_types`, `report_alternate_keys`, `report_all_keys_as_esc`, `report_associated_text`) | Key encoding; release and repeat forwarding |
 
 Shift+click bypasses mouse reporting so local text selection still works when an
 application captures the mouse.
@@ -74,9 +76,10 @@ application captures the mouse.
 
 ## Key encoding
 
-Source: `crates/terminal/src/input.rs`. The encoder emits xterm-compatible
-sequences; there is no Kitty keyboard protocol. Coordinates and modifiers follow
-the xterm convention: modifier parameter `m = 1 + shift + 2*alt + 4*ctrl`.
+Source: `crates/terminal/src/input.rs`. Two encoders live there: the classic xterm
+one documented first, and the Kitty keyboard protocol, used only while the
+application has asked for it. Coordinates and modifiers follow the xterm
+convention in both: modifier parameter `m = 1 + shift + 2*alt + 4*ctrl`.
 
 ### Printable keys and modifiers
 
@@ -129,6 +132,41 @@ Function keys:
 
 The encoder also knows F13–F20 (codes 25, 26, 28, 29, 31, 32, 33, 34); F21 and
 above produce no bytes.
+
+### Kitty keyboard protocol
+
+Advertised by default (`terminal.kitty_keyboard = true`). The emulation core
+answers `CSI ? u` with the mode at the top of its stack and honours `CSI = u`
+(set), `CSI > u` (push) and `CSI < u` (pop), so an application can switch the
+protocol on, stack a mode and restore it on exit. The flags reach the UI and the
+encoder through `TerminalEngine::modes().kitty`.
+
+With no flags active the encoder emits exactly the xterm sequences above;
+`xterm_encoding_is_unchanged_with_kitty_off` is the regression guard for that.
+Under the flags, the encoding is `CSI code[:shifted:base][;m[:event]][;text] u`:
+
+| Flag | Value | Effect on the encoder |
+|---|---|---|
+| disambiguate | 1 | `Ctrl`/`Alt` combinations, `Escape`, and modified `Enter`/`Tab`/`Backspace` switch to `CSI code u`, with a `;m` parameter when modifiers differ from none. Plain text and unmodified `Enter`/`Tab`/`Backspace` keep their bytes. |
+| report_event_types | 2 | Appends `:1` (press), `:2` (repeat) or `:3` (release) to the modifier parameter. |
+| report_alternate_keys | 4 | Emits `code:shifted:base` for a shifted character. |
+| report_all_keys_as_esc | 8 | Every key, plain text included, uses `CSI code u`. |
+| report_associated_text | 16 | Appends the text the key produced, as codepoints: `CSI code;m;text u`. |
+
+Under `report_all_keys_as_esc`, functional keys use the protocol's fixed numbers
+(`57_348` for `Insert` through `57_357` for `End`; `F1`…`F20` from `57_364`)
+instead of their tilde sequences.
+
+Release and repeat are reported only under flag 2. The application forwards a
+release to the PTY only while the focused session has `REPORT_EVENT_TYPES` on and
+marks a repeated press as `Repeat` under the same condition; otherwise the
+release is dropped and a repeat stays a press, so an xterm session still sees one
+event per key (`releases_are_forwarded_only_with_report_event_types`).
+
+One upstream detail: `CSI ? u` reports the top of the *push* stack, so an
+application that only uses `CSI = u` (set, never push) queries `0` while its
+flags are in fact active. Applications that push on entry and pop on exit, which
+is the usual pattern, see the right answer.
 
 ### Paste
 
@@ -238,9 +276,13 @@ behaviour, redraw artefacts, and whether resizing needs a manual `Ctrl+L`.
 State these plainly; they are not bugs in the emulation core but in the adapter
 or the application.
 
-- **No Kitty keyboard protocol.** `TermConfig::kitty_keyboard` is `false` and the
-  encoder emits xterm sequences only. Applications that probe for the Kitty
-  protocol get no support and fall back.
+- **Kitty keyboard protocol coverage is protocol-shaped, not exhaustive.** The
+  flag is advertised by default, the five flags of the current protocol
+  (1/2/4/8/16) are honoured, and the query/set/push/pop sequences are handled by
+  the emulation core. What is missing is platform input the window layer does not
+  deliver (see the IME gap below). `terminal.kitty_keyboard = false` restores the
+  historical xterm-only behaviour: no `CSI ? u` answer, a held key is a repeated
+  press, and a release sends nothing.
 - **No IME preedit.** `window.set_ime_allowed(false)` in `crates/app/src/app.rs`.
   CJK and other IME-based input cannot compose text; only characters delivered as
   key events work.

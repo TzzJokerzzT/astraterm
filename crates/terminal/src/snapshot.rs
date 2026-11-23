@@ -117,6 +117,35 @@ pub struct SelectionSpan {
     pub is_block: bool,
 }
 
+/// Kitty keyboard protocol flags, as requested by the running application.
+///
+/// Every flag is off by default: an application that never sends `CSI > u` keeps
+/// the xterm encoding it has always had.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KittyFlags {
+    /// Report ctrl/alt combinations and Escape in the `CSI u` form.
+    pub disambiguate: bool,
+    /// Report press, repeat and release separately.
+    pub report_event_types: bool,
+    /// Report the shifted and base codepoints of a key.
+    pub report_alternate_keys: bool,
+    /// Report every key, including plain text, in the `CSI u` form.
+    pub report_all_keys_as_esc: bool,
+    /// Append the text a key produced as codepoints.
+    pub report_associated_text: bool,
+}
+
+impl KittyFlags {
+    /// Whether the application opted into the protocol at all.
+    pub const fn enabled(&self) -> bool {
+        self.disambiguate
+            || self.report_event_types
+            || self.report_alternate_keys
+            || self.report_all_keys_as_esc
+            || self.report_associated_text
+    }
+}
+
 /// Terminal modes the UI and input encoder care about.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ModeFlags {
@@ -132,6 +161,7 @@ pub struct ModeFlags {
     pub show_cursor: bool,
     pub focus_reporting: bool,
     pub insert: bool,
+    pub kitty: KittyFlags,
 }
 
 impl ModeFlags {

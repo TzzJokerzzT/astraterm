@@ -21,6 +21,7 @@ fn spec(args: &[&str]) -> SessionSpec {
         engine: EngineSpec {
             scrollback: 1000,
             allow_osc52: false,
+            kitty_keyboard: true,
         },
         profile: None,
         label: None,

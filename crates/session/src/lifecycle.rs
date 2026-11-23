@@ -31,6 +31,8 @@ pub struct SessionSpec {
 pub struct EngineSpec {
     pub scrollback: usize,
     pub allow_osc52: bool,
+    /// Advertise the Kitty keyboard protocol (on unless configured otherwise).
+    pub kitty_keyboard: bool,
 }
 
 impl SessionSpec {
@@ -41,6 +43,7 @@ impl SessionSpec {
             scrollback: self.engine.scrollback,
             hollow_cursor: false,
             allow_osc52: self.engine.allow_osc52,
+            kitty_keyboard: self.engine.kitty_keyboard,
         }
     }
 }
@@ -131,6 +134,7 @@ pub fn session_spec(
             scrollback,
             // Escape sequences are untrusted input: OSC 52 stays off.
             allow_osc52: false,
+            kitty_keyboard: config.terminal.kitty_keyboard,
         },
         profile: profile_id,
         label: profile
@@ -221,6 +225,10 @@ mod tests {
         );
         assert_eq!(spec.engine.scrollback, config.terminal.scrollback_lines);
         assert!(!spec.engine.allow_osc52, "OSC 52 stays disabled by default");
+        assert!(
+            spec.engine.kitty_keyboard,
+            "the Kitty keyboard protocol is advertised by default"
+        );
     }
 
     #[test]
@@ -266,5 +274,15 @@ mod tests {
         assert_eq!(options.cols, 132);
         assert_eq!(options.rows, 43);
         assert_eq!(options.scrollback, config.terminal.scrollback_lines);
+        assert_eq!(options.kitty_keyboard, config.terminal.kitty_keyboard);
+    }
+
+    #[test]
+    fn kitty_keyboard_follows_the_configuration() {
+        let mut config = Config::default();
+        config.terminal.kitty_keyboard = false;
+        let spec = session_spec(&config, None, None, None, 80, 24, (8, 16));
+        assert!(!spec.engine.kitty_keyboard);
+        assert!(!spec.engine_options(80, 24).kitty_keyboard);
     }
 }

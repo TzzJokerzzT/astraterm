@@ -19,8 +19,8 @@ use alacritty_terminal::vte::ansi::{
 };
 
 use crate::snapshot::{
-    CellFlags, CellSnapshot, CursorSnapshot, CursorVisual, ModeFlags, RowSnapshot, Snapshot,
-    SnapshotColor,
+    CellFlags, CellSnapshot, CursorSnapshot, CursorVisual, KittyFlags, ModeFlags, RowSnapshot,
+    Snapshot, SnapshotColor,
 };
 
 /// Number of distinct colours the terminal core can report.
@@ -149,6 +149,12 @@ pub struct EngineOptions {
     /// Off by default: OSC 52 is untrusted terminal input and writing the user's
     /// clipboard from a remote session is a real risk.
     pub allow_osc52: bool,
+    /// Advertise the Kitty keyboard protocol.
+    ///
+    /// On by default: applications probe with `CSI ? u` and fall back to the xterm
+    /// encodings when nobody answers. Turning it off keeps the historical
+    /// xterm-only behaviour for an application that misbehaves with the protocol.
+    pub kitty_keyboard: bool,
 }
 
 impl Default for EngineOptions {
@@ -159,6 +165,7 @@ impl Default for EngineOptions {
             scrollback: 10_000,
             hollow_cursor: false,
             allow_osc52: false,
+            kitty_keyboard: true,
         }
     }
 }
@@ -189,9 +196,9 @@ impl TerminalEngine {
                 },
                 blinking: true,
             },
-            // Kitty keyboard protocol is not advertised: it changes what sequences
-            // applications expect and is not implemented by this encoder yet.
-            kitty_keyboard: false,
+            // Applications query this with `CSI ? u`; answering is what makes them
+            // speak the protocol, and a test guards the xterm fallback.
+            kitty_keyboard: options.kitty_keyboard,
             osc52: if options.allow_osc52 {
                 alacritty_terminal::term::Osc52::OnlyCopy
             } else {
@@ -294,6 +301,13 @@ impl TerminalEngine {
             show_cursor: mode.contains(TermMode::SHOW_CURSOR),
             focus_reporting: mode.contains(TermMode::FOCUS_IN_OUT),
             insert: mode.contains(TermMode::INSERT),
+            kitty: KittyFlags {
+                disambiguate: mode.contains(TermMode::DISAMBIGUATE_ESC_CODES),
+                report_event_types: mode.contains(TermMode::REPORT_EVENT_TYPES),
+                report_alternate_keys: mode.contains(TermMode::REPORT_ALTERNATE_KEYS),
+                report_all_keys_as_esc: mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC),
+                report_associated_text: mode.contains(TermMode::REPORT_ASSOCIATED_TEXT),
+            },
         }
     }
 
@@ -625,6 +639,69 @@ pub type TermColors = Colors;
 
 /// `WindowSize` is re-exported so the session layer can answer size queries.
 pub type TermWindowSize = WindowSize;
+
+#[cfg(test)]
+mod kitty_keyboard_tests {
+    use super::{EngineOptions, TerminalEngine, TerminalEvent};
+
+    fn engine(kitty_keyboard: bool) -> TerminalEngine {
+        TerminalEngine::new(EngineOptions {
+            cols: 20,
+            rows: 4,
+            kitty_keyboard,
+            ..Default::default()
+        })
+    }
+
+    fn replies(engine: &mut TerminalEngine) -> Vec<Vec<u8>> {
+        engine
+            .drain_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                TerminalEvent::PtyReply(bytes) => Some(bytes),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn keyboard_mode_query_is_answered_when_the_protocol_is_enabled() {
+        let mut engine = engine(true);
+        engine.process(b"\x1b[?u");
+        assert_eq!(replies(&mut engine), vec![b"\x1b[?0u".to_vec()]);
+    }
+
+    #[test]
+    fn keyboard_mode_query_is_silent_when_the_protocol_is_disabled() {
+        let mut engine = engine(false);
+        engine.process(b"\x1b[?u");
+        assert!(
+            replies(&mut engine).is_empty(),
+            "a disabled protocol must not answer `CSI ? u`"
+        );
+    }
+
+    #[test]
+    fn push_set_and_pop_update_the_reported_flags() {
+        let mut engine = engine(true);
+
+        engine.process(b"\x1b[>2u");
+        assert!(engine.modes().kitty.report_event_types);
+        engine.process(b"\x1b[?u");
+        assert_eq!(replies(&mut engine), vec![b"\x1b[?2u".to_vec()]);
+
+        engine.process(b"\x1b[=3u");
+        let kitty = engine.modes().kitty;
+        assert!(kitty.disambiguate && kitty.report_event_types);
+        assert!(!kitty.report_all_keys_as_esc);
+
+        engine.process(b"\x1b[<u");
+        assert!(
+            !engine.modes().kitty.enabled(),
+            "pop restores the empty stack"
+        );
+    }
+}
 
 #[cfg(test)]
 mod color_reply_tests {

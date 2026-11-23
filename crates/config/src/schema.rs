@@ -81,6 +81,8 @@ pub struct TerminalConfig {
     pub shell_args: Vec<String>,
     /// Advertised `$TERM` value.
     pub term: String,
+    /// Advertise and honour the Kitty keyboard protocol.
+    pub kitty_keyboard: bool,
     /// Scrollback lines kept per session.
     pub scrollback_lines: usize,
     /// Initial working directory policy.
@@ -101,6 +103,7 @@ impl Default for TerminalConfig {
             shell: "auto".to_owned(),
             shell_args: Vec::new(),
             term: "xterm-256color".to_owned(),
+            kitty_keyboard: true,
             scrollback_lines: 10_000,
             working_directory: WorkingDirectory::home(),
             confirm_on_close: true,
@@ -384,5 +387,28 @@ impl Profile {
             name: name.into(),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kitty_keyboard_is_enabled_by_default() {
+        assert!(
+            TerminalConfig::default().kitty_keyboard,
+            "the Kitty keyboard protocol is advertised unless the user opts out"
+        );
+        assert!(Config::default().terminal.kitty_keyboard);
+    }
+
+    #[test]
+    fn kitty_keyboard_defaults_on_when_the_key_is_absent() {
+        let config: Config = toml::from_str("[terminal]\nscrollback_lines = 500\n").unwrap();
+        assert!(config.terminal.kitty_keyboard);
+
+        let config: Config = toml::from_str("[terminal]\nkitty_keyboard = false\n").unwrap();
+        assert!(!config.terminal.kitty_keyboard);
     }
 }

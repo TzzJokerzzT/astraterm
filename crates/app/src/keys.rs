@@ -12,7 +12,8 @@ use astraterm_config::keys::{
     ActionId, Chord, Key as ChordKey, Modifiers as ChordModifiers, NamedKey,
 };
 use astraterm_core::events::{AppCommand, FocusDirection};
-use astraterm_terminal::input::{Direction, KeyPress, TermKey};
+use astraterm_terminal::input::{Direction, KeyEventType, KeyPress, TermKey};
+use astraterm_terminal::snapshot::ModeFlags;
 use winit::event::KeyEvent;
 use winit::keyboard::ModifiersState;
 use winit::keyboard::{Key, NamedKey as WinitNamedKey};
@@ -130,7 +131,17 @@ pub fn key_press(event: &KeyEvent, modifiers: ModifiersState) -> Option<KeyPress
         ctrl,
         alt,
         shift,
+        event: KeyEventType::Press,
     })
+}
+
+/// Whether key release and repeat events must reach the PTY.
+///
+/// Only the Kitty keyboard protocol's `REPORT_EVENT_TYPES` flag gives them an
+/// encoding: every other mode reports a key once, on press, so forwarding a
+/// release there would duplicate input.
+pub fn forwards_release(modes: ModeFlags) -> bool {
+    modes.kitty.report_event_types
 }
 
 /// The application command a bound action maps to.
@@ -293,5 +304,25 @@ mod tests {
             command_for(ActionId::ScrollToBottom),
             Some(AppCommand::ScrollToBottom)
         ));
+    }
+
+    #[test]
+    fn releases_are_forwarded_only_with_report_event_types() {
+        let mut modes = ModeFlags::default();
+        assert!(
+            !forwards_release(modes),
+            "an xterm session must never see a release"
+        );
+
+        modes.kitty.disambiguate = true;
+        modes.kitty.report_all_keys_as_esc = true;
+        modes.kitty.report_associated_text = true;
+        assert!(
+            !forwards_release(modes),
+            "the other Kitty flags do not ask for event types"
+        );
+
+        modes.kitty.report_event_types = true;
+        assert!(forwards_release(modes));
     }
 }

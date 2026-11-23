@@ -6,7 +6,7 @@
 //! application requested (application cursor keys, bracketed paste, mouse
 //! reporting, SGR mouse).
 
-use crate::snapshot::ModeFlags;
+use crate::snapshot::{KittyFlags, ModeFlags};
 
 /// Arrow/relative movement direction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +42,27 @@ pub struct KeyPress {
     pub ctrl: bool,
     pub alt: bool,
     pub shift: bool,
+    pub event: KeyEventType,
+}
+
+/// Key event kinds the Kitty keyboard protocol can distinguish.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyEventType {
+    #[default]
+    Press,
+    Repeat,
+    Release,
+}
+
+impl KeyEventType {
+    /// Value of the protocol's event-type parameter.
+    const fn code(self) -> u8 {
+        match self {
+            Self::Press => 1,
+            Self::Repeat => 2,
+            Self::Release => 3,
+        }
+    }
 }
 
 impl KeyPress {
@@ -51,6 +72,7 @@ impl KeyPress {
             ctrl: false,
             alt: false,
             shift: false,
+            event: KeyEventType::Press,
         }
     }
 
@@ -60,7 +82,14 @@ impl KeyPress {
             ctrl,
             alt,
             shift,
+            event: KeyEventType::Press,
         }
+    }
+
+    /// Marks the press as a repeat or a release.
+    pub const fn with_event(mut self, event: KeyEventType) -> Self {
+        self.event = event;
+        self
     }
 
     /// xterm modifier parameter: 1 + shift(1) + alt(2) + ctrl(4).
@@ -78,6 +107,25 @@ impl KeyPress {
 /// Returns an empty vector when the combination has no representation (for
 /// example a bare modifier), in which case nothing must be sent.
 pub fn encode_key(press: KeyPress, modes: ModeFlags) -> Vec<u8> {
+    if press.event != KeyEventType::Press {
+        // Only the Kitty protocol reports anything other than a press. Falling back
+        // to the xterm path would send the key twice, once on press and once on
+        // release.
+        if !modes.kitty.enabled() {
+            return Vec::new();
+        }
+        return encode_kitty_key(press, modes.kitty).unwrap_or_default();
+    }
+    if modes.kitty.enabled()
+        && let Some(bytes) = encode_kitty_key(press, modes.kitty)
+    {
+        return bytes;
+    }
+    encode_xterm_key(press, modes)
+}
+
+/// The classic xterm encoding, unchanged since before the Kitty protocol existed.
+fn encode_xterm_key(press: KeyPress, modes: ModeFlags) -> Vec<u8> {
     match press.key {
         TermKey::Char(ch) => encode_char(ch, press),
         TermKey::Enter => {
@@ -115,6 +163,123 @@ pub fn encode_key(press: KeyPress, modes: ModeFlags) -> Vec<u8> {
         TermKey::PageUp => tilde_sequence(5, press.modifier_param()),
         TermKey::PageDown => tilde_sequence(6, press.modifier_param()),
         TermKey::Function(number) => encode_function(number, press),
+    }
+}
+
+/// Encodes a key in the Kitty `CSI u` form, or `None` when the key keeps its xterm
+/// or plain-text encoding.
+fn encode_kitty_key(press: KeyPress, kitty: KittyFlags) -> Option<Vec<u8>> {
+    if press.event != KeyEventType::Press && !kitty.report_event_types {
+        return None;
+    }
+    if !kitty_escape_form(press, kitty) {
+        return None;
+    }
+    let code = kitty_key_code(press.key)?;
+    let number = kitty_key_number(press, kitty, code);
+    let text = if kitty.report_associated_text {
+        kitty_text(press)
+    } else {
+        Vec::new()
+    };
+    let modifiers = press.modifier_param();
+    let report_event = kitty.report_event_types;
+
+    let mut out = Vec::with_capacity(16);
+    out.extend_from_slice(b"\x1b[");
+    out.extend_from_slice(number.as_bytes());
+    // The modifier parameter is optional only when it is the default and nothing
+    // follows it; the protocol otherwise needs the placeholder.
+    if modifiers != 1 || report_event || !text.is_empty() {
+        out.push(b';');
+        out.extend_from_slice(modifiers.to_string().as_bytes());
+        if report_event {
+            out.push(b':');
+            out.push(b'0' + press.event.code());
+        }
+    }
+    if !text.is_empty() {
+        out.push(b';');
+        for (index, codepoint) in text.iter().enumerate() {
+            if index > 0 {
+                out.push(b':');
+            }
+            out.extend_from_slice(codepoint.to_string().as_bytes());
+        }
+    }
+    out.push(b'u');
+    Some(out)
+}
+
+/// Whether the protocol reports this key as `CSI u` instead of its xterm form.
+fn kitty_escape_form(press: KeyPress, kitty: KittyFlags) -> bool {
+    if kitty.report_all_keys_as_esc {
+        return true;
+    }
+    if !kitty.disambiguate {
+        return false;
+    }
+    match press.key {
+        // Escape alone is indistinguishable from the start of a sequence.
+        TermKey::Escape => true,
+        // Unmodified Enter/Tab/Backspace stay as their control bytes.
+        TermKey::Enter | TermKey::Tab | TermKey::Backspace => press.has_modifiers(),
+        TermKey::Char(_) => press.ctrl || press.alt || (kitty.report_alternate_keys && press.shift),
+        // Arrows and the other functional keys already have unambiguous forms.
+        _ => false,
+    }
+}
+
+/// The key number, with the alternate codepoints when the application asked for them.
+fn kitty_key_number(press: KeyPress, kitty: KittyFlags, code: u32) -> String {
+    if kitty.report_alternate_keys
+        && press.shift
+        && let TermKey::Char(ch) = press.key
+        && let Some(shifted) = shifted_character(ch)
+    {
+        return format!("{code}:{}:{code}", shifted as u32);
+    }
+    code.to_string()
+}
+
+/// Kitty key numbers: Unicode codepoints for text, fixed numbers for functional keys.
+fn kitty_key_code(key: TermKey) -> Option<u32> {
+    Some(match key {
+        TermKey::Char(ch) => ch as u32,
+        TermKey::Enter => 13,
+        TermKey::Tab => 9,
+        TermKey::Backspace => 127,
+        TermKey::Escape => 27,
+        TermKey::Insert => 57_348,
+        TermKey::Delete => 57_349,
+        TermKey::Arrow(Direction::Left) => 57_350,
+        TermKey::Arrow(Direction::Right) => 57_351,
+        TermKey::Arrow(Direction::Up) => 57_352,
+        TermKey::Arrow(Direction::Down) => 57_353,
+        TermKey::PageUp => 57_354,
+        TermKey::PageDown => 57_355,
+        TermKey::Home => 57_356,
+        TermKey::End => 57_357,
+        TermKey::Function(number) if (1..=35).contains(&number) => 57_363 + number as u32,
+        TermKey::Function(_) => return None,
+    })
+}
+
+/// Codepoints of the text a key produced, for the associated-text parameter.
+fn kitty_text(press: KeyPress) -> Vec<u32> {
+    if press.ctrl || press.alt {
+        return Vec::new();
+    }
+    match press.key {
+        TermKey::Char(ch) => {
+            let ch = if press.shift {
+                shifted_character(ch).unwrap_or(ch)
+            } else {
+                ch
+            };
+            vec![ch as u32]
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -395,6 +560,140 @@ mod tests {
             show_cursor: true,
             ..ModeFlags::default()
         }
+    }
+
+    fn kitty(flags: KittyFlags) -> ModeFlags {
+        ModeFlags {
+            kitty: flags,
+            ..ModeFlags::default()
+        }
+    }
+
+    #[test]
+    fn disambiguate_turns_ctrl_letters_into_escape_codes() {
+        let press = KeyPress::with_mods(TermKey::Char('a'), true, false, false);
+        let modes = kitty(KittyFlags {
+            disambiguate: true,
+            ..KittyFlags::default()
+        });
+        assert_eq!(encode_key(press, modes), b"\x1b[97;5u");
+    }
+
+    #[test]
+    fn disambiguate_reports_escape_as_a_key_code() {
+        let modes = kitty(KittyFlags {
+            disambiguate: true,
+            ..KittyFlags::default()
+        });
+        assert_eq!(
+            encode_key(KeyPress::new(TermKey::Escape), modes),
+            b"\x1b[27u"
+        );
+    }
+
+    #[test]
+    fn disambiguate_leaves_plain_text_alone() {
+        let modes = kitty(KittyFlags {
+            disambiguate: true,
+            ..KittyFlags::default()
+        });
+        assert_eq!(encode_key(KeyPress::new(TermKey::Char('a')), modes), b"a");
+        assert_eq!(encode_key(KeyPress::new(TermKey::Enter), modes), b"\r");
+        assert_eq!(encode_key(KeyPress::new(TermKey::Tab), modes), b"\t");
+    }
+
+    #[test]
+    fn disambiguate_reports_modified_enter_and_tab() {
+        let modes = kitty(KittyFlags {
+            disambiguate: true,
+            ..KittyFlags::default()
+        });
+        let ctrl_enter = KeyPress::with_mods(TermKey::Enter, true, false, false);
+        assert_eq!(encode_key(ctrl_enter, modes), b"\x1b[13;5u");
+        let shift_tab = KeyPress::with_mods(TermKey::Tab, false, false, true);
+        assert_eq!(encode_key(shift_tab, modes), b"\x1b[9;2u");
+    }
+
+    #[test]
+    fn all_keys_as_esc_wraps_plain_text() {
+        let modes = kitty(KittyFlags {
+            report_all_keys_as_esc: true,
+            ..KittyFlags::default()
+        });
+        assert_eq!(
+            encode_key(KeyPress::new(TermKey::Char('a')), modes),
+            b"\x1b[97u"
+        );
+        assert_eq!(
+            encode_key(KeyPress::new(TermKey::Insert), modes),
+            b"\x1b[57348u"
+        );
+    }
+
+    #[test]
+    fn associated_text_is_appended_when_requested() {
+        let modes = kitty(KittyFlags {
+            report_all_keys_as_esc: true,
+            report_associated_text: true,
+            ..KittyFlags::default()
+        });
+        assert_eq!(
+            encode_key(KeyPress::new(TermKey::Char('a')), modes),
+            b"\x1b[97;1;97u"
+        );
+    }
+
+    #[test]
+    fn alternate_keys_report_the_shifted_codepoint() {
+        let modes = kitty(KittyFlags {
+            disambiguate: true,
+            report_alternate_keys: true,
+            ..KittyFlags::default()
+        });
+        let shifted = KeyPress::with_mods(TermKey::Char('1'), false, false, true);
+        assert_eq!(encode_key(shifted, modes), b"\x1b[49:33:49;2u");
+    }
+
+    #[test]
+    fn event_types_are_reported_only_when_requested() {
+        let with_types = kitty(KittyFlags {
+            disambiguate: true,
+            report_event_types: true,
+            ..KittyFlags::default()
+        });
+        let repeated = KeyPress::with_mods(TermKey::Char('a'), true, false, false)
+            .with_event(KeyEventType::Repeat);
+        assert_eq!(encode_key(repeated, with_types), b"\x1b[97;5:2u");
+
+        let released = KeyPress::new(TermKey::Escape).with_event(KeyEventType::Release);
+        assert_eq!(encode_key(released, with_types), b"\x1b[27;1:3u");
+
+        let without_types = kitty(KittyFlags {
+            disambiguate: true,
+            ..KittyFlags::default()
+        });
+        assert!(encode_key(released, without_types).is_empty());
+    }
+
+    #[test]
+    fn a_release_never_falls_back_to_xterm() {
+        let released = KeyPress::new(TermKey::Escape).with_event(KeyEventType::Release);
+        assert!(encode_key(released, ModeFlags::default()).is_empty());
+    }
+
+    #[test]
+    fn xterm_encoding_is_unchanged_with_kitty_off() {
+        let modes = ModeFlags::default();
+        let ctrl_a = KeyPress::with_mods(TermKey::Char('a'), true, false, false);
+        assert_eq!(encode_key(ctrl_a, modes), b"\x01");
+        assert_eq!(encode_key(KeyPress::new(TermKey::Escape), modes), b"\x1b");
+        assert_eq!(
+            encode_key(
+                KeyPress::with_mods(TermKey::Char('a'), false, true, false),
+                modes
+            ),
+            b"\x1ba"
+        );
     }
 
     #[test]
