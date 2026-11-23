@@ -6,9 +6,9 @@
 //! the terminal, so the settings experience is native, compact and consistent with
 //! the dark, minimal workspace.
 
-use astraterm_config::{Config, ConfigIssue, IssueSeverity};
+use astraterm_config::{Config, ConfigIssue, IssueSeverity, Palette, Rgb, Theme};
 
-use crate::fields::{Field, FieldKind};
+use crate::fields::{Field, FieldKind, PaletteEntry};
 
 /// Settings sections, in the order they are shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -59,7 +59,12 @@ impl Section {
                 Field::CursorStyle,
                 Field::CursorBlink,
                 Field::ShowStatusBar,
+                Field::StatusBarCpu,
+                Field::StatusBarRam,
+                Field::StatusBarClock,
+                Field::ClockFormat,
                 Field::TabBarPosition,
+                Field::TabStripWidth,
                 Field::CompactTabs,
                 Field::BackgroundBlur,
                 Field::PaddingX,
@@ -79,7 +84,13 @@ impl Section {
                 Field::LineHeight,
                 Field::LetterSpacing,
             ],
-            Section::Colors => vec![Field::Theme, Field::AccentColor],
+            Section::Colors => vec![
+                Field::Theme,
+                Field::PaletteEntry,
+                Field::PaletteColor,
+                Field::SaveTheme,
+                Field::AccentColor,
+            ],
             Section::Terminal => vec![
                 Field::Shell,
                 Field::Term,
@@ -143,6 +154,10 @@ pub enum PanelAction {
     Message(String),
     /// Revert the draft to the last saved configuration.
     Revert,
+    /// Show a candidate palette immediately, without persisting anything.
+    PreviewPalette(Box<Palette>),
+    /// Save the edited palette as a named theme and select it.
+    SaveTheme { name: String, palette: Box<Palette> },
 }
 
 /// Visual role of one projected line.
@@ -214,8 +229,14 @@ pub struct SettingsPanel {
     filtering: bool,
     /// Validation issues to display.
     issues: Vec<ConfigIssue>,
-    /// Theme names available for the theme picker.
-    themes: Vec<String>,
+    /// Themes available for the picker and for seeding the editor.
+    themes: Vec<Theme>,
+    /// Palette being edited; seeded from the selected theme.
+    palette: Palette,
+    /// Which palette entry the editor is changing.
+    palette_entry: PaletteEntry,
+    /// True while the inline buffer holds a new theme name.
+    editing_theme_name: bool,
     /// Reminder of which settings need a new session.
     restart_needed: bool,
     message: Option<String>,
@@ -229,7 +250,12 @@ pub struct SettingsPanel {
 
 impl SettingsPanel {
     /// Creates a panel editing a copy of `config`.
-    pub fn new(config: &Config, themes: Vec<String>, issues: Vec<ConfigIssue>) -> Self {
+    pub fn new(config: &Config, themes: Vec<Theme>, issues: Vec<ConfigIssue>) -> Self {
+        let palette = themes
+            .iter()
+            .find(|theme| theme.name.eq_ignore_ascii_case(&config.appearance.theme))
+            .map(|theme| theme.palette.clone())
+            .unwrap_or_else(Palette::midnight);
         Self {
             section: Section::Appearance,
             focus: 0,
@@ -240,6 +266,9 @@ impl SettingsPanel {
             filtering: false,
             issues,
             themes,
+            palette,
+            palette_entry: PaletteEntry::Background,
+            editing_theme_name: false,
             restart_needed: false,
             message: None,
             scroll: 0,
@@ -268,8 +297,33 @@ impl SettingsPanel {
         self.message.as_deref()
     }
 
-    pub fn set_themes(&mut self, themes: Vec<String>) {
+    pub fn set_themes(&mut self, themes: Vec<Theme>) {
         self.themes = themes;
+    }
+
+    /// Theme names in picker order.
+    pub fn theme_names(&self) -> Vec<String> {
+        self.themes.iter().map(|theme| theme.name.clone()).collect()
+    }
+
+    /// Palette being edited.
+    pub fn palette(&self) -> &Palette {
+        &self.palette
+    }
+
+    /// Which colour the editor is changing.
+    pub fn palette_entry(&self) -> PaletteEntry {
+        self.palette_entry
+    }
+
+    /// Value shown for a row, including the panel-owned palette rows.
+    fn field_value(&self, field: Field) -> String {
+        match field {
+            Field::PaletteEntry => self.palette_entry.label().to_owned(),
+            Field::PaletteColor => self.palette_entry.get(&self.palette).to_hex(),
+            Field::SaveTheme => "enter to name and save".to_owned(),
+            other => other.value(&self.draft),
+        }
     }
 
     /// Tells the panel how many rows fit on screen so scrolling stays correct.
@@ -298,7 +352,7 @@ impl SettingsPanel {
             .filter(|field| {
                 field.label().to_lowercase().contains(&needle)
                     || field.id().contains(&needle)
-                    || field.value(&self.draft).to_lowercase().contains(&needle)
+                    || self.field_value(*field).to_lowercase().contains(&needle)
             })
             .collect()
     }
@@ -359,14 +413,8 @@ impl SettingsPanel {
                 PanelAction::Consumed
             }
             PanelKey::Enter => self.activate(),
-            PanelKey::Left => {
-                self.step_focused(-1);
-                PanelAction::Consumed
-            }
-            PanelKey::Right => {
-                self.step_focused(1);
-                PanelAction::Consumed
-            }
+            PanelKey::Left => self.step_focused(-1).unwrap_or(PanelAction::Consumed),
+            PanelKey::Right => self.step_focused(1).unwrap_or(PanelAction::Consumed),
             PanelKey::ResetSection => {
                 self.reset_section();
                 PanelAction::Consumed
@@ -393,16 +441,37 @@ impl SettingsPanel {
             PanelKey::Enter => {
                 let text = buffer.clone();
                 self.edit_buffer = None;
-                if let Some(field) = self.focused_field() {
-                    field.set_text(&mut self.draft, &text);
-                    if field.requires_restart() && self.draft != self.baseline {
-                        self.restart_needed = true;
-                    }
+
+                if self.editing_theme_name {
+                    self.editing_theme_name = false;
+                    return PanelAction::SaveTheme {
+                        name: text,
+                        palette: Box::new(self.palette.clone()),
+                    };
+                }
+
+                let Some(field) = self.focused_field() else {
+                    return PanelAction::Consumed;
+                };
+                if field == Field::PaletteColor {
+                    return match Rgb::parse(&text) {
+                        Ok(color) => {
+                            self.palette_entry.set(&mut self.palette, color);
+                            PanelAction::PreviewPalette(Box::new(self.palette.clone()))
+                        }
+                        Err(message) => PanelAction::Message(message),
+                    };
+                }
+
+                field.set_text(&mut self.draft, &text);
+                if field.requires_restart() && self.draft != self.baseline {
+                    self.restart_needed = true;
                 }
                 self.confirm()
             }
             PanelKey::Escape => {
                 self.edit_buffer = None;
+                self.editing_theme_name = false;
                 PanelAction::Consumed
             }
             PanelKey::Backspace => {
@@ -450,24 +519,71 @@ impl SettingsPanel {
                 self.step_focused(1);
                 PanelAction::Consumed
             }
-            FieldKind::Text | FieldKind::Color => {
+            FieldKind::Text => {
+                self.editing_theme_name = false;
                 self.edit_buffer = Some(field.value(&self.draft));
+                PanelAction::Consumed
+            }
+            FieldKind::Color => {
+                self.editing_theme_name = false;
+                self.edit_buffer = Some(self.field_value(field));
+                PanelAction::Consumed
+            }
+            FieldKind::Action => {
+                // "Save theme as…": start with a suggestion derived from the base
+                // theme so the user only has to confirm or rename it.
+                if field == Field::SaveTheme {
+                    let base = self.draft.appearance.theme.clone();
+                    self.editing_theme_name = true;
+                    self.edit_buffer = Some(format!("{base}-custom"));
+                }
                 PanelAction::Consumed
             }
             FieldKind::Info => PanelAction::Consumed,
         }
     }
 
-    fn step_focused(&mut self, direction: i32) {
-        let Some(field) = self.focused_field() else {
-            return;
-        };
-        if field.kind() == FieldKind::Info {
-            return;
-        }
-        field.step(&mut self.draft, direction, &self.themes);
-        if field.requires_restart() && self.draft != self.baseline {
-            self.restart_needed = true;
+    fn step_focused(&mut self, direction: i32) -> Option<PanelAction> {
+        let field = self.focused_field()?;
+        match field {
+            Field::PaletteEntry => {
+                let current = PaletteEntry::ALL
+                    .iter()
+                    .position(|entry| *entry == self.palette_entry)
+                    .unwrap_or(0);
+                let len = PaletteEntry::ALL.len();
+                let next = if direction >= 0 {
+                    (current + 1) % len
+                } else {
+                    (current + len - 1) % len
+                };
+                self.palette_entry = PaletteEntry::ALL[next];
+                None
+            }
+            _ => {
+                if field.kind() == FieldKind::Info || field.kind() == FieldKind::Action {
+                    return None;
+                }
+                let names = self.theme_names();
+                field.step(&mut self.draft, direction, &names);
+                if field.requires_restart() && self.draft != self.baseline {
+                    self.restart_needed = true;
+                }
+                if field == Field::Theme {
+                    // Selecting a theme seeds the editor with that palette and previews
+                    // it, so "edit → save as" starts from what is on screen.
+                    let selected = names
+                        .iter()
+                        .position(|name| name.eq_ignore_ascii_case(&self.draft.appearance.theme))
+                        .and_then(|index| self.themes.get(index))
+                        .map(|theme| theme.palette.clone());
+                    if let Some(palette) = selected {
+                        self.palette = palette;
+                        return Some(PanelAction::PreviewPalette(Box::new(self.palette.clone())));
+                    }
+                }
+                None
+            }
         }
     }
 
@@ -598,7 +714,7 @@ impl SettingsPanel {
             } else if let Some(text) = self.about_value(*field) {
                 text
             } else {
-                field.value(&self.draft)
+                self.field_value(*field)
             };
             let suffix = if field.requires_restart() {
                 "  · new session"
@@ -670,7 +786,7 @@ mod tests {
     fn panel() -> SettingsPanel {
         SettingsPanel::new(
             &Config::default(),
-            vec!["midnight".to_owned(), "dawn".to_owned()],
+            astraterm_config::builtin_themes(),
             Vec::new(),
         )
     }
@@ -880,5 +996,133 @@ mod tests {
         assert!(panel.needs_restart());
         panel.revert();
         assert!(!panel.needs_restart());
+    }
+}
+
+#[cfg(test)]
+mod theme_editor_tests {
+    use super::*;
+    use crate::fields::PaletteEntry;
+
+    fn panel() -> SettingsPanel {
+        let mut config = Config::default();
+        config.appearance.theme = "midnight".to_owned();
+        SettingsPanel::new(&config, astraterm_config::builtin_themes(), Vec::new())
+    }
+
+    fn focus(panel: &mut SettingsPanel, field: Field) {
+        panel.section = Section::Colors;
+        let rows = panel.rows();
+        panel.focus = rows
+            .iter()
+            .position(|row| *row == field)
+            .expect("field in section");
+    }
+
+    #[test]
+    fn the_editor_starts_from_the_selected_theme() {
+        let panel = panel();
+        assert_eq!(panel.palette().background, Palette::midnight().background);
+        assert_eq!(palette_entry_label(&panel), "Background");
+    }
+
+    fn palette_entry_label(panel: &SettingsPanel) -> &'static str {
+        panel.palette_entry().label()
+    }
+
+    #[test]
+    fn stepping_the_entry_cycles_through_the_palette() {
+        let mut panel = panel();
+        focus(&mut panel, Field::PaletteEntry);
+        assert_eq!(panel.palette_entry(), PaletteEntry::Background);
+        panel.handle_key(PanelKey::Right);
+        assert_eq!(panel.palette_entry(), PaletteEntry::Foreground);
+        panel.handle_key(PanelKey::Left);
+        assert_eq!(panel.palette_entry(), PaletteEntry::Background);
+    }
+
+    #[test]
+    fn editing_a_colour_previews_it_without_saving_the_config() {
+        let mut panel = panel();
+        focus(&mut panel, Field::PaletteColor);
+        panel.handle_key(PanelKey::Enter);
+        for _ in 0..16 {
+            panel.handle_key(PanelKey::Backspace);
+        }
+        for ch in "#102030".chars() {
+            panel.handle_key(PanelKey::Char(ch));
+        }
+        let action = panel.handle_key(PanelKey::Enter);
+        match action {
+            PanelAction::PreviewPalette(palette) => {
+                assert_eq!(palette.background, Rgb::new(0x10, 0x20, 0x30));
+            }
+            other => panic!("expected a preview, got {other:?}"),
+        }
+        assert_eq!(panel.palette().background, Rgb::new(0x10, 0x20, 0x30));
+        assert!(
+            !panel.is_dirty(),
+            "editing a theme does not dirty the configuration"
+        );
+    }
+
+    #[test]
+    fn an_invalid_colour_is_reported_instead_of_applied() {
+        let mut panel = panel();
+        focus(&mut panel, Field::PaletteColor);
+        panel.handle_key(PanelKey::Enter);
+        for _ in 0..16 {
+            panel.handle_key(PanelKey::Backspace);
+        }
+        for ch in "nope".chars() {
+            panel.handle_key(PanelKey::Char(ch));
+        }
+        let action = panel.handle_key(PanelKey::Enter);
+        assert!(matches!(action, PanelAction::Message(_)), "got {action:?}");
+        assert_eq!(panel.palette().background, Palette::midnight().background);
+    }
+
+    #[test]
+    fn saving_asks_for_a_name_and_emits_the_palette() {
+        let mut panel = panel();
+        focus(&mut panel, Field::SaveTheme);
+        assert!(matches!(
+            panel.handle_key(PanelKey::Enter),
+            PanelAction::Consumed
+        ));
+        // The suggestion is pre-filled from the base theme.
+        let action = panel.handle_key(PanelKey::Enter);
+        match action {
+            PanelAction::SaveTheme { name, palette } => {
+                assert!(name.contains("midnight"), "suggested name: {name}");
+                assert_eq!(*palette, *panel.palette());
+            }
+            other => panic!("expected SaveTheme, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn choosing_another_theme_reseeds_the_editor_and_previews_it() {
+        let mut panel = panel();
+        focus(&mut panel, Field::Theme);
+        let action = panel.handle_key(PanelKey::Right);
+        assert!(
+            matches!(action, PanelAction::PreviewPalette(_)),
+            "got {action:?}"
+        );
+        assert_eq!(panel.palette().background, Palette::dawn().background);
+    }
+
+    #[test]
+    fn palette_rows_show_their_values_in_the_projection() {
+        let mut panel = panel();
+        focus(&mut panel, Field::PaletteColor);
+        let lines = panel.lines();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.value.as_deref() == Some("#1c1f26")),
+            "the background hex is shown: {lines:?}"
+        );
     }
 }

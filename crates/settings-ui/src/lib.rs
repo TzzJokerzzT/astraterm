@@ -13,5 +13,5 @@
 pub mod fields;
 pub mod panel;
 
-pub use fields::{Field, FieldKind};
+pub use fields::{Field, FieldKind, PaletteEntry};
 pub use panel::{PanelAction, PanelKey, PanelLine, PanelStyle, Section, SettingsPanel};

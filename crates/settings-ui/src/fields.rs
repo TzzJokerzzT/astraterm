@@ -6,7 +6,72 @@
 //! schema in step (they share the same typed model).
 
 use astraterm_config::schema::CursorStyle;
-use astraterm_config::{Config, TabBarPosition};
+use astraterm_config::{Config, Palette, Rgb, TabBarPosition};
+
+/// Which palette colour the theme editor is changing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaletteEntry {
+    Background,
+    Foreground,
+    Accent,
+    Cursor,
+    CursorText,
+    SelectionBackground,
+    PaneBorder,
+    TabBarBackground,
+}
+
+impl PaletteEntry {
+    pub const ALL: [PaletteEntry; 8] = [
+        PaletteEntry::Background,
+        PaletteEntry::Foreground,
+        PaletteEntry::Accent,
+        PaletteEntry::Cursor,
+        PaletteEntry::CursorText,
+        PaletteEntry::SelectionBackground,
+        PaletteEntry::PaneBorder,
+        PaletteEntry::TabBarBackground,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            PaletteEntry::Background => "Background",
+            PaletteEntry::Foreground => "Foreground",
+            PaletteEntry::Accent => "Accent",
+            PaletteEntry::Cursor => "Cursor",
+            PaletteEntry::CursorText => "Cursor text",
+            PaletteEntry::SelectionBackground => "Selection",
+            PaletteEntry::PaneBorder => "Focused border",
+            PaletteEntry::TabBarBackground => "Tab bar",
+        }
+    }
+
+    pub fn get(self, palette: &Palette) -> Rgb {
+        match self {
+            PaletteEntry::Background => palette.background,
+            PaletteEntry::Foreground => palette.foreground,
+            PaletteEntry::Accent => palette.accent,
+            PaletteEntry::Cursor => palette.cursor,
+            PaletteEntry::CursorText => palette.cursor_text,
+            PaletteEntry::SelectionBackground => palette.selection_background,
+            PaletteEntry::PaneBorder => palette.pane_border_focused,
+            PaletteEntry::TabBarBackground => palette.tab_bar_background,
+        }
+    }
+
+    pub fn set(self, palette: &mut Palette, color: Rgb) {
+        match self {
+            PaletteEntry::Background => palette.background = color,
+            PaletteEntry::Foreground => palette.foreground = color,
+            PaletteEntry::Accent => palette.accent = color,
+            PaletteEntry::Cursor => palette.cursor = color,
+            PaletteEntry::CursorText => palette.cursor_text = color,
+            PaletteEntry::SelectionBackground => palette.selection_background = color,
+            PaletteEntry::PaneBorder => palette.pane_border_focused = color,
+            PaletteEntry::TabBarBackground => palette.tab_bar_background = color,
+        }
+    }
+}
 
 /// How a field is edited.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,6 +88,8 @@ pub enum FieldKind {
     Color,
     /// Informational row; not editable.
     Info,
+    /// Runs an action when activated (for example "save theme as").
+    Action,
 }
 
 /// Every editable setting.
@@ -35,8 +102,16 @@ pub enum Field {
     ShowStatusBar,
     BackgroundBlur,
     TabBarPosition,
+    TabStripWidth,
+    StatusBarCpu,
+    StatusBarRam,
+    StatusBarClock,
+    ClockFormat,
     CompactTabs,
     AccentColor,
+    PaletteEntry,
+    PaletteColor,
+    SaveTheme,
     PaddingX,
     PaddingY,
     PaneGap,
@@ -85,8 +160,16 @@ impl Field {
             Field::ShowStatusBar => "show-status-bar",
             Field::BackgroundBlur => "background-blur",
             Field::TabBarPosition => "tab-bar-position",
+            Field::TabStripWidth => "tab-strip-width",
+            Field::StatusBarCpu => "status-bar-cpu",
+            Field::StatusBarRam => "status-bar-ram",
+            Field::StatusBarClock => "status-bar-clock",
+            Field::ClockFormat => "clock-format",
             Field::CompactTabs => "compact-tabs",
             Field::AccentColor => "accent-color",
+            Field::PaletteEntry => "palette-entry",
+            Field::PaletteColor => "palette-color",
+            Field::SaveTheme => "save-theme",
             Field::PaddingX => "padding-x",
             Field::PaddingY => "padding-y",
             Field::PaneGap => "pane-gap",
@@ -129,8 +212,16 @@ impl Field {
             Field::ShowStatusBar => "Status bar",
             Field::BackgroundBlur => "Background blur",
             Field::TabBarPosition => "Tab bar position",
+            Field::TabStripWidth => "Tab strip width",
+            Field::StatusBarCpu => "Status bar: CPU",
+            Field::StatusBarRam => "Status bar: RAM",
+            Field::StatusBarClock => "Status bar: clock",
+            Field::ClockFormat => "Clock format",
             Field::CompactTabs => "Compact tabs",
             Field::AccentColor => "Accent colour",
+            Field::PaletteEntry => "Edit theme colour",
+            Field::PaletteColor => "Colour value",
+            Field::SaveTheme => "Save theme as…",
             Field::PaddingX => "Horizontal padding",
             Field::PaddingY => "Vertical padding",
             Field::PaneGap => "Pane gap",
@@ -171,10 +262,18 @@ impl Field {
             | Field::CursorStyle
             | Field::CursorBlink
             | Field::ShowStatusBar
+            | Field::StatusBarCpu
+            | Field::StatusBarRam
+            | Field::StatusBarClock
             | Field::BackgroundBlur
             | Field::TabBarPosition
+            | Field::TabStripWidth
+            | Field::ClockFormat
             | Field::CompactTabs
             | Field::AccentColor
+            | Field::PaletteEntry
+            | Field::PaletteColor
+            | Field::SaveTheme
             | Field::PaddingX
             | Field::PaddingY
             | Field::PaneGap
@@ -207,6 +306,9 @@ impl Field {
         match self {
             Field::CursorBlink
             | Field::ShowStatusBar
+            | Field::StatusBarCpu
+            | Field::StatusBarRam
+            | Field::StatusBarClock
             | Field::BackgroundBlur
             | Field::CompactTabs
             | Field::ConfirmOnClose
@@ -218,7 +320,9 @@ impl Field {
             | Field::ClosePaneWhenShellExits
             | Field::GpuAcceleration
             | Field::LowPowerMode => FieldKind::Toggle,
-            Field::Theme | Field::CursorStyle | Field::TabBarPosition => FieldKind::Choice,
+            Field::Theme | Field::CursorStyle | Field::TabBarPosition | Field::PaletteEntry => {
+                FieldKind::Choice
+            }
             Field::PaddingX
             | Field::PaddingY
             | Field::PaneGap
@@ -227,6 +331,7 @@ impl Field {
             | Field::FontWeight
             | Field::LineHeight
             | Field::LetterSpacing
+            | Field::TabStripWidth
             | Field::ScrollbackLines
             | Field::WindowWidth
             | Field::WindowHeight
@@ -236,8 +341,11 @@ impl Field {
             | Field::Shell
             | Field::Term
             | Field::WorkingDirectory
-            | Field::WordDelimiters => FieldKind::Text,
+            | Field::WordDelimiters
+            | Field::ClockFormat => FieldKind::Text,
             Field::AccentColor => FieldKind::Color,
+            Field::PaletteColor => FieldKind::Color,
+            Field::SaveTheme => FieldKind::Action,
             Field::AboutVersion | Field::AboutConfigPath | Field::AboutThemes => FieldKind::Info,
         }
     }
@@ -252,7 +360,13 @@ impl Field {
             Field::BackgroundBlur => yes_no(config.appearance.background_blur),
             Field::TabBarPosition => config.appearance.tab_bar_position.label().to_owned(),
             Field::CompactTabs => yes_no(config.appearance.compact_tabs),
+            Field::TabStripWidth => config.appearance.tab_strip_width.to_string(),
+            Field::StatusBarCpu => yes_no(config.appearance.status_bar_cpu),
+            Field::StatusBarRam => yes_no(config.appearance.status_bar_ram),
+            Field::StatusBarClock => yes_no(config.appearance.status_bar_clock),
+            Field::ClockFormat => config.appearance.clock_format.clone(),
             Field::AccentColor => config.appearance.accent_color.clone(),
+            Field::PaletteEntry | Field::PaletteColor | Field::SaveTheme => String::new(),
             Field::PaddingX => config.appearance.padding_x.to_string(),
             Field::PaddingY => config.appearance.padding_y.to_string(),
             Field::PaneGap => config.appearance.pane_gap.to_string(),
@@ -330,6 +444,19 @@ impl Field {
                 config.appearance.background_blur = !config.appearance.background_blur;
             }
             Field::CompactTabs => config.appearance.compact_tabs = !config.appearance.compact_tabs,
+            Field::StatusBarCpu => {
+                config.appearance.status_bar_cpu = !config.appearance.status_bar_cpu
+            }
+            Field::StatusBarRam => {
+                config.appearance.status_bar_ram = !config.appearance.status_bar_ram
+            }
+            Field::StatusBarClock => {
+                config.appearance.status_bar_clock = !config.appearance.status_bar_clock;
+            }
+            Field::TabStripWidth => {
+                config.appearance.tab_strip_width =
+                    step_u32(config.appearance.tab_strip_width, direction, 20, 120, 480);
+            }
             Field::ConfirmOnClose => {
                 config.terminal.confirm_on_close = !config.terminal.confirm_on_close;
             }
@@ -410,7 +537,9 @@ impl Field {
                 config.performance.max_fps_when_idle =
                     step_u32(config.performance.max_fps_when_idle, direction, 1, 1, 240);
             }
-            // Text and colour fields are committed from `set_text`.
+            // Text and colour fields are committed from `set_text`; palette rows are
+            // owned by the panel because they edit a theme, not the configuration.
+            Field::PaletteEntry | Field::PaletteColor | Field::SaveTheme | Field::ClockFormat => {}
             Field::FontFamily
             | Field::Shell
             | Field::Term
@@ -432,6 +561,7 @@ impl Field {
             Field::Term => config.terminal.term = text.to_owned(),
             Field::WordDelimiters => config.terminal.word_delimiters = text.to_owned(),
             Field::AccentColor => config.appearance.accent_color = text.to_owned(),
+            Field::ClockFormat => config.appearance.clock_format = text.to_owned(),
             Field::WorkingDirectory => {
                 config.terminal.working_directory =
                     if text.is_empty() || text == "home" || text == "current" {
@@ -465,6 +595,19 @@ impl Field {
                 config.appearance.tab_bar_position = defaults.appearance.tab_bar_position
             }
             Field::CompactTabs => config.appearance.compact_tabs = defaults.appearance.compact_tabs,
+            Field::TabStripWidth => {
+                config.appearance.tab_strip_width = defaults.appearance.tab_strip_width;
+            }
+            Field::StatusBarCpu => {
+                config.appearance.status_bar_cpu = defaults.appearance.status_bar_cpu
+            }
+            Field::StatusBarRam => {
+                config.appearance.status_bar_ram = defaults.appearance.status_bar_ram
+            }
+            Field::StatusBarClock => {
+                config.appearance.status_bar_clock = defaults.appearance.status_bar_clock;
+            }
+            Field::ClockFormat => config.appearance.clock_format = defaults.appearance.clock_format,
             Field::AccentColor => config.appearance.accent_color = defaults.appearance.accent_color,
             Field::PaddingX => config.appearance.padding_x = defaults.appearance.padding_x,
             Field::PaddingY => config.appearance.padding_y = defaults.appearance.padding_y,
@@ -522,7 +665,12 @@ impl Field {
             Field::MaxFpsWhenIdle => {
                 config.performance.max_fps_when_idle = defaults.performance.max_fps_when_idle;
             }
-            Field::AboutVersion | Field::AboutConfigPath | Field::AboutThemes => {}
+            Field::PaletteEntry
+            | Field::PaletteColor
+            | Field::SaveTheme
+            | Field::AboutVersion
+            | Field::AboutConfigPath
+            | Field::AboutThemes => {}
         }
     }
 
@@ -679,6 +827,59 @@ mod tests {
         Field::Theme.reset(&mut config);
         assert_eq!(config.font.size, Config::default().font.size);
         assert_eq!(config.appearance.theme, Config::default().appearance.theme);
+    }
+
+    #[test]
+    fn tab_strip_width_steps_within_bounds_and_resets() {
+        let mut config = Config::default();
+        let default = config.appearance.tab_strip_width;
+        Field::TabStripWidth.step(&mut config, 1, &themes());
+        assert!(config.appearance.tab_strip_width > default);
+        for _ in 0..40 {
+            Field::TabStripWidth.step(&mut config, 1, &themes());
+        }
+        assert_eq!(config.appearance.tab_strip_width, 480);
+        for _ in 0..40 {
+            Field::TabStripWidth.step(&mut config, -1, &themes());
+        }
+        assert_eq!(config.appearance.tab_strip_width, 120);
+        Field::TabStripWidth.reset(&mut config);
+        assert_eq!(config.appearance.tab_strip_width, default);
+    }
+
+    #[test]
+    fn status_bar_segments_toggle_independently() {
+        let mut config = Config::default();
+        assert!(config.appearance.status_bar_cpu);
+        Field::StatusBarCpu.step(&mut config, 1, &themes());
+        assert!(!config.appearance.status_bar_cpu);
+        assert!(
+            config.appearance.status_bar_ram,
+            "the other segments are untouched"
+        );
+        assert!(config.appearance.status_bar_clock);
+    }
+
+    #[test]
+    fn the_clock_format_is_editable_text() {
+        let mut config = Config::default();
+        Field::ClockFormat.set_text(&mut config, "%H:%M:%S");
+        assert_eq!(config.appearance.clock_format, "%H:%M:%S");
+        Field::ClockFormat.reset(&mut config);
+        assert_eq!(config.appearance.clock_format, "%H:%M");
+    }
+
+    #[test]
+    fn every_new_row_maps_to_the_appearance_section() {
+        for field in [
+            Field::TabStripWidth,
+            Field::StatusBarCpu,
+            Field::StatusBarRam,
+            Field::StatusBarClock,
+            Field::ClockFormat,
+        ] {
+            assert_eq!(field.path(), "appearance", "{}", field.id());
+        }
     }
 
     #[test]
