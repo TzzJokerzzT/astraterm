@@ -83,6 +83,12 @@ pub struct TerminalConfig {
     pub term: String,
     /// Advertise and honour the Kitty keyboard protocol.
     pub kitty_keyboard: bool,
+    /// Decode and draw images sent by the running program.
+    ///
+    /// Off by default: the bytes arrive from whatever runs in the terminal,
+    /// including a remote host over SSH, and decoding them is a new parser fed by
+    /// untrusted input. Turning it on is a deliberate choice.
+    pub images: bool,
     /// Scrollback lines kept per session.
     pub scrollback_lines: usize,
     /// Initial working directory policy.
@@ -104,6 +110,7 @@ impl Default for TerminalConfig {
             shell_args: Vec::new(),
             term: "xterm-256color".to_owned(),
             kitty_keyboard: true,
+            images: false,
             scrollback_lines: 10_000,
             working_directory: WorkingDirectory::home(),
             confirm_on_close: true,
@@ -401,6 +408,18 @@ mod tests {
             "the Kitty keyboard protocol is advertised unless the user opts out"
         );
         assert!(Config::default().terminal.kitty_keyboard);
+    }
+
+    #[test]
+    fn images_are_off_by_default() {
+        assert!(
+            !TerminalConfig::default().images,
+            "decoding images from untrusted output is opt-in"
+        );
+        let config: Config = toml::from_str("[terminal]\nimages = true\n").unwrap();
+        assert!(config.terminal.images);
+        let config: Config = toml::from_str("[terminal]\nscrollback_lines = 100\n").unwrap();
+        assert!(!config.terminal.images);
     }
 
     #[test]
