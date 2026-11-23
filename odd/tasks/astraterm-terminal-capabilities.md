@@ -50,8 +50,9 @@ S5.3 Ninguna imagen rompe el grid ni la salida de texto normal: las secuencias m
 | T3 | S3.1–S3.3 | Ligaduras opt-in con `font.ligatures` y verificación de alineación | inline | `7410eb6` |
 | T4 | S4.1–S4.4 | Kitty keyboard: flag, flags expuestos y encoder completo + docs | inline + worker | `a37ee4b` |
 | T5 | S5.1, S5.3 | Scanner APC/OSC/DCS incremental con reensamble entre chunks + modelo de anclaje | inline + worker | `662c512` |
-| T6 | S5.2 | Decoders (kitty graphics, iTerm2, sixel) con límites de dimensión y memoria; puro y testeable sin GPU | worker | — |
-| T7 | S5.1, S5.2 | Texturas en el renderer (sampler, UV, z-order), cableado en la app y `docs/SECURITY.md` | worker | — |
+| T6 | S5.2 | Decoders (kitty graphics, iTerm2, sixel) con límites de dimensión y memoria; puro y testeable sin GPU | worker | `06e1f53` |
+| T7 | S5.1 | Renderer: ítems de imagen en `Scene`, pipeline texturizado, sampler/UV y caché de texturas con desalojo | worker | — |
+| T8 | S5.1, S5.2 | Cableado en la app (decode → anclaje → escena), opción `terminal.images` y `docs/SECURITY.md` | worker | — |
 
 T5–T7 no empiezan hasta que T1–T4 estén cerrados y verificados: son subsistema, no feature.
 
