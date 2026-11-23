@@ -11,12 +11,15 @@ use std::time::{Duration, Instant};
 
 use astraterm_config::schema::{Config, CursorStyle, TabBarPosition};
 use astraterm_config::themes::Theme;
-use astraterm_core::{CellMetrics, PaneId, Rect, Size, SplitAxis, TabId, WindowId};
+use astraterm_core::{CellMetrics, PaneId, Rect, SessionId, Size, SplitAxis, TabId, WindowId};
 use astraterm_platform::system::SystemSnapshot;
 use astraterm_renderer::Renderer;
-use astraterm_renderer::paint::{self, PaintOptions, Scene, TextItem};
+use astraterm_renderer::paint::{self, ImageItem, ImagePixels, PaintOptions, Scene, TextItem};
 use astraterm_session::SessionManager;
 use astraterm_settings_ui::panel::{PanelStyle, SettingsPanel};
+use astraterm_terminal::TerminalEngine;
+use astraterm_terminal::image::{ImagePlacement, ImageStore};
+use astraterm_terminal::image_decode::{DecodeLimits, decode};
 use astraterm_terminal::snapshot::{CursorVisual, Snapshot};
 use astraterm_workspace::{LayoutConfig, Pane, Tab, WindowState};
 
@@ -452,7 +455,12 @@ impl WindowUi {
     }
 
     /// Composes the frame.
-    pub fn compose(&mut self, sessions: &mut SessionManager, system: &SystemSnapshot) -> Scene {
+    pub fn compose(
+        &mut self,
+        sessions: &mut SessionManager,
+        system: &SystemSnapshot,
+        images: &BTreeMap<SessionId, SessionImages>,
+    ) -> Scene {
         let opacity = self.config.window.opacity.clamp(0.1, 1.0);
         let mut scene = Scene::with_clear(self.theme.palette.background, opacity);
 
@@ -468,6 +476,7 @@ impl WindowUi {
                 continue;
             };
             let snapshot = session.snapshot();
+            let session_id = session.id;
             let options = PaintOptions {
                 padding: self.padding(),
                 draw_cursor: focused == Some(*pane) && self.cursor_phase,
@@ -489,6 +498,12 @@ impl WindowUi {
                 options,
             );
 
+            // Images are anchored to buffer lines, so they are drawn from the
+            // pane's session and placed on the same grid the glyphs use.
+            if let Some(anchored) = images.get(&session_id) {
+                self.compose_images(&mut scene, *rect, rects.len() > 1, &snapshot, anchored);
+            }
+
             if let Overlay::Search(search) = &self.overlay {
                 self.paint_search_highlights(&mut scene, *rect, &snapshot, search);
             }
@@ -497,6 +512,40 @@ impl WindowUi {
         self.compose_status_bar(&mut scene, sessions, system);
         self.compose_overlay(&mut scene, sessions);
         scene
+    }
+
+    /// Queues the images anchored to one pane into the scene.
+    ///
+    /// The origin, padding and border match `paint::paint_pane`, so an image lands
+    /// on the cells it was anchored to instead of a pixel-shifted copy of them.
+    fn compose_images(
+        &self,
+        scene: &mut Scene,
+        rect: Rect,
+        show_border: bool,
+        snapshot: &Snapshot,
+        images: &SessionImages,
+    ) {
+        // Belt and braces around the intake gate: with the option off nothing is
+        // decoded, and a frame composed before the next pump must not draw what a
+        // previous one left behind either.
+        if !self.config.terminal.images || images.is_empty() {
+            return;
+        }
+        let padding = self.padding();
+        let inner = if show_border { rect.shrunk(1) } else { rect };
+        let grid = ImageGrid {
+            origin: (inner.x + padding.x as i32, inner.y + padding.y as i32),
+            metrics: self.metrics,
+            rows: snapshot.rows,
+            cols: snapshot.cols,
+            display_offset: snapshot.display_offset,
+        };
+        for (placement, id, pixels) in images.items() {
+            if let Some(item) = image_item(placement, id, pixels, grid) {
+                scene.push_image(item);
+            }
+        }
     }
 
     fn compose_tab_strip(&self, scene: &mut Scene) {
@@ -999,6 +1048,346 @@ pub fn plan_exit_cleanup(workspace: &WindowState, pane: PaneId) -> ExitCleanup {
     ExitCleanup::KeepOpen
 }
 
+// --- Terminal images ---------------------------------------------------------
+
+/// Generation carried by every image item.
+///
+/// A decoded image never changes its bytes, so its generation never changes
+/// either and a redraw reuses the texture the cache already holds. A different
+/// image arrives as a different `id`, which is what forces an upload; deriving
+/// the generation from the frame counter would re-upload every image on every
+/// frame.
+pub const IMAGE_GENERATION: u64 = 1;
+
+/// Cells an image covers, from its pixel size and the pane's cell metrics.
+///
+/// The anchoring model stores sizes in cells, so an image is rounded up to whole
+/// cells (a 100x50 image in 8x16 cells is 13 columns by 4 rows) and never
+/// occupies zero cells.
+pub fn image_cells(pixels: (u32, u32), metrics: CellMetrics) -> (u16, u16) {
+    let cell_width = metrics.width.max(1.0);
+    let cell_height = metrics.height.max(1) as f32;
+    let columns = (pixels.0 as f32 / cell_width).ceil().max(1.0);
+    let rows = (pixels.1 as f32 / cell_height).ceil().max(1.0);
+    (clamp_cells(columns), clamp_cells(rows))
+}
+
+fn clamp_cells(value: f32) -> u16 {
+    value.min(u16::MAX as f32) as u16
+}
+
+/// The cell grid an image is anchored to, in device pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImageGrid {
+    /// Top-left corner of the first cell of the pane.
+    pub origin: (i32, i32),
+    /// Cell metrics of the pane.
+    pub metrics: CellMetrics,
+    /// Rows the pane shows.
+    pub rows: u16,
+    /// Columns the pane shows.
+    pub cols: u16,
+    /// Lines scrolled back from the live bottom, so an image follows the view.
+    pub display_offset: usize,
+}
+
+/// Destination rectangle and source sub-rectangle of one drawn image.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImageRect {
+    /// Where it lands on the canvas, in device pixels, clipped to the grid.
+    pub rect: Rect,
+    /// Source sub-rectangle as `u0, v0, u1, v1`, for the part that is visible.
+    pub uv: [f32; 4],
+}
+
+/// Places one anchored image on the grid, clipping the part that is off-screen.
+///
+/// Returns `None` when no part of it is on the grid: scrolled past the top, below
+/// the last row or past the last column. Culling here is what keeps a stale anchor
+/// from drawing over the chrome or a neighbouring pane, because the image pipeline
+/// has no clip rectangle of its own.
+pub fn image_rect(placement: &ImagePlacement, grid: ImageGrid) -> Option<ImageRect> {
+    let total_rows = placement.rows.max(1) as i32;
+    let total_columns = placement.cols.max(1) as i32;
+    let screen_row = placement.anchor_line + grid.display_offset as i32;
+    let column = placement.column as i32;
+
+    let top = screen_row.max(0);
+    let bottom = (screen_row + total_rows).min(grid.rows as i32);
+    let left = column.max(0);
+    let right = (column + total_columns).min(grid.cols as i32);
+    if bottom <= top || right <= left {
+        return None;
+    }
+
+    let cell_width = grid.metrics.width.max(1.0);
+    let cell_height = grid.metrics.height.max(1) as i32;
+    // Column edges are truncated and the width is rounded up, exactly like
+    // `paint::paint_cell_backgrounds` and the glyph positions: a fractional cell
+    // width must not shift an image a pixel away from the text it sits behind.
+    let x = grid.origin.0 + (left as f32 * cell_width) as i32;
+    let y = grid.origin.1 + top * cell_height;
+    let width = (((right - left) as f32) * cell_width).ceil().max(1.0) as u32;
+    let height = (bottom - top) as u32 * cell_height as u32;
+
+    Some(ImageRect {
+        rect: Rect::new(x, y, width, height),
+        uv: [
+            (left - column) as f32 / total_columns as f32,
+            (top - screen_row) as f32 / total_rows as f32,
+            (right - column) as f32 / total_columns as f32,
+            (bottom - screen_row) as f32 / total_rows as f32,
+        ],
+    })
+}
+
+/// Scene item for one anchored image, or `None` when it is not on screen.
+pub fn image_item(
+    placement: &ImagePlacement,
+    id: u64,
+    pixels: &Arc<ImagePixels>,
+    grid: ImageGrid,
+) -> Option<ImageItem> {
+    let placed = image_rect(placement, grid)?;
+    Some(ImageItem::new(id, placed.rect, Arc::clone(pixels), IMAGE_GENERATION).with_uv(placed.uv))
+}
+
+/// Whether the anchors still name lines on the screen that is now displayed.
+///
+/// An image is anchored to buffer lines of the grid it arrived on, and the primary
+/// and alternate grids have independent lines: entering the alternate screen
+/// discards the primary anchors, and leaving it discards the alternate ones.
+/// Nothing is re-anchored, because the model can only drop.
+pub fn images_survive_alt_switch(was_alternate: bool, is_alternate: bool) -> bool {
+    was_alternate == is_alternate
+}
+
+/// One anchored image and the texture it draws with.
+struct AnchoredImage {
+    /// Texture identifier, assigned once so the cache never re-uploads it.
+    id: u64,
+    pixels: Arc<ImagePixels>,
+}
+
+/// The decoded images of one session: anchors, pixels and a byte budget.
+///
+/// [`ImageStore`] holds the anchoring model (budget, eviction, drop rules) and this
+/// type holds the pixels for each placement *index for index*, so an image is only
+/// ever drawn with the bytes that produced it.
+pub struct SessionImages {
+    store: ImageStore,
+    /// Pixels of `store.placements()`, in the same order and with the same length.
+    images: Vec<AnchoredImage>,
+    /// Last texture identifier handed out; never reused, so an evicted id cannot
+    /// come back with different pixels.
+    next_id: u64,
+    /// `line_range().0` when the anchors were moved last.
+    top_line: i32,
+    /// Alternate-screen flag observed at the last intake.
+    alternate_screen: bool,
+}
+
+impl SessionImages {
+    /// An empty store for `session`, with [`ImageStore`]'s default budget.
+    pub fn new(session: SessionId, top_line: i32) -> Self {
+        Self::with_budget(session, top_line, ImageStore::default().budget())
+    }
+
+    /// Same, with an explicit byte budget for the decoded pixels.
+    pub fn with_budget(session: SessionId, top_line: i32, budget: usize) -> Self {
+        Self {
+            store: ImageStore::new(budget),
+            images: Vec::new(),
+            // Session ids are unique in the process, so the high half of the
+            // identifier keeps texture keys unique across panes without a second
+            // allocator.
+            next_id: session.raw() << 32,
+            top_line,
+            alternate_screen: false,
+        }
+    }
+
+    /// Anchors a decoded image and keeps its pixels for drawing.
+    ///
+    /// The byte total comes from the pixels, never from the caller, so the budget
+    /// cannot be lied about. Returns `false` when the image alone exceeds the
+    /// budget: the store then holds nothing and no pixels are kept.
+    pub fn insert(&mut self, mut placement: ImagePlacement, pixels: Arc<ImagePixels>) -> bool {
+        placement.bytes = pixels.byte_len();
+        if !self.store.insert(placement) {
+            return false;
+        }
+        // The store evicts the oldest placements, always from the front of its
+        // list, so trimming the front here keeps both lists aligned.
+        while self.images.len() >= self.store.len() {
+            self.images.remove(0);
+        }
+        self.next_id += 1;
+        self.images.push(AnchoredImage {
+            id: self.next_id,
+            pixels,
+        });
+        true
+    }
+
+    /// Placements, oldest first, with the texture that draws each one.
+    pub fn items(&self) -> impl Iterator<Item = (&ImagePlacement, u64, &Arc<ImagePixels>)> + '_ {
+        self.store
+            .placements()
+            .iter()
+            .zip(self.images.iter())
+            .map(|(placement, image)| (placement, image.id, &image.pixels))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.store.is_empty()
+    }
+
+    /// Drops every anchor and its pixels.
+    pub fn clear(&mut self) {
+        self.store.clear();
+        self.images.clear();
+    }
+
+    /// Drains the image sequences the session captured and anchors what decodes.
+    ///
+    /// Returns how many images were anchored. `enabled` is `terminal.images`: when
+    /// it is off the payloads are drained and dropped **without decoding**, which
+    /// is the point of the option — the bytes come from whatever program is
+    /// running, including a remote host over SSH.
+    pub fn intake(
+        &mut self,
+        engine: &mut TerminalEngine,
+        metrics: CellMetrics,
+        enabled: bool,
+    ) -> usize {
+        let messages = engine.take_images();
+        self.follow_alt_screen(engine.is_alternate_screen());
+        self.follow_buffer(engine.line_range().0);
+        if !enabled {
+            self.clear();
+            return 0;
+        }
+        let cursor = engine.cursor_point();
+        let limits = DecodeLimits::default();
+        let mut stored = 0;
+        for message in messages {
+            // A refused payload is a dropped image: `decode` reports the reason and
+            // nothing else uses it, so a malformed or oversized sequence can never
+            // panic and never draws half an image (S5.2, S5.3).
+            let Ok(decoded) = decode(&message, &limits) else {
+                continue;
+            };
+            let Some(pixels) = ImagePixels::new(decoded.width, decoded.height, decoded.rgba) else {
+                continue;
+            };
+            let (cols, rows) = image_cells((decoded.width, decoded.height), metrics);
+            let placement = ImagePlacement {
+                protocol: message.protocol,
+                anchor_line: cursor.line.0,
+                column: cursor.column.0.min(u16::MAX as usize) as u16,
+                cols,
+                rows,
+                bytes: 0,
+            };
+            if self.insert(placement, Arc::new(pixels)) {
+                stored += 1;
+            }
+        }
+        stored
+    }
+
+    /// Drops the anchors when the screen underneath them changed.
+    ///
+    /// Returns whether anything was dropped.
+    pub fn follow_alt_screen(&mut self, is_alternate: bool) -> bool {
+        let survived = images_survive_alt_switch(self.alternate_screen, is_alternate);
+        self.alternate_screen = is_alternate;
+        if survived {
+            return false;
+        }
+        self.clear();
+        true
+    }
+
+    /// Follows the buffer as lines enter or leave its history.
+    ///
+    /// `top_line` is the oldest line the buffer still holds
+    /// ([`TerminalEngine::line_range`]'s first value, negative while there is
+    /// scrollback). When new history appears above the screen every existing line
+    /// number decreases by the same amount, so the anchors move with it. When
+    /// history is *discarded* the remaining lines stay where they are, so nothing
+    /// is moved; the anchors that named discarded lines are dropped instead.
+    pub fn follow_buffer(&mut self, top_line: i32) {
+        let delta = top_line - self.top_line;
+        self.top_line = top_line;
+        if delta < 0 && !self.images.is_empty() {
+            self.shift(delta);
+        }
+        self.remove_before(top_line);
+    }
+
+    /// Drops the anchors above `line`.
+    ///
+    /// The same rule as [`ImageStore::remove_before`], applied here because the
+    /// store cannot report which placements it kept and the pixels have to follow
+    /// their placement.
+    pub fn remove_before(&mut self, line: i32) {
+        self.retain(|placement| placement.anchor_line >= line);
+    }
+
+    /// Drops the anchors a grid of `rows` x `cols` cells can never show.
+    ///
+    /// Called after a resize. Nothing is re-anchored — the anchoring model can only
+    /// drop — so an image the reflow moved to another line keeps pointing at its old
+    /// line number.
+    pub fn drop_outside(&mut self, rows: u16, cols: u16) {
+        self.retain(|placement| placement.anchor_line < rows as i32 && placement.column < cols);
+    }
+
+    /// Moves every anchor by `delta` lines, keeping placements and pixels paired.
+    fn shift(&mut self, delta: i32) {
+        let placements: Vec<ImagePlacement> = self
+            .store
+            .placements()
+            .iter()
+            .map(|placement| ImagePlacement {
+                anchor_line: placement.anchor_line + delta,
+                ..*placement
+            })
+            .collect();
+        let images = std::mem::take(&mut self.images);
+        self.rebuild(placements, images);
+    }
+
+    /// Keeps only the placements the predicate accepts, with their pixels.
+    fn retain(&mut self, mut keep: impl FnMut(&ImagePlacement) -> bool) {
+        let mut placements = Vec::with_capacity(self.store.len());
+        let mut images = Vec::with_capacity(self.images.len());
+        let taken = std::mem::take(&mut self.images);
+        for (placement, image) in self.store.placements().iter().zip(taken) {
+            if keep(placement) {
+                placements.push(*placement);
+                images.push(image);
+            }
+        }
+        self.rebuild(placements, images);
+    }
+
+    /// Rebuilds the store from paired placements and pixels.
+    ///
+    /// Insertion order is preserved and the byte total only ever shrinks here, so
+    /// nothing is evicted by the rebuild.
+    fn rebuild(&mut self, placements: Vec<ImagePlacement>, images: Vec<AnchoredImage>) {
+        self.store.clear();
+        for placement in &placements {
+            self.store.insert(*placement);
+        }
+        self.images = images;
+        debug_assert_eq!(self.store.len(), self.images.len());
+    }
+}
+
 /// Detects an http(s) URL on the cell under `column`.
 ///
 /// The word containing the column is extracted and accepted only when it starts
@@ -1031,6 +1420,7 @@ mod tests {
     use super::*;
     use astraterm_terminal::TerminalEngine;
     use astraterm_terminal::engine::EngineOptions;
+    use astraterm_terminal::image::ImageProtocol;
 
     fn snapshot(text: &str) -> Snapshot {
         let mut engine = TerminalEngine::new(EngineOptions {
@@ -1192,5 +1582,342 @@ mod tests {
         let layout = layout_config(&config);
         assert_eq!(layout.divider, 3);
         assert_eq!(layout.gap, 4);
+    }
+
+    // --- Terminal images ---------------------------------------------------
+
+    /// A 2x2 raw RGBA kitty image (`f=32`, `s=2`, `v=2`).
+    ///
+    /// Kitty's raw format needs no PNG encoder in the test binary: the base64
+    /// body of sixteen zero bytes is a constant, and every pixel is transparent.
+    const KITTY_IMAGE: &[u8] = b"\x1b_Ga=T,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\";
+
+    fn image_metrics() -> CellMetrics {
+        CellMetrics {
+            width: 8.0,
+            height: 16,
+            baseline: 12.0,
+        }
+    }
+
+    fn anchored(anchor_line: i32, column: u16, cols: u16, rows: u16) -> ImagePlacement {
+        ImagePlacement {
+            protocol: ImageProtocol::Kitty,
+            anchor_line,
+            column,
+            cols,
+            rows,
+            bytes: 0,
+        }
+    }
+
+    fn image_grid() -> ImageGrid {
+        ImageGrid {
+            origin: (10, 20),
+            metrics: image_metrics(),
+            rows: 4,
+            cols: 10,
+            display_offset: 0,
+        }
+    }
+
+    fn pixels(width: u32, height: u32, red: u8) -> Arc<ImagePixels> {
+        let rgba = vec![red; (width * height * 4) as usize];
+        Arc::new(ImagePixels::new(width, height, rgba).expect("matching RGBA buffer"))
+    }
+
+    fn image_engine() -> TerminalEngine {
+        TerminalEngine::new(EngineOptions {
+            cols: 20,
+            rows: 5,
+            ..Default::default()
+        })
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn an_image_covers_whole_cells() {
+        assert_eq!(image_cells((100, 50), image_metrics()), (13, 4));
+        assert_eq!(
+            image_cells((16, 32), image_metrics()),
+            (2, 2),
+            "exact multiples keep their cell count"
+        );
+        assert_eq!(
+            image_cells((1, 1), image_metrics()),
+            (1, 1),
+            "a sub-cell image still occupies one cell"
+        );
+        assert_eq!(image_cells((0, 0), image_metrics()), (1, 1));
+    }
+
+    #[test]
+    fn a_visible_image_covers_its_cells() {
+        let placed = image_rect(&anchored(1, 2, 3, 2), image_grid()).expect("inside the grid");
+        assert_eq!(placed.rect, Rect::new(26, 36, 24, 32));
+        assert_eq!(placed.uv, [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn scrolling_back_moves_the_image_down_with_the_text() {
+        let grid = ImageGrid {
+            display_offset: 2,
+            ..image_grid()
+        };
+        let placed = image_rect(&anchored(1, 0, 1, 1), grid).expect("still on screen");
+        assert_eq!(
+            placed.rect,
+            Rect::new(10, 68, 8, 16),
+            "row 1 plus two lines of scrollback"
+        );
+    }
+
+    #[test]
+    fn an_image_scrolled_past_the_top_is_culled() {
+        assert_eq!(image_rect(&anchored(-2, 0, 1, 2), image_grid()), None);
+        assert_eq!(
+            image_rect(&anchored(4, 0, 1, 1), image_grid()),
+            None,
+            "the row below the last one is outside the grid"
+        );
+        assert_eq!(
+            image_rect(&anchored(0, 10, 2, 1), image_grid()),
+            None,
+            "the column past the last one is outside the grid"
+        );
+    }
+
+    #[test]
+    fn a_partially_visible_image_is_clipped_instead_of_overflowing() {
+        let top = image_rect(&anchored(-1, 0, 2, 3), image_grid()).expect("two rows visible");
+        assert_eq!(top.rect, Rect::new(10, 20, 16, 32));
+        assert_close(top.uv[1], 1.0 / 3.0);
+        assert_close(top.uv[3], 1.0);
+
+        let bottom = image_rect(&anchored(3, 0, 1, 3), image_grid()).expect("one row visible");
+        assert_eq!(bottom.rect, Rect::new(10, 68, 8, 16));
+        assert_close(bottom.uv[1], 0.0);
+        assert_close(bottom.uv[3], 1.0 / 3.0);
+    }
+
+    #[test]
+    fn an_image_wider_than_the_grid_is_clipped() {
+        let placed = image_rect(&anchored(0, 8, 4, 1), image_grid()).expect("two columns visible");
+        assert_eq!(placed.rect, Rect::new(74, 20, 16, 16));
+        assert_close(placed.uv[2], 0.5);
+    }
+
+    #[test]
+    fn an_item_keeps_one_upload_generation_per_image() {
+        let image = pixels(2, 2, 1);
+        let first = image_item(&anchored(0, 0, 1, 1), 7, &image, image_grid()).expect("visible");
+        let second = image_item(&anchored(0, 0, 1, 1), 7, &image, image_grid()).expect("visible");
+        assert_eq!(first.id, 7);
+        assert_eq!(
+            first.generation, second.generation,
+            "the generation must not change with the frame"
+        );
+        assert_eq!(first.rect, second.rect);
+        assert!(Arc::ptr_eq(&first.pixels, &second.pixels));
+    }
+
+    #[test]
+    fn the_alternate_screen_invalidates_every_anchor() {
+        assert!(images_survive_alt_switch(false, false));
+        assert!(images_survive_alt_switch(true, true));
+        assert!(
+            !images_survive_alt_switch(false, true),
+            "entering the alternate screen drops the primary anchors"
+        );
+        assert!(
+            !images_survive_alt_switch(true, false),
+            "leaving it drops the alternate anchors"
+        );
+    }
+
+    #[test]
+    fn a_decoded_image_keeps_one_identity_across_frames() {
+        let mut images = SessionImages::new(SessionId::from_raw(4), 0);
+        assert!(images.insert(anchored(2, 0, 2, 1), pixels(16, 16, 3)));
+        let first: Vec<(u64, usize)> = images
+            .items()
+            .map(|(_, id, pixels)| (id, pixels.rgba.len()))
+            .collect();
+        let second: Vec<(u64, usize)> = images
+            .items()
+            .map(|(_, id, pixels)| (id, pixels.rgba.len()))
+            .collect();
+        assert_eq!(first, second, "identifiers are assigned once, at insert");
+        assert_eq!(first.len(), 1);
+        assert!(first[0].0 > 0);
+    }
+
+    #[test]
+    fn the_budget_evicts_the_oldest_image_first() {
+        let mut images = SessionImages::with_budget(SessionId::from_raw(5), 0, 64);
+        assert!(images.insert(anchored(1, 0, 1, 1), pixels(4, 4, 10)));
+        assert!(images.insert(anchored(2, 0, 1, 1), pixels(4, 4, 20)));
+
+        let kept: Vec<u8> = images
+            .items()
+            .map(|(_, _, pixels)| pixels.rgba[0])
+            .collect();
+        assert_eq!(kept, vec![20], "64 bytes of budget hold one 4x4 image");
+        let bytes: usize = images.items().map(|(_, _, pixels)| pixels.byte_len()).sum();
+        assert_eq!(bytes, 64, "the budget accounts for the decoded pixels");
+        let anchor = images.items().next().expect("one image").0.anchor_line;
+        assert_eq!(anchor, 2);
+    }
+
+    #[test]
+    fn an_image_larger_than_the_budget_is_refused() {
+        let mut images = SessionImages::with_budget(SessionId::from_raw(6), 0, 32);
+        assert!(!images.insert(anchored(1, 0, 1, 1), pixels(4, 4, 1)));
+        assert!(images.is_empty());
+        assert_eq!(images.items().count(), 0);
+    }
+
+    #[test]
+    fn lines_that_scroll_into_history_move_the_anchors() {
+        let mut images = SessionImages::new(SessionId::from_raw(7), 0);
+        assert!(images.insert(anchored(4, 0, 1, 1), pixels(2, 2, 9)));
+
+        images.follow_buffer(-3);
+
+        let anchor = images.items().next().expect("one image").0.anchor_line;
+        assert_eq!(
+            anchor, 1,
+            "the line the image sits on moved up with the content"
+        );
+        assert_eq!(images.items().count(), 1, "the texture is kept");
+    }
+
+    #[test]
+    fn discarding_history_drops_the_anchors_that_left_the_buffer() {
+        let mut images = SessionImages::new(SessionId::from_raw(8), -4);
+        assert!(images.insert(anchored(-2, 0, 1, 1), pixels(2, 2, 1)));
+        assert!(images.insert(anchored(1, 0, 1, 1), pixels(2, 2, 2)));
+
+        // Clearing the scrollback moves the top back to the live screen; anchors
+        // that named discarded lines must not survive it.
+        images.follow_buffer(0);
+
+        let kept: Vec<u8> = images
+            .items()
+            .map(|(_, _, pixels)| pixels.rgba[0])
+            .collect();
+        assert_eq!(kept, vec![2]);
+        let anchor = images.items().next().expect("one image").0.anchor_line;
+        assert_eq!(anchor, 1);
+    }
+
+    #[test]
+    fn entering_and_leaving_the_alternate_screen_drops_the_anchors() {
+        let mut images = SessionImages::new(SessionId::from_raw(9), 0);
+        assert!(images.insert(anchored(0, 0, 1, 1), pixels(2, 2, 1)));
+
+        images.follow_alt_screen(true);
+        assert!(images.is_empty(), "the primary anchors are dropped");
+
+        assert!(images.insert(anchored(0, 0, 1, 1), pixels(2, 2, 2)));
+        images.follow_alt_screen(true);
+        assert_eq!(
+            images.items().count(),
+            1,
+            "staying on the same screen keeps them"
+        );
+
+        images.follow_alt_screen(false);
+        assert!(images.is_empty(), "the alternate anchors are dropped");
+    }
+
+    #[test]
+    fn resize_discards_the_anchors_the_new_grid_cannot_show() {
+        let mut images = SessionImages::new(SessionId::from_raw(10), 0);
+        assert!(images.insert(anchored(30, 0, 1, 1), pixels(2, 2, 1)));
+        assert!(images.insert(anchored(2, 0, 1, 1), pixels(2, 2, 2)));
+        assert!(images.insert(anchored(0, 100, 1, 1), pixels(2, 2, 3)));
+
+        images.drop_outside(24, 80);
+
+        let kept: Vec<u8> = images
+            .items()
+            .map(|(_, _, pixels)| pixels.rgba[0])
+            .collect();
+        assert_eq!(kept, vec![2]);
+    }
+
+    #[test]
+    fn a_captured_kitty_image_is_anchored_and_drawn() {
+        let mut engine = image_engine();
+        let mut images = SessionImages::new(SessionId::from_raw(11), engine.line_range().0);
+
+        engine.process(KITTY_IMAGE);
+        assert_eq!(images.intake(&mut engine, image_metrics(), true), 1);
+
+        let (placement, id, pixels) = images.items().next().expect("one anchored image");
+        assert_eq!(placement.protocol, ImageProtocol::Kitty);
+        assert_eq!((placement.cols, placement.rows), (1, 1));
+        assert_eq!(placement.anchor_line, engine.cursor_point().line.0);
+        assert_eq!(pixels.byte_len(), 2 * 2 * 4);
+
+        let grid = ImageGrid {
+            origin: (0, 0),
+            metrics: image_metrics(),
+            rows: 5,
+            cols: 20,
+            display_offset: 0,
+        };
+        let item = image_item(placement, id, pixels, grid).expect("on screen");
+        assert_eq!(item.rect, Rect::new(0, 0, 8, 16));
+    }
+
+    #[test]
+    fn images_are_discarded_without_decoding_when_the_option_is_off() {
+        let mut engine = image_engine();
+        let mut images = SessionImages::new(SessionId::from_raw(12), engine.line_range().0);
+
+        engine.process(KITTY_IMAGE);
+        assert_eq!(images.intake(&mut engine, image_metrics(), false), 0);
+        assert!(images.is_empty());
+        assert!(
+            engine.take_images().is_empty(),
+            "the payloads are drained, not left to accumulate"
+        );
+    }
+
+    #[test]
+    fn a_refused_payload_leaves_the_session_usable() {
+        let mut engine = image_engine();
+        let mut images = SessionImages::new(SessionId::from_raw(13), engine.line_range().0);
+
+        // A chunked kitty transfer is legal on the wire but not supported here, and
+        // a truncated iTerm2 payload is simply broken: both are dropped silently.
+        engine.process(b"\x1b_Ga=T,f=32,s=2,v=2,m=1;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+        engine.process(b"\x1b]1337;File=inline=1:not-base64!\x07");
+        assert_eq!(images.intake(&mut engine, image_metrics(), true), 0);
+        assert!(images.is_empty());
+
+        engine.process(b"still fine");
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.lines[0].text().trim_end(), "still fine");
+    }
+
+    #[test]
+    fn an_image_sequence_does_not_reach_the_grid_as_text() {
+        let mut engine = image_engine();
+        engine.process(KITTY_IMAGE);
+        let snapshot = engine.snapshot();
+        assert_eq!(
+            snapshot.lines[0].text().trim_end(),
+            "",
+            "the payload is captured, not printed"
+        );
     }
 }

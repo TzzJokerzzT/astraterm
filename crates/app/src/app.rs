@@ -39,7 +39,7 @@ use crate::paste;
 use crate::prefs::{FONT_SIZE_STEP, Preferences, next_font_size};
 use crate::ui::{
     ClickInfo, ConfirmDialog, DragState, ExitCleanup, Overlay, PendingAction, RenameOverlay,
-    SearchOverlay, SplitIdRef, WindowUi, plan_exit_cleanup, url_at,
+    SearchOverlay, SessionImages, SplitIdRef, WindowUi, plan_exit_cleanup, url_at,
 };
 
 /// Events the application sends itself from other threads.
@@ -84,6 +84,9 @@ pub struct Application {
     system: SystemMonitor,
     /// When the status bar readings should be refreshed next.
     system_deadline: Option<Instant>,
+    /// Decoded images of each session, anchored to buffer lines. Only filled when
+    /// `terminal.images` is on; dropped when the session closes.
+    images: BTreeMap<SessionId, SessionImages>,
 }
 
 impl Application {
@@ -163,6 +166,7 @@ impl Application {
             blink_deadline: None,
             system: SystemMonitor::new(),
             system_deadline: None,
+            images: BTreeMap::new(),
         })
     }
 
@@ -404,10 +408,46 @@ impl Application {
         for event in self.sessions.drain_events() {
             self.handle_session_event(event);
         }
+        self.intake_images();
         if report.bytes_processed > 0 || report.exits > 0 {
             for ui in self.windows.values() {
                 ui.window.request_redraw();
             }
+        }
+    }
+
+    /// Drains the image sequences every session captured in the last pump.
+    ///
+    /// This is the only path from untrusted bytes to the GPU, so it is gated on
+    /// `terminal.images`: with the option off the payloads are drained and dropped
+    /// without being decoded. A refused payload is a dropped image, never a panic.
+    fn intake_images(&mut self) {
+        let enabled = self.config.config().terminal.images;
+        for session in self.sessions.iter_mut() {
+            let pane = session.pane;
+            let id = session.id;
+            // The cell metrics of the pane decide how many cells an image covers;
+            // a session whose window is already gone falls back to the defaults.
+            let metrics = self
+                .windows
+                .values()
+                .find(|ui| ui.panes.contains_key(&pane))
+                .map(|ui| ui.metrics)
+                .unwrap_or_default();
+            let top_line = session.engine.line_range().0;
+            let images = self
+                .images
+                .entry(id)
+                .or_insert_with(|| SessionImages::new(id, top_line));
+            images.intake(&mut session.engine, metrics, enabled);
+        }
+        // A closed session must not keep its decoded pixels alive. Session ids are
+        // never reused, so a stale entry can never become live again. The map is
+        // only walked when it holds something, which is never the case while the
+        // option is off.
+        if !self.images.is_empty() {
+            let live: Vec<SessionId> = self.sessions.iter().map(|session| session.id).collect();
+            self.images.retain(|id, _| live.contains(id));
         }
     }
 
@@ -591,12 +631,22 @@ impl Application {
             return;
         };
         let mut resized = false;
+        let mut resized_grids: Vec<(SessionId, u16, u16)> = Vec::new();
         for (pane, (cols, rows)) in sizes {
             if let Some(session) = self.sessions.for_pane_mut(pane)
                 && session.engine.size() != (cols, rows)
             {
                 session.resize(cols, rows, cell.0, cell.1);
+                resized_grids.push((session.id, cols, rows));
                 resized = true;
+            }
+        }
+        // A resize reflows the buffer, and an image anchor is a bare line number:
+        // nothing can be re-anchored, so the anchors the new grid cannot show are
+        // discarded instead of being drawn on the wrong line.
+        for (session, cols, rows) in resized_grids {
+            if let Some(images) = self.images.get_mut(&session) {
+                images.drop_outside(rows, cols);
             }
         }
         if resized && let Some(ui) = self.windows.get(&window_id) {
@@ -2430,8 +2480,9 @@ impl ApplicationHandler<UserEvent> for Application {
             WindowEvent::MouseWheel { delta, .. } => self.handle_wheel(window_id, delta),
             WindowEvent::CursorLeft { .. } => self.cursor = None,
             WindowEvent::RedrawRequested => {
+                let system = self.system.snapshot();
                 let scene = match self.windows.get_mut(&window_id) {
-                    Some(ui) => ui.compose(&mut self.sessions, &self.system.snapshot()),
+                    Some(ui) => ui.compose(&mut self.sessions, &system, &self.images),
                     None => return,
                 };
                 if let Some(ui) = self.windows.get_mut(&window_id)

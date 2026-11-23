@@ -13,6 +13,7 @@ input.
 | The user's keyboard, mouse and explicit commands | trusted | They act with the user's intent |
 | Terminal output and escape sequences | **untrusted** | Any program, file or remote host can emit them |
 | OSC 52 clipboard requests | **untrusted** | A remote process could read or overwrite the user's clipboard |
+| Image payloads (kitty graphics, iTerm2 `OSC 1337;File=`, sixel) | **untrusted** | Any program, file or remote host can emit them; decoded pixels are the largest allocation a program can ask for |
 | OSC 0/2 titles, bells, colour queries | untrusted | Titles and bells are displayed/reported; colour queries are answered with theme colours only; nothing from them is executed |
 | Status bar readings (`/proc/stat`, `/proc/meminfo`) | trusted, kernel-provided | Read locally, parsed with bounds, never logged; no process names or command lines are read |
 | Clipboard contents pasted by the user | untrusted | Pasted text may contain control characters; it is sent as input, not evaluated by AstraTerm |
@@ -80,6 +81,58 @@ that turns it on: `EngineSpec.allow_osc52` exists, but nothing sets it to true.
 If it were enabled, the engine would allow copy requests only
 (`Osc52::OnlyCopy`), and the application would write through the platform
 clipboard service.
+
+### Terminal images are opt-in, bounded and never fetched
+
+Image protocols are the one place where a program asks the terminal to allocate a
+large buffer and to put pixels on the screen. The bytes that arrive are exactly as
+untrusted as any other terminal output, so the whole path is gated and bounded.
+
+- **Opt-in.** `terminal.images` (`crates/config/src/schema.rs`) defaults to
+  `false`; the test `images_are_off_by_default` pins it. With the option off,
+  `SessionImages::intake` (`crates/app/src/ui.rs`) still drains the sequences the
+  session captured — they never accumulate — and drops them **without decoding a
+  single byte**. Nothing from a program can reach a decoder while the option is
+  off.
+- **Capture is bounded** (`crates/terminal/src/image.rs`). One payload is capped
+  at `MAX_IMAGE_BYTES` (8 MiB) and an unterminated sequence is abandoned at
+  `MAX_PENDING_BYTES` (8 MiB + 8 KiB), so a malformed sequence cannot swallow the
+  text that follows it. Cancelled, unterminated and oversized sequences are
+  counted and dropped; foreign APC/OSC/DCS sequences are passed through byte for
+  byte. Only the three image introducers are ever buffered.
+- **Declared sizes are checked before allocation**
+  (`crates/terminal/src/image_decode.rs`, `DecodeLimits::default()`): a payload is
+  limited to 8 MiB, a decoded image to 4096 pixels on either axis and to
+  2048x2048 pixels (16 MiB of RGBA). The width and height are validated *before*
+  the pixel buffer is sized, so a PNG header that claims 60000x60000 reserves
+  nothing. Base64 is strict: an invalid alphabet, length or padding is refused,
+  never guessed.
+- **Unsupported features are refused, not half-drawn.** A chunked kitty transfer
+  (`m=1`), a kitty format other than PNG or raw RGB/RGBA, an iTerm2 `inline=0`
+  download, and sixel HLS colour definitions all return
+  `DecodeError::Unsupported`. Decode errors are dropped silently: a malformed
+  sequence is an image that did not appear, never a panic and never a partial
+  grid.
+- **Nothing is fetched.** There is no network path and no file write on the image
+  path: iTerm2's `inline=0` ("save the file instead of showing it") is refused, and
+  no URL or path from a payload is ever opened. AstraTerm never downloads an
+  image that a program names.
+- **Memory is bounded twice.** The anchoring store
+  (`ImageStore`, `crates/terminal/src/image.rs`) holds at most 64 MiB of decoded
+  pixels per session and evicts the oldest image first; a single image larger than
+  the whole budget is refused. The GPU side has its own 64 MiB texture budget with
+  least-recently-used eviction (`crates/renderer/src/texture.rs`).
+- **Lifecycle.** The store is cleared when the alternate screen is entered or
+  left (the anchors name lines of the other grid), anchors that named discarded
+  scrollback lines are dropped, and a closed session's decoded pixels are released
+  with it (`Application::intake_images`). A resize never re-anchors; anchors the new
+  grid cannot show are discarded.
+- **Not logged.** The image path logs nothing: no payload, no decoded pixel,
+  no protocol header. In a terminal, logging an image's bytes would be logging
+  terminal content.
+
+No `unsafe` is involved: the decoders are safe Rust over slices, and the only
+allocation sizes derive from the checked dimensions above.
 
 ### URL opening is restricted and gesture-driven
 
