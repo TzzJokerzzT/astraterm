@@ -133,18 +133,28 @@ never prints the content.
 
 ### Child processes are terminated on shutdown
 
-- `PtyHandle::shutdown` (`crates/pty/src/lib.rs`) sends `Shutdown` to the writer
-  thread, which drops the PTY master (SIGHUP), waits `KILL_GRACE = 400 ms`, then
-  calls the child killer and waits up to two seconds.
-- `SessionManager::shutdown_all` shuts every session down; it is called by
-  `Application::finish` (quit / last window closed) and by
-  `ApplicationHandler::exiting`, and `SessionManager` also calls it from `Drop`.
-- `SessionManager::close` removes a session and shuts it down; closing a pane,
-  tab or window goes through it.
+- `PtyHandle::request_shutdown` (`crates/pty/src/lib.rs`) asks the writer thread to
+  close the PTY master. Closing it is a *polite* close, not a guarantee: the reader
+  thread holds a duplicate of the descriptor and a child may ignore SIGHUP.
+- `PtyHandle::kill_hard` escalates with `SIGKILL` sent to the child's **process
+  group** (`libc::kill(-pid, SIGKILL)`; the child is a session leader, so its
+  process group id equals its pid). That also terminates grandchildren a shell may
+  have spawned, which is what prevents orphans. It is the only `unsafe` block in
+  the workspace, is three lines long, and cannot violate memory safety.
+- `PtyHandle::shutdown` is bounded: polite close, one `KILL_GRACE = 400 ms` wait,
+  hard kill, short reap. `PtyHandle::drop` performs the same escalation so a dropped
+  handle cannot leak a child.
+- `SessionManager::shutdown_all` requests a polite close for every session, waits a
+  **single shared** 400 ms grace period (not one per session), hard-kills whatever
+  is still alive, and reaps the exit statuses. It is called by
+  `Application::finish` (quit / last window closed), by
+  `ApplicationHandler::exiting`, and from `SessionManager`'s `Drop`.
+- `SessionManager::close` removes a session and shuts it down with the same bounded
+  path; closing a pane, tab or window goes through it.
 
-This is a best-effort process-tree termination: AstraTerm kills the child it
-spawned. A grandchild that detaches itself (setsid) is the responsibility of the
-program, as with any terminal.
+A grandchild that deliberately calls `setsid` to leave the terminal's process group
+is outside what any terminal can reclaim, exactly as with any other terminal
+emulator.
 
 ## SSH posture
 
@@ -172,9 +182,11 @@ program, as with any terminal.
 
 ## Unsafe code policy
 
-`grep -rn "unsafe" crates/` returns **no matches**: the workspace has zero
-`unsafe` blocks, `unsafe fn`, `unsafe impl` or `unsafe trait` declarations as of
-this tree. New `unsafe` code must be justified in review, kept minimal, and
+The workspace contains exactly **one** `unsafe` site, in
+`crates/pty/src/lib.rs` (`PtyHandle::kill_hard`): two `libc::kill(2)` calls that
+escalate to `SIGKILL` when a child ignores the polite close, each preceded by a
+`// SAFETY:` comment. There are no `unsafe fn`, `unsafe impl` or `unsafe trait`
+declarations. New `unsafe` code must be justified in review, kept minimal, and
 documented with a `// SAFETY:` comment.
 
 Dependencies may use `unsafe` internally (wgpu, winit, alacritty_terminal,

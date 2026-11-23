@@ -236,7 +236,9 @@ checksums before publishing** (see the comment at the top of the file).
   bounded, so a noisy process cannot exhaust memory or starve other panes.
 - **No automatic link opening.** URL detection only acts on an explicit user
   action.
-- **No `unsafe` Rust.** The workspace currently contains no `unsafe` block.
+- **Minimal `unsafe`.** Exactly one place: the `SIGKILL` escalation that stops a
+  child which ignores the polite close (`crates/pty/src/lib.rs`, three lines, no
+  memory access). See [docs/SECURITY.md](docs/SECURITY.md).
 
 ## Known limitations
 

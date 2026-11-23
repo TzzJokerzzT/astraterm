@@ -34,8 +34,8 @@ use winit::window::{Window, WindowId as WinitWindowId};
 use crate::cli::Cli;
 use crate::keys;
 use crate::ui::{
-    ClickInfo, ConfirmDialog, DragState, Overlay, PendingAction, RenameOverlay, SearchOverlay,
-    SplitIdRef, WindowUi, url_at,
+    ClickInfo, ConfirmDialog, DragState, ExitCleanup, Overlay, PendingAction, RenameOverlay,
+    SearchOverlay, SplitIdRef, WindowUi, plan_exit_cleanup, url_at,
 };
 
 /// Events the application sends itself from other threads.
@@ -443,61 +443,88 @@ impl Application {
         let description = reason.describe();
 
         if close_pane {
-            let mut to_sync = Vec::new();
+            let mut changed = Vec::new();
+            let mut kept_open = false;
+            let mut remove_session = false;
             for window_id in self.windows.keys().copied().collect::<Vec<_>>() {
-                let closed = self
-                    .with_window(window_id, |ui| {
-                        let Some(tab_id) = ui
-                            .workspace
-                            .tabs
-                            .iter()
-                            .find(|tab| tab.panes().contains(&pane))
-                            .map(|tab| tab.id)
-                        else {
-                            return false;
-                        };
-                        let single = ui
-                            .workspace
-                            .tab(tab_id)
-                            .map(|tab| tab.pane_count() == 1)
+                let plan = self
+                    .windows
+                    .get(&window_id)
+                    .map(|ui| plan_exit_cleanup(&ui.workspace, pane));
+                match plan {
+                    Some(ExitCleanup::ClosePane(pane)) => {
+                        let closed = self
+                            .with_window(window_id, |ui| {
+                                let closed = ui
+                                    .workspace
+                                    .active_tab_mut()
+                                    .map(|tab| tab.close_pane(pane))
+                                    .unwrap_or(false);
+                                if closed {
+                                    ui.panes.remove(&pane);
+                                    ui.session_bindings.remove(&pane);
+                                    ui.window.request_redraw();
+                                }
+                                closed
+                            })
                             .unwrap_or(false);
-                        if single {
-                            let closed = ui.workspace.close_tab(tab_id);
-                            ui.panes.remove(&pane);
-                            ui.session_bindings.remove(&pane);
-                            closed
-                        } else {
-                            let removed = ui
-                                .workspace
-                                .tab_mut(tab_id)
-                                .map(|tab| tab.close_pane(pane))
-                                .unwrap_or(false);
-                            if removed {
-                                ui.panes.remove(&pane);
-                                ui.session_bindings.remove(&pane);
-                            }
-                            removed
+                        if closed {
+                            changed.push(window_id);
+                            remove_session = true;
                         }
-                    })
-                    .unwrap_or(false);
-                if closed {
-                    to_sync.push(window_id);
-                    if let Some(ui) = self.windows.get_mut(&window_id) {
-                        ui.status = Some((format!("session {description}"), Instant::now()));
+                    }
+                    Some(ExitCleanup::CloseTab(tab)) => {
+                        let closed = self
+                            .with_window(window_id, |ui| {
+                                let panes = ui
+                                    .workspace
+                                    .tab(tab)
+                                    .map(|tab| tab.panes())
+                                    .unwrap_or_default();
+                                let closed = ui.workspace.close_tab(tab);
+                                if closed {
+                                    for pane in panes {
+                                        ui.panes.remove(&pane);
+                                        ui.session_bindings.remove(&pane);
+                                    }
+                                    ui.window.request_redraw();
+                                }
+                                closed
+                            })
+                            .unwrap_or(false);
+                        if closed {
+                            changed.push(window_id);
+                            remove_session = true;
+                        }
+                    }
+                    Some(ExitCleanup::KeepOpen) | None => {
+                        // The last pane of the last tab keeps its session and metadata so
+                        // the final screen stays readable; nothing is stripped.
+                        kept_open = true;
+                    }
+                }
+            }
+            for window_id in changed {
+                self.sync_sizes(window_id);
+                self.with_window(window_id, |ui| {
+                    ui.status = Some((format!("session {description}"), Instant::now()));
+                });
+            }
+            if kept_open {
+                for ui in self.windows.values_mut() {
+                    if ui.panes.contains_key(&pane) {
+                        ui.status = Some((
+                            format!("session {description} — close the tab to dismiss"),
+                            Instant::now(),
+                        ));
                         ui.window.request_redraw();
                     }
                 }
             }
-            for window_id in to_sync {
-                self.sync_sizes(window_id);
+            if remove_session {
+                self.sessions.close(session_id);
             }
             self.persist_workspace();
-        }
-
-        // Keep the session object until the pane is gone so its terminal content stays
-        // visible; the PTY is already closed.
-        if !self.windows.values().any(|ui| ui.panes.contains_key(&pane)) {
-            self.sessions.close(session_id);
         }
     }
 
@@ -2125,8 +2152,9 @@ impl ApplicationHandler<UserEvent> for Application {
                 if let Some(ui) = self.windows.get_mut(&window_id)
                     && let Err(error) = ui.renderer.render(&scene)
                 {
-                    tracing::debug!(error = %error, "frame was not drawn; retrying");
-                    ui.window.request_redraw();
+                    // A redraw requested from inside the redraw handler would spin the
+                    // event loop on a persistent failure; the next real event retries.
+                    tracing::warn!(error = %error, "frame was not drawn");
                 }
             }
             WindowEvent::Occluded(occluded) => {

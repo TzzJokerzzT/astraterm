@@ -108,3 +108,32 @@ repository parent directory).
   because terminal escape sequences are untrusted input (S13).
 - The graphical settings panel is a native overlay rendered with the same GPU
   pipeline: no GUI framework, no webview (S5).
+
+### L4 — independent verification of the concurrency path (item 4)
+
+An independent read-only verifier reviewed the PTY/session/application concurrency
+and produced four findings; every one is now fixed and pinned by a test:
+
+1. **Shutdown could leak an orphan.** Closing the PTY is not a hangup (the reader
+   thread holds a duplicate descriptor) and `portable-pty`'s killer sends SIGHUP, so
+   a child that traps HUP survived. Now `PtyHandle::kill_hard` sends `SIGKILL` to the
+   child's process group, `Drop` escalates too, and `SessionManager::shutdown_all`
+   uses one shared grace period for all sessions instead of one per session
+   (measured before: 2.4 s and a leak per ignoring child; after: bounded, no leak).
+   Pinned by `crates/session/tests/shutdown_no_orphan.rs`.
+2. **`PumpReport::bytes_processed` under-reported** because it was derived from the
+   remaining budget, which saturates on the final chunk. The pump now returns the
+   exact count. Pinned by `crates/session/tests/output_accounting.rs`.
+3. **A zombie pane** appeared when the shell exited in the last pane of the last tab:
+   pane metadata was stripped even though the tab could not be closed. The decision
+   now lives in a pure helper (`ui::plan_exit_cleanup`) with three outcomes, and the
+   last pane keeps its session and metadata so the final screen stays readable.
+   Pinned by unit tests in `crates/app/src/ui.rs`.
+4. **A redraw requested from inside the redraw handler** would spin the event loop on
+   a persistent renderer error. The retry was removed; the next real event retries.
+
+Also corrected while fixing these: protocol replies now wait a bounded 100 ms for
+queue room instead of blocking forever, `reap_exited` (dead code that could re-emit
+an exit) was removed, `input_drops` logs on the first drop instead of being silent,
+and `docs/SECURITY.md` now describes the real `SIGKILL` escalation and the single
+documented `unsafe` site.

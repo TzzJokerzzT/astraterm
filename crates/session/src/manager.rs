@@ -25,6 +25,9 @@ use crate::lifecycle::SessionSpec;
 /// Together with the bounded PTY queue this is what keeps a `yes` flood from
 /// making the UI unresponsive: one pass does a bounded amount of parsing work and
 /// the remaining bytes stay queued with backpressure applied to the child.
+///
+/// A pass overshoots by at most one read chunk ([`astraterm_pty::READ_CHUNK_BYTES`])
+/// because the budget is checked before each chunk, not inside it.
 pub const PUMP_BUDGET_BYTES: usize = 256 * 1024;
 
 /// Maximum chunks read from one session per pump pass, to keep fairness between
@@ -33,6 +36,9 @@ pub const PUMP_BUDGET_CHUNKS: usize = 512;
 
 /// How often the session refreshes its cached working directory.
 const CWD_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Shared grace period for shutting down every session on exit.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(400);
 
 /// Errors raised while creating a session.
 #[derive(Debug, thiserror::Error)]
@@ -88,9 +94,15 @@ impl Session {
             return;
         };
         if !pty.write(bytes) {
-            // Queue full or PTY gone; count it so the app can surface a warning
-            // instead of pretending the keystroke reached the child.
+            // Queue full or PTY gone. Count it and warn once per session so a dropped
+            // keystroke is visible instead of silently lost.
             self.input_drops += 1;
+            if self.input_drops == 1 {
+                tracing::warn!(
+                    session = %self.id,
+                    "input queue is full; keystrokes may be dropped"
+                );
+            }
         }
     }
 
@@ -175,9 +187,9 @@ impl Session {
         clipboard: &mut Vec<String>,
         replies: &mut Vec<(SessionId, Vec<u8>)>,
         budget: &mut usize,
-    ) {
+    ) -> usize {
         let Some(pty) = self.private_pty.as_ref() else {
-            return;
+            return 0;
         };
         let mut processed = 0usize;
         let mut chunks = 0usize;
@@ -191,6 +203,8 @@ impl Session {
             self.engine.process(&chunk);
             self.dirty = true;
         }
+        // Saturating: a chunk may overshoot the budget by at most one read, and the
+        // exact count is reported through the return value.
         *budget = budget.saturating_sub(processed);
 
         for event in self.engine.drain_events() {
@@ -231,6 +245,38 @@ impl Session {
         if processed > 0 {
             events.push(SessionEvent::Output { session: self.id });
         }
+        processed
+    }
+
+    /// Asks the PTY to close without blocking the caller.
+    pub fn request_shutdown(&self) {
+        if let Some(pty) = self.private_pty.as_ref() {
+            pty.request_shutdown();
+        }
+    }
+
+    /// Kills the child's process group. Used after the shared grace period.
+    pub fn kill_hard(&mut self) {
+        if let Some(pty) = self.private_pty.as_ref() {
+            pty.kill_hard();
+        }
+    }
+
+    /// Whether the child is still alive according to the latest pump.
+    pub fn child_alive(&self) -> bool {
+        self.exit.is_none()
+    }
+
+    /// Reaps a pending exit status so a killed child does not stay a zombie.
+    pub fn take_exit(&mut self) -> Option<ExitReason> {
+        let reason = self
+            .private_pty
+            .as_mut()
+            .and_then(|pty| pty.try_recv_exit());
+        if let Some(reason) = &reason {
+            self.exit = Some(reason.clone());
+        }
+        reason
     }
 }
 
@@ -390,15 +436,12 @@ impl SessionManager {
 
         for session in self.sessions.values_mut() {
             let mut budget = PUMP_BUDGET_BYTES;
-            let before = session.dirty;
-            session.pump_output(&mut events, &mut clipboard, &mut replies, &mut budget);
-            if session.dirty && !before {
-                session.dirty = true;
-            }
+            let processed =
+                session.pump_output(&mut events, &mut clipboard, &mut replies, &mut budget);
             if session.dirty {
                 report.sessions_dirty += 1;
             }
-            report.bytes_processed += PUMP_BUDGET_BYTES - budget;
+            report.bytes_processed += processed;
 
             if session.exit.is_none()
                 && let Some(pty) = session.private_pty.as_mut()
@@ -424,33 +467,42 @@ impl SessionManager {
         std::mem::take(&mut self.events)
     }
 
-    /// Removes sessions whose child exited and whose pane was already closed.
-    pub fn reap_exited(&mut self, keep: &[PaneId]) -> Vec<SessionEvent> {
-        let mut events = Vec::new();
-        let remove: Vec<SessionId> = self
-            .sessions
-            .values()
-            .filter(|session| session.exit.is_some() && !keep.contains(&session.pane))
-            .map(|session| session.id)
-            .collect();
-        for id in remove {
-            if let Some(mut session) = self.sessions.remove(&id) {
-                session.shutdown();
-                if let Some(reason) = session.exit {
-                    events.push(SessionEvent::Exited {
-                        session: id,
-                        reason,
-                    });
+    /// Shuts every session down. Used on application exit so no child is orphaned.
+    ///
+    /// One shared grace period for all sessions, then `SIGKILL` for anything that
+    /// ignored the polite close. This is bounded and cannot leak a child that traps
+    /// SIGHUP, and it does not cost one grace period per session.
+    pub fn shutdown_all(&mut self) {
+        let mut sessions: Vec<Session> = std::mem::take(&mut self.sessions).into_values().collect();
+        if sessions.is_empty() {
+            return;
+        }
+        for session in &sessions {
+            session.request_shutdown();
+        }
+
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        while Instant::now() < deadline {
+            let mut alive = false;
+            for session in &mut sessions {
+                if session.child_alive() {
+                    alive = true;
                 }
             }
+            if !alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
-        events
-    }
 
-    /// Shuts every session down. Used on application exit so no child is orphaned.
-    pub fn shutdown_all(&mut self) {
-        for (_, mut session) in std::mem::take(&mut self.sessions) {
-            session.shutdown();
+        for session in &mut sessions {
+            if session.child_alive() {
+                session.kill_hard();
+            }
+        }
+        // Reap the killed children so no zombie is left behind.
+        for session in &mut sessions {
+            let _ = session.take_exit();
         }
     }
 
@@ -610,9 +662,12 @@ mod tests {
             let report = manager.pump();
             passes += 1;
             if report.bytes_processed > 0 {
+                // The loop stops once the budget is reached, so a pass can overshoot
+                // by at most the chunk it was already reading.
                 assert!(
-                    report.bytes_processed <= PUMP_BUDGET_BYTES,
-                    "budget exceeded"
+                    report.bytes_processed <= PUMP_BUDGET_BYTES + astraterm_pty::READ_CHUNK_BYTES,
+                    "budget exceeded: {} bytes in one pass",
+                    report.bytes_processed
                 );
             }
             let done = manager.iter().all(|session| session.exit.is_some());

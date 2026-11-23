@@ -860,6 +860,38 @@ pub fn layout_config(config: &Config) -> LayoutConfig {
     }
 }
 
+/// What the application should do with a window when a session's child exits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitCleanup {
+    /// Another pane survives in the same tab: close just this pane.
+    ClosePane(PaneId),
+    /// This was the tab's only pane but another tab exists: close the tab.
+    CloseTab(TabId),
+    /// This is the last pane of the last tab: keep it visible, close nothing.
+    KeepOpen,
+}
+
+/// Decides the cleanup for an exited session.
+///
+/// Keeping the metadata of a pane that cannot be closed is what prevents a zombie
+/// pane: a pane with no session and no metadata neither renders nor closes.
+pub fn plan_exit_cleanup(workspace: &WindowState, pane: PaneId) -> ExitCleanup {
+    let Some(tab) = workspace
+        .tabs
+        .iter()
+        .find(|tab| tab.panes().contains(&pane))
+    else {
+        return ExitCleanup::KeepOpen;
+    };
+    if tab.pane_count() > 1 {
+        return ExitCleanup::ClosePane(pane);
+    }
+    if workspace.tabs.len() > 1 {
+        return ExitCleanup::CloseTab(tab.id);
+    }
+    ExitCleanup::KeepOpen
+}
+
 /// Detects an http(s) URL on the cell under `column`.
 ///
 /// The word containing the column is extracted and accepted only when it starts
@@ -995,6 +1027,54 @@ mod tests {
     fn empty_rename_clears_the_title() {
         let rename = RenameOverlay::new(TabId::from_raw(1), "   ");
         assert_eq!(rename.committed_title(), "");
+    }
+
+    #[test]
+    fn exit_cleanup_closes_a_pane_when_siblings_remain() {
+        let first = PaneId::from_raw(1);
+        let second = PaneId::from_raw(2);
+        let mut tab = Tab::new("t", first);
+        tab.split_focused(SplitAxis::Vertical, second);
+        let workspace = WindowState::new(WindowId::from_raw(1), tab);
+        assert_eq!(
+            plan_exit_cleanup(&workspace, second),
+            ExitCleanup::ClosePane(second)
+        );
+    }
+
+    #[test]
+    fn exit_cleanup_closes_the_tab_when_it_is_the_only_pane_but_not_the_only_tab() {
+        let first = PaneId::from_raw(1);
+        let other = PaneId::from_raw(2);
+        let tab = Tab::new("one", first);
+        let mut workspace = WindowState::new(WindowId::from_raw(1), tab);
+        workspace.add_tab(Tab::new("two", other));
+        let tab_id = workspace.tabs[0].id;
+        assert_eq!(
+            plan_exit_cleanup(&workspace, first),
+            ExitCleanup::CloseTab(tab_id)
+        );
+    }
+
+    #[test]
+    fn exit_cleanup_keeps_the_last_pane_of_the_last_tab() {
+        let only = PaneId::from_raw(1);
+        let workspace = WindowState::new(WindowId::from_raw(1), Tab::new("only", only));
+        assert_eq!(
+            plan_exit_cleanup(&workspace, only),
+            ExitCleanup::KeepOpen,
+            "the last pane must stay rendered instead of becoming a zombie"
+        );
+    }
+
+    #[test]
+    fn exit_cleanup_ignores_unknown_panes() {
+        let workspace =
+            WindowState::new(WindowId::from_raw(1), Tab::new("only", PaneId::from_raw(1)));
+        assert_eq!(
+            plan_exit_cleanup(&workspace, PaneId::from_raw(99)),
+            ExitCleanup::KeepOpen
+        );
     }
 
     #[test]

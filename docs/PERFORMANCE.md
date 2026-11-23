@@ -28,7 +28,8 @@ Structural tests that pin these rules:
 - `crates/pty`: `output_queue_is_bounded_and_never_loses_bytes` (a 400 KB burst
   arrives almost completely; the queue never drops chunks), `shutdown_terminates_a_long_running_child`.
 - `crates/session`: `pump_budget_limits_work_per_pass` (a 2 MB flood must be split
-  across pump passes and no pass exceeds `PUMP_BUDGET_BYTES`).
+  across pump passes; a pass may overshoot `PUMP_BUDGET_BYTES` by at most one read
+  chunk, `astraterm_pty::READ_CHUNK_BYTES`).
 - `crates/app/src/ui.rs`: `blink_gate_fires_twice_per_period`,
   `blink_gate_does_not_burst_after_a_long_stall`.
 - `crates/renderer/src/text.rs`: `shaping_populates_the_cache_and_is_reused`,

@@ -174,6 +174,9 @@ Notes:
 - `SessionManager::pump` gives every session one budget pass:
   `PUMP_BUDGET_BYTES = 256 KiB` or `PUMP_BUDGET_CHUNKS = 512` chunks, whichever
   is reached first. Leftover output stays in the bounded PTY queue.
+- A pump pass stops once the byte budget is reached, so it can overshoot its budget
+  by at most one read chunk (`astraterm_pty::READ_CHUNK_BYTES`); `PumpReport`
+  reports the exact number of bytes that reached the engine.
 - `pump` also translates engine events (title, bell, OSC 52 store, colour
   queries, direct PTY replies) into `SessionEvent`s or `PumpReport` fields, and
   reports child exit exactly once. A colour query (OSC 4/10/11) becomes

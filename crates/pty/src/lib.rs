@@ -23,12 +23,17 @@ use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
 
 /// Size of a single read from the PTY master.
 const READ_CHUNK: usize = 32 * 1024;
+
+/// Largest amount a single pump pass can overshoot its budget by.
+pub const READ_CHUNK_BYTES: usize = READ_CHUNK;
 /// Bounded output queue depth, in chunks (about 2 MiB per session).
 const OUTPUT_QUEUE: usize = 64;
 /// Bounded input queue depth, in messages.
 const INPUT_QUEUE: usize = 1024;
 /// Grace period between closing the PTY and killing a surviving child.
 const KILL_GRACE: Duration = Duration::from_millis(400);
+/// Upper bound on how long a protocol reply may wait for queue room.
+const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Everything needed to launch a session.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,15 +140,22 @@ impl PtyHandle {
         }
     }
 
-    /// Queues bytes, waiting for room. Used for small, mandatory writes.
+    /// Queues bytes, waiting at most [`WRITE_TIMEOUT`] for room.
     ///
-    /// Returns `false` when the PTY has already been shut down, which means the
-    /// write was not delivered and the caller may ignore it.
+    /// Protocol replies (cursor position reports, colour answers) must not stall the
+    /// event loop, so the wait is bounded. Returns `false` when the bytes were not
+    /// delivered, either because the PTY is gone or because the queue stayed full,
+    /// which callers count instead of pretending the write happened.
     pub fn write_blocking(&self, bytes: &[u8]) -> bool {
         if bytes.is_empty() {
             return true;
         }
-        self.input.send(Input::Data(bytes.to_vec())).is_ok()
+        !matches!(
+            self.input
+                .send_timeout(Input::Data(bytes.to_vec()), WRITE_TIMEOUT),
+            Err(crossbeam_channel::SendTimeoutError::Timeout(_))
+                | Err(crossbeam_channel::SendTimeoutError::Disconnected(_))
+        )
     }
 
     /// Notifies the PTY of a new size. Never blocks.
@@ -179,21 +191,56 @@ impl PtyHandle {
         !self.exited
     }
 
+    /// Asks the PTY to close without blocking the caller.
+    ///
+    /// Closing the master is the polite path, but it is not a guarantee: the reader
+    /// thread holds a duplicate of the master descriptor, and a child that ignores
+    /// SIGHUP keeps running. Callers that need certainty must follow up with
+    /// [`PtyHandle::kill_hard`], as [`PtyHandle::shutdown`] and the session manager do.
+    pub fn request_shutdown(&self) {
+        let _ = self.input.try_send(Input::Shutdown);
+    }
+
+    /// Kills the child's process group with `SIGKILL`.
+    ///
+    /// The child is a session leader (the PTY layer calls `setsid`), so its process
+    /// group id equals its pid: signalling the negative pid also terminates the
+    /// grandchildren a shell may have spawned, which is what prevents orphans.
+    pub fn kill_hard(&self) {
+        let Some(pid) = self.child_pid else {
+            // Without a pid the only portable option is the crate's own killer.
+            let mut killer = self.killer.clone_killer();
+            let _ = killer.kill();
+            return;
+        };
+        let pid = pid as libc::pid_t;
+        // SAFETY: `kill(2)` with a plain integer pid and a constant signal cannot
+        // violate memory safety; a failure is reported through the return value,
+        // which is intentionally ignored because there is nothing left to try.
+        let killed_group = unsafe { libc::kill(-pid, libc::SIGKILL) } == 0;
+        if !killed_group {
+            // The process may not be a group leader after all; fall back to the pid.
+            // SAFETY: same reasoning as above.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+
     /// Closes the PTY, then kills a surviving child after a short grace period.
     ///
-    /// Returns the exit reason when it becomes available.
+    /// Bounded by construction: one grace period plus a short reap window, never an
+    /// unbounded wait.
     pub fn shutdown(&mut self) -> Option<ExitReason> {
         if self.exited {
             return None;
         }
-        let _ = self.input.try_send(Input::Shutdown);
+        self.request_shutdown();
         if let Some(reason) = self.wait_exit(KILL_GRACE) {
             return Some(reason);
         }
-        // Closing the PTY did not stop the child (it may ignore SIGHUP), so hang it
-        // up explicitly and give the waiter thread time to publish the status.
-        let _ = self.killer.kill();
-        self.wait_exit(Duration::from_secs(2))
+        self.kill_hard();
+        self.wait_exit(Duration::from_millis(200))
     }
 
     /// Waits up to `timeout` for the waiter thread to publish an exit status.
@@ -219,9 +266,16 @@ impl PtyHandle {
 
 impl Drop for PtyHandle {
     fn drop(&mut self) {
-        // Closing the PTY is what stops the child; the writer thread owns the
-        // master and exits when it receives this message.
-        let _ = self.input.try_send(Input::Shutdown);
+        // Dropping a handle must not leak a child: ask for a polite close and kill
+        // the process group when the child is still alive. The waiter thread reports
+        // the status asynchronously, so this stays cheap.
+        self.request_shutdown();
+        if !self.exited {
+            // Give the polite close a moment without blocking shutdown paths for long.
+            if self.wait_exit(Duration::from_millis(50)).is_none() {
+                self.kill_hard();
+            }
+        }
     }
 }
 
@@ -351,7 +405,10 @@ pub fn spawn_with_waker(spec: &PtySpec, waker: Option<Waker>) -> Result<PtyHandl
                     Input::Shutdown => break,
                 }
             }
-            // Dropping the master here closes the PTY, which sends SIGHUP.
+            // Dropping the master closes this descriptor. The reader thread holds a
+            // duplicate, so the child is not guaranteed a hangup here: shutdown paths
+            // escalate to `PtyHandle::kill_hard` when the child outlives the grace
+            // period.
             drop(master);
         })
         .map_err(|error| PtyError::Attach(error.to_string()))?;
