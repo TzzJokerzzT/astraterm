@@ -43,17 +43,11 @@ package() {
         "$pkgdir/usr/share/applications/astraterm.desktop"
     install -Dm644 packaging/linux/config.toml "$pkgdir/etc/astraterm/config.toml"
 
-    # The repository ships the icon as SVG (see assets/icons/README.md); the
-    # freedesktop 128x128 icon slot takes a PNG, so rasterise it here. Without
-    # rsvg-convert (librsvg) the scalable SVG slot is used instead, which icon
-    # themes resolve just as well.
-    if command -v rsvg-convert >/dev/null 2>&1; then
-        rsvg-convert -w 128 -h 128 assets/icons/astraterm.svg -o astraterm.png
-        install -Dm644 astraterm.png "$pkgdir/usr/share/icons/hicolor/128x128/apps/astraterm.png"
-    else
-        warning "rsvg-convert not found; installing the scalable SVG icon instead of a 128x128 PNG"
-        warning "install librsvg as a build dependency to produce the PNG"
-        install -Dm644 assets/icons/astraterm.svg \
-            "$pkgdir/usr/share/icons/hicolor/scalable/apps/astraterm.svg"
-    fi
+    # The icon set is committed under assets/icons/hicolor (generated from
+    # assets/icons/logo.png by assets/icons/generate-icons.sh), so the package
+    # installs every size the icon theme asks for instead of scaling one bitmap.
+    for size in 32x32 48x48 64x64 128x128 256x256 512x512; do
+        install -Dm644 "assets/icons/hicolor/$size/apps/astraterm.png" \
+            "$pkgdir/usr/share/icons/hicolor/$size/apps/astraterm.png"
+    done
 }

@@ -22,6 +22,7 @@ astraterm-platform = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 crossbeam-channel = { workspace = true }
+png = { workspace = true }
 pollster = "0.4"
 thiserror = { workspace = true }
 toml = { workspace = true }

@@ -1,29 +1,39 @@
 # AstraTerm icons
 
-`astraterm.svg` is a **placeholder** icon: a dark terminal window with an
-accent-coloured (`#8B9CFF`) prompt glyph on the theme background. The maintainer
-is expected to replace it with the final artwork. Keep the replacement a valid,
-standalone SVG with `viewBox="0 0 128 128"`, no external references and no
-embedded raster images, so the packaging steps below keep working unchanged.
+The application icon comes from `logo.png` — the AstraTerm emblem: a dark terminal
+window with a `>_` prompt, an orbit and a star.
 
-## Rasterising to PNG
+## Files
 
-Freedesktop icon themes look for a PNG in `hicolor/128x128/apps/`, so the
-packaging assets ship a 128x128 PNG generated from this SVG. Rasterise it with
-`rsvg-convert` (package `librsvg` on Arch, `librsvg2-bin` on Debian) from this
-directory:
+| Path | Purpose |
+|---|---|
+| `logo.png` | The source artwork (landscape PNG on a white background). |
+| `generate-icons.sh` | Regenerates every derived icon from `logo.png`. |
+| `astraterm.png` | Canonical square 512 px icon, embedded into the binary for the window icon. |
+| `hicolor/<size>/apps/astraterm.png` | The icon set that desktop environments read (32, 48, 64, 128, 256, 512). |
 
-```sh
-rsvg-convert -w 128 -h 128 astraterm.svg -o astraterm.png
+## Regenerating
+
+```bash
+sh assets/icons/generate-icons.sh
 ```
 
-Inkscape works too, if you already have it:
+The script needs ImageMagick (`magick`). It removes the *connected* outer white
+background by flood-filling from the four corners rather than deleting every white
+pixel — the prompt glyph inside the window is white and must survive — then trims
+and centres the artwork on a square canvas with a small margin, so the icon looks
+the same in a launcher, a dock and a window switcher.
 
-```sh
-inkscape astraterm.svg --export-type=png --export-width=128 --export-height=128 --export-filename=astraterm.png
-```
+Commit the regenerated PNGs: they are what the installer and the package ship, and
+the 512 px one is compiled into the binary.
 
-`astraterm.png` is a build artefact and is not committed; `packaging/linux/install.sh`,
-`packaging/linux/PKGBUILD` and `.gitignore` all expect it to be absent from the
-repository. They either rasterise the SVG on the fly or, when `rsvg-convert` is
-not available, install the SVG into `hicolor/scalable/apps/`.
+## How the icon reaches the desktop
+
+- `packaging/desktop/astraterm.desktop` declares `Icon=astraterm` and
+  `StartupWMClass=astraterm`.
+- The window sets the same identity (`app_id` on Wayland, `WM_CLASS` on X11) and
+  its icon at startup, so the compositor associates the window with the entry
+  instead of showing a generic placeholder.
+- `packaging/linux/install.sh` copies every `hicolor/<size>` directory and refreshes
+  the icon cache, which is what makes the entry appear in the Omarchy menu and the
+  dock with its icon.

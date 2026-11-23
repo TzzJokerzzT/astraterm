@@ -160,7 +160,7 @@ impl Application {
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop, restore: bool) -> anyhow::Result<()> {
         let config = self.config.config().clone();
-        let attributes = Window::default_attributes()
+        let attributes = PlatformName::apply(Window::default_attributes())
             .with_title("AstraTerm")
             .with_inner_size(LogicalSize::new(
                 config.window.width as f64,
@@ -172,6 +172,10 @@ impl Application {
         let window = Arc::new(event_loop.create_window(attributes)?);
         // IME preedit is not implemented yet; text input arrives through key events.
         window.set_ime_allowed(false);
+        // The icon comes from the same logo the desktop entry installs, and the app
+        // identity matches `StartupWMClass`/`Icon` so the launcher and the window
+        // switcher show it instead of a generic placeholder.
+        window.set_window_icon(window_icon());
 
         let renderer = astraterm_renderer::Renderer::new(
             window.clone(),
@@ -2103,6 +2107,55 @@ impl Application {
             session.write(bytes);
         }
     }
+}
+
+/// Applies the platform window identity (`app_id` on Wayland, `WM_CLASS` on X11).
+struct PlatformName;
+
+impl PlatformName {
+    fn apply(attributes: winit::window::WindowAttributes) -> winit::window::WindowAttributes {
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        {
+            // Both backends read the same field: Wayland uses `general` as `app_id`,
+            // X11 uses the pair as `WM_CLASS`. The value matches the installed desktop
+            // file, so the compositor can associate the window with its icon.
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            return WindowAttributesExtWayland::with_name(attributes, "astraterm", "astraterm");
+        }
+        #[allow(unreachable_code)]
+        attributes
+    }
+}
+
+/// Window icon decoded from the logo committed in `assets/icons`.
+///
+/// The PNG is embedded in the binary so the icon works from any installation
+/// directory; a decode failure is not fatal and simply leaves the window with the
+/// compositor-provided icon.
+fn window_icon() -> Option<winit::window::Icon> {
+    const ICON_PNG: &[u8] = include_bytes!("../../../assets/icons/astraterm.png");
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(ICON_PNG));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().ok()?;
+    let mut buffer = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buffer).ok()?;
+    let data = match info.color_type {
+        png::ColorType::Rgba => buffer[..info.buffer_size()].to_vec(),
+        png::ColorType::Rgb => buffer[..info.buffer_size()]
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 0xff])
+            .collect(),
+        _ => return None,
+    };
+    winit::window::Icon::from_rgba(data, info.width, info.height).ok()
 }
 
 /// Builds the persisted workspace, or `None` when there is nothing to persist.

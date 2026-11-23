@@ -185,7 +185,8 @@ Files in this repository:
 | `packaging/linux/install.sh` | POSIX `sh` installer for a portable build into the user's XDG directories (no root) |
 | `packaging/linux/uninstall.sh` | removes exactly the files `install.sh` created |
 | `packaging/linux/config.toml` | the system-wide default configuration installed to `/etc/astraterm/config.toml` |
-| `assets/icons/astraterm.svg` | icon source (128×128, placeholder — see `assets/icons/README.md`) |
+| `assets/icons/logo.png` | the AstraTerm logo; every icon size is generated from it |
+| `assets/icons/astraterm.png`, `assets/icons/hicolor/*` | committed icon set (32–512 px, transparent) used by the installer, the package and the window icon |
 | `assets/themes/midnight.toml`, `assets/themes/dawn.toml` | exports of the built-in themes |
 
 Portable install for the current user, after `cargo build --release --locked`:
@@ -198,9 +199,14 @@ It installs:
 
 - the binary to `${XDG_BIN_HOME:-~/.local/bin}/astraterm`,
 - the desktop entry to `${XDG_DATA_HOME:-~/.local/share}/applications/astraterm.desktop`,
-- the icon to `${XDG_DATA_HOME:-~/.local/share}/icons/hicolor/128x128/apps/astraterm.png`
-  (rasterised from the SVG with `rsvg-convert`; without it the SVG is installed
-  into `hicolor/scalable/apps/` instead).
+- the icon in every size it ships (32, 48, 64, 128, 256, 512) to
+  `${XDG_DATA_HOME:-~/.local/share}/icons/hicolor/<size>/apps/astraterm.png`,
+  and refreshes the desktop and icon caches.
+
+After that, **AstraTerm appears in the Omarchy application menu (and every
+freedesktop launcher) as “AstraTerm”, with its logo as the icon**. Launching from
+the menu and launching the binary behave the same; the window sets the matching
+`app_id`/`WM_CLASS` so the compositor groups it with the entry.
 
 It refuses to run when the release binary is missing, never needs root, and
 never touches your configuration. Remove it again with:
@@ -257,8 +263,9 @@ checksums before publishing** (see the comment at the top of the file).
   universal blur support.
 - `/etc/astraterm/config.toml` is installed as documentation and a copy
   template; the loader reads only the per-user file.
-- The icon is a placeholder and the 128×128 PNG is generated at install/build
-  time from the SVG rather than committed.
+- The icon set is generated from `assets/icons/logo.png`; regenerate it with
+  `sh assets/icons/generate-icons.sh` after changing the artwork and commit the
+  resulting PNGs.
 - Settings that are declared but not yet consumed: `word_delimiters`,
   `remember_geometry`, `appearance.style`, `appearance.show_window_controls`,
   `background_blur`, `font.fallbacks`, `gpu_acceleration`, `max_fps_when_idle`
