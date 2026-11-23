@@ -46,9 +46,9 @@ S5.3 Ninguna imagen rompe el grid ni la salida de texto normal: las secuencias m
 | ID | Spec | Qué se hace | Route | Commit |
 |---|---|---|---|---|
 | T1 | S1.1 | Persistir el tamaño de fuente elegido en el estado de la app y aplicarlo al arrancar | inline | `b9ec742` |
-| T2 | S2.2, S2.3 | Pegado asíncrono (hilo de portapapeles) y payload grande sin truncar ni congelar | inline | — |
-| T3 | S3.1–S3.3 | Ligaduras opt-in con `font.ligatures` y verificación de alineación | inline | — |
-| T4 | S4.1–S4.4 | Kitty keyboard: flag, flags expuestos y encoder completo + docs | inline | — |
+| T2 | S2.2, S2.3 | Pegado asíncrono (hilo de portapapeles) y payload grande sin truncar ni congelar | inline | `2a716b3` |
+| T3 | S3.1–S3.3 | Ligaduras opt-in con `font.ligatures` y verificación de alineación | inline | `7410eb6` |
+| T4 | S4.1–S4.4 | Kitty keyboard: flag, flags expuestos y encoder completo + docs | inline + worker | `a37ee4b` |
 | T5 | S5.1, S5.3 | Scanner APC/OSC/DCS incremental con reensamble entre chunks + modelo de anclaje | inline | — |
 | T6 | S5.1, S5.2 | Renderer: textura, sampler, UV y orden de dibujo; decoder PNG con límites | worker | — |
 | T7 | S5.2 | Decoders kitty graphics y sixel, eviction de memoria y política de seguridad | worker | — |
@@ -69,7 +69,13 @@ L2 (evidencia, auditoría de factibilidad):
 L3 (pedido del usuario, verbatim):
 "Sigue el orden y quiero poder pegar texto, comandos, ext externos a la terminal. Ya que es algo que hago muy frecuentemente"
 
-L4 (decisiones):
+L4 (cierre de T1–T4, evidencia):
+- T1 `b9ec742`, T2 `2a716b3`, T3 `7410eb6`, T4 `a37ee4b`. Suite completa 380 tests, `cargo clippy --workspace --all-targets` sin advertencias, `cargo fmt --check` limpio.
+- T4 delegado en parte a un worker por el backstop de contexto; su primer intento se detuvo porque la superficie de edición que le di omitía `crates/session/src/lifecycle.rs` (el verdadero sitio donde se construye `EngineOptions`, no `manager.rs`) y los dos tests de sesión que escriben `EngineSpec` como literal. Ampliada la superficie y completado.
+- Defecto propio corregido en el camino: añadir `KeyPress.event` dejó `crates/app/src/keys.rs` sin compilar (construía el literal sin el campo) porque solo se verificó la crate `terminal` tras el cambio del encoder. El worker lo arregló dentro de su superficie.
+- Caveat upstream documentado: `CSI ? u` reporta solo la cima de la pila de modos, así que una app que usa `CSI = u` sin push consulta `0` aunque sus flags estén activos; el encoder los honra igual.
+- Límite conocido no testeable sin ventana: los modificadores del release salen de `self.mods`, así que si la plataforma limpia Shift antes del release, `Shift+A` puede liberarse como `a`.
+L5 (decisiones de alcance, tomadas al autorizar; se registran con el cierre):
 - Se sigue el orden propuesto: zoom, ligaduras, Kitty keyboard, imágenes. El pegado entra en segundo lugar, antes de ligaduras, por frecuencia de uso declarada por el usuario.
 - El pegado ya funciona (`ctrl+shift+v` → `AppCommand::Paste` → `App::paste` → `encode_paste`); lo que se corrige es el bloqueo del event loop al leer el portapapeles y el manejo de payloads grandes.
 - La persistencia del zoom se guarda en el estado de la aplicación (`StatePaths`, `crates/platform/src/paths.rs`), no en el TOML del usuario: escribir config dispararía el watcher y realimentaría `ConfigChanged`.
