@@ -22,7 +22,10 @@ pub use schema::{
     TerminalConfig, WindowConfig, WorkingDirectory, WorkspaceConfig,
 };
 pub use service::{ConfigService, SaveOutcome};
-pub use themes::{Theme, builtin_themes, load_theme_file, theme_by_name};
+pub use themes::{
+    Theme, ThemeSaveError, available_themes, builtin_themes, load_theme_file, resolve_theme,
+    sanitize_theme_name, save_theme, theme_by_name,
+};
 pub use validation::{ConfigIssue, IssueSeverity, ValidationReport};
 
 /// XDG configuration directory for AstraTerm (`~/.config/astraterm`).

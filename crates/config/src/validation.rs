@@ -230,6 +230,36 @@ pub fn validate(config: &Config, known_themes: &[&str]) -> ValidationReport {
             "padding above 64px wastes workspace",
         ));
     }
+    if !(120..=480).contains(&config.appearance.tab_strip_width) {
+        report.push(ConfigIssue::error(
+            "appearance.tab_strip_width",
+            format!(
+                "must be between 120 and 480 (found {})",
+                config.appearance.tab_strip_width
+            ),
+        ));
+    }
+    if config.appearance.clock_format.trim().is_empty() {
+        report.push(ConfigIssue::error(
+            "appearance.clock_format",
+            "must not be empty; use `%H:%M` for a 24-hour clock",
+        ));
+    } else if config.appearance.clock_format.chars().count() > 64 {
+        report.push(ConfigIssue::error(
+            "appearance.clock_format",
+            "must be at most 64 characters",
+        ));
+    }
+    if config.appearance.show_status_bar
+        && !config.appearance.status_bar_cpu
+        && !config.appearance.status_bar_ram
+        && !config.appearance.status_bar_clock
+    {
+        report.push(ConfigIssue::warning(
+            "appearance.show_status_bar",
+            "the status bar has no right-hand segments enabled",
+        ));
+    }
     if !(1..=12).contains(&config.appearance.divider_thickness) {
         report.push(ConfigIssue::error(
             "appearance.divider_thickness",
@@ -534,6 +564,48 @@ mod tests {
         let report = validate(&config, &themes());
         assert!(report.is_valid());
         assert!(report.warnings().any(|issue| issue.field == "keys"));
+    }
+
+    #[test]
+    fn rejects_an_unusable_tab_strip_width() {
+        let mut config = Config::default();
+        config.appearance.tab_strip_width = 80;
+        let report = validate(&config, &themes());
+        assert!(
+            report
+                .errors()
+                .any(|issue| issue.field == "appearance.tab_strip_width")
+        );
+        config.appearance.tab_strip_width = 200;
+        assert!(validate(&config, &themes()).is_valid());
+    }
+
+    #[test]
+    fn rejects_an_empty_clock_format() {
+        let mut config = Config::default();
+        config.appearance.clock_format = "  ".to_owned();
+        let report = validate(&config, &themes());
+        assert!(
+            report
+                .errors()
+                .any(|issue| issue.field == "appearance.clock_format")
+        );
+    }
+
+    #[test]
+    fn warns_when_the_status_bar_has_no_segments() {
+        let mut config = Config::default();
+        config.appearance.show_status_bar = true;
+        config.appearance.status_bar_cpu = false;
+        config.appearance.status_bar_ram = false;
+        config.appearance.status_bar_clock = false;
+        let report = validate(&config, &themes());
+        assert!(report.is_valid());
+        assert!(
+            report
+                .warnings()
+                .any(|issue| issue.field == "appearance.show_status_bar")
+        );
     }
 
     #[test]

@@ -248,6 +248,7 @@ version = "0.1.0"
 dependencies = [
  "astraterm-config",
  "astraterm-core",
+ "libc",
  "tracing",
 ]
 

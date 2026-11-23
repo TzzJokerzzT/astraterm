@@ -104,6 +104,78 @@ pub fn load_theme_dir(dir: &Path) -> (Vec<Theme>, Vec<ThemeError>) {
     (themes, errors)
 }
 
+/// Turns a user-provided theme name into a safe file name stem.
+///
+/// Lowercases, collapses anything that is not `[a-z0-9]` into a single dash and
+/// trims dashes, so a name like `Mi Tema / Oscuro` becomes `mi-tema-oscuro`. Returns
+/// `None` when nothing usable is left.
+pub fn sanitize_theme_name(name: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut last_dash = true;
+    for ch in name.trim().to_lowercase().chars() {
+        if out.chars().count() >= 40 {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Error raised while saving a theme.
+#[derive(Debug, thiserror::Error)]
+pub enum ThemeSaveError {
+    #[error("the theme name needs at least one letter or digit")]
+    EmptyName,
+    #[error("`{0}` is a built-in theme name; choose another one")]
+    ReservedName(String),
+    #[error("theme file `{path}` could not be written: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: crate::writer::WriteError,
+    },
+}
+
+/// Saves `palette` as a user theme called `name` inside `dir`.
+///
+/// The file is written atomically and can be read back with [`load_theme_file`]. A
+/// name that collides with a built-in theme is refused so a user theme can never
+/// silently shadow the shipped palette.
+pub fn save_theme(
+    dir: &Path,
+    name: &str,
+    palette: Palette,
+) -> Result<(String, PathBuf), ThemeSaveError> {
+    let stem = sanitize_theme_name(name).ok_or(ThemeSaveError::EmptyName)?;
+    if theme_by_name(&stem).is_some() {
+        return Err(ThemeSaveError::ReservedName(stem));
+    }
+    let theme = Theme {
+        name: stem.clone(),
+        light: palette.background.luminance() > 0.5,
+        palette,
+    };
+    let text = toml::to_string_pretty(&theme).map_err(|error| ThemeSaveError::Write {
+        path: dir.join(format!("{stem}.toml")),
+        source: crate::writer::WriteError::Serialize(error.to_string()),
+    })?;
+    let path = dir.join(format!("{stem}.toml"));
+    crate::writer::write_atomic(&path, &text).map_err(|source| ThemeSaveError::Write {
+        path: path.clone(),
+        source,
+    })?;
+    Ok((stem, path))
+}
+
 /// Built-in themes followed by user themes, with user themes winning on a name
 /// clash so a personal theme can override a built-in one deliberately.
 pub fn available_themes(user_dir: &Path) -> (Vec<Theme>, Vec<ThemeError>) {
@@ -155,6 +227,65 @@ mod tests {
     fn unknown_theme_falls_back_to_midnight() {
         let dir = std::path::Path::new("/nonexistent-theme-dir");
         assert_eq!(resolve_theme("does-not-exist", dir).name, "midnight");
+    }
+
+    #[test]
+    fn names_are_sanitised_into_file_stems() {
+        assert_eq!(
+            sanitize_theme_name("Mi Tema / Oscuro").as_deref(),
+            Some("mi-tema-oscuro")
+        );
+        assert_eq!(sanitize_theme_name("  neon!!  ").as_deref(), Some("neon"));
+        assert_eq!(sanitize_theme_name("---").as_deref(), None);
+        assert_eq!(sanitize_theme_name("").as_deref(), None);
+        let long = "x".repeat(60);
+        assert!(sanitize_theme_name(&long).unwrap().chars().count() <= 40);
+    }
+
+    #[test]
+    fn saving_a_theme_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut palette = Palette::midnight();
+        palette.accent = crate::palette::Rgb::new(0xff, 0x88, 0x00);
+        let (name, path) = save_theme(dir.path(), "Mi Tema", palette.clone()).unwrap();
+        assert_eq!(name, "mi-tema");
+        assert_eq!(path.file_name().unwrap(), "mi-tema.toml");
+        let loaded = load_theme_file(&path).unwrap();
+        assert_eq!(loaded.name, "mi-tema");
+        assert_eq!(loaded.palette.accent, palette.accent);
+        assert!(!loaded.light);
+    }
+
+    #[test]
+    fn saving_refuses_builtin_names_and_empty_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let palette = Palette::midnight();
+        assert!(matches!(
+            save_theme(dir.path(), "midnight", palette.clone()),
+            Err(ThemeSaveError::ReservedName(_))
+        ));
+        assert!(matches!(
+            save_theme(dir.path(), "!!!", palette),
+            Err(ThemeSaveError::EmptyName)
+        ));
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "nothing is written"
+        );
+    }
+
+    #[test]
+    fn a_saved_theme_overrides_a_user_theme_with_the_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        save_theme(dir.path(), "custom", Palette::midnight()).unwrap();
+        let mut second = Palette::midnight();
+        second.background = crate::palette::Rgb::new(1, 2, 3);
+        save_theme(dir.path(), "custom", second.clone()).unwrap();
+        let (themes, errors) = available_themes(dir.path());
+        assert!(errors.is_empty(), "{errors:?}");
+        let found = themes.iter().find(|theme| theme.name == "custom").unwrap();
+        assert_eq!(found.palette.background, second.background);
     }
 
     #[test]

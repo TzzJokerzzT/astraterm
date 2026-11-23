@@ -63,7 +63,8 @@ impl Rect {
     }
 }
 
-/// A size in device pixels.#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// A size in device pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Size {
     pub width: u32,
     pub height: u32,

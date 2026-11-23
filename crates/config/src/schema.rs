@@ -224,6 +224,8 @@ impl CursorStyle {
 pub enum TabBarPosition {
     Top,
     Bottom,
+    /// Vertical strip on the right edge (Warp-style sidebar tabs).
+    Right,
     Hidden,
 }
 
@@ -232,6 +234,7 @@ impl TabBarPosition {
         match self {
             TabBarPosition::Top => "top",
             TabBarPosition::Bottom => "bottom",
+            TabBarPosition::Right => "right",
             TabBarPosition::Hidden => "hidden",
         }
     }
@@ -260,9 +263,21 @@ pub struct AppearanceConfig {
     /// Visual style identifier, kept for forward compatibility.
     pub style: String,
     pub show_status_bar: bool,
+    /// Show CPU usage in the status bar.
+    pub status_bar_cpu: bool,
+    /// Show RAM usage in the status bar.
+    pub status_bar_ram: bool,
+    /// Show the clock in the status bar.
+    pub status_bar_clock: bool,
+    /// Clock format: `%H %M %S %d %m %Y %b %a` are supported, everything else is
+    /// literal text.
+    pub clock_format: String,
     pub show_window_controls: bool,
     pub accent_color: String,
     pub tab_bar_position: TabBarPosition,
+    /// Width of the vertical tab strip in logical pixels, when the tabs sit on the
+    /// right edge.
+    pub tab_strip_width: u32,
     /// Use smaller tab labels without the profile hint.
     pub compact_tabs: bool,
     /// Thickness of the divider between panes, in logical pixels.
@@ -282,9 +297,14 @@ impl Default for AppearanceConfig {
             cursor_blink: true,
             style: "minimal-dark".to_owned(),
             show_status_bar: false,
+            status_bar_cpu: true,
+            status_bar_ram: true,
+            status_bar_clock: true,
+            clock_format: "%H:%M".to_owned(),
             show_window_controls: false,
             accent_color: "#8B9CFF".to_owned(),
             tab_bar_position: TabBarPosition::Top,
+            tab_strip_width: 180,
             compact_tabs: false,
             divider_thickness: 1,
             pane_gap: 2,

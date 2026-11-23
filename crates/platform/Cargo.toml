@@ -7,4 +7,5 @@ license.workspace = true
 [dependencies]
 astraterm-core = { workspace = true }
 astraterm-config = { workspace = true }
+libc = { workspace = true }
 tracing = { workspace = true }
