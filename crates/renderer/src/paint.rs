@@ -238,13 +238,21 @@ pub fn paint_pane(
     }
 
     // Pane background first, so text and selection sit on top.
+    //
+    // The border is chrome and always opaque; only the pane *background* follows
+    // `background_alpha`, which the application sets to 0 so a translucent window is
+    // painted once by the scene clear instead of compositing alpha twice.
+    //
+    // A border is drawn as four thin edges, never as a filled rectangle: filling the
+    // whole pane and covering it with the background only works while the background
+    // is opaque.
     if options.show_border {
         let border = if options.focused {
             theme.pane_border_focused
         } else {
             theme.pane_border
         };
-        scene.push_quad(rect, border, options.background_alpha);
+        push_border(scene, rect, border);
     }
     let inner = if options.show_border {
         rect.shrunk(1)
@@ -299,6 +307,40 @@ pub fn paint_pane(
             scene, id_base, inner, origin_x, origin_y, cursor, snapshot, theme, metrics, options,
         );
     }
+}
+
+/// Draws a one-pixel border along the four edges of `rect`.
+pub fn push_border(scene: &mut Scene, rect: Rect, color: Rgb) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    let thickness = 1u32.min(rect.width.min(rect.height));
+    scene.push_quad(Rect::new(rect.x, rect.y, rect.width, thickness), color, 1.0);
+    scene.push_quad(
+        Rect::new(
+            rect.x,
+            rect.bottom() - thickness as i32,
+            rect.width,
+            thickness,
+        ),
+        color,
+        1.0,
+    );
+    scene.push_quad(
+        Rect::new(rect.x, rect.y, thickness, rect.height),
+        color,
+        1.0,
+    );
+    scene.push_quad(
+        Rect::new(
+            rect.right() - thickness as i32,
+            rect.y,
+            thickness,
+            rect.height,
+        ),
+        color,
+        1.0,
+    );
 }
 
 /// Builds the text item for one row, merging adjacent cells with identical style
@@ -618,14 +660,66 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(scene.quads.len() >= 2);
-        assert_eq!(scene.quads[0].color, rgba(theme().pane_border_focused, 1.0));
-        assert_eq!(scene.quads[1].color, rgba(theme().background, 1.0));
+        assert!(
+            scene.quads.len() >= 5,
+            "four border edges plus the pane background"
+        );
+        assert!(
+            scene
+                .quads
+                .iter()
+                .any(|quad| quad.color == rgba(theme().pane_border_focused, 1.0)),
+            "the focused border is painted"
+        );
+        assert!(
+            scene
+                .quads
+                .iter()
+                .any(|quad| quad.color == rgba(theme().background, 1.0)),
+            "the pane background is painted"
+        );
         // One text item per visible row, plus one for the character under the cursor.
         assert_eq!(scene.texts.len(), 3, "row items plus the cursor cell");
         assert_eq!(scene.texts[0].id, 0);
         assert_eq!(scene.texts[1].id, 1);
         assert!(scene.texts[0].spans[0].text.starts_with("hi"));
+    }
+
+    #[test]
+    fn the_border_stays_opaque_when_the_pane_background_is_transparent() {
+        let mut scene = Scene::default();
+        let snapshot = snapshot("x", 5, 1);
+        paint_pane(
+            &mut scene,
+            0,
+            Rect::new(0, 0, 100, 40),
+            &snapshot,
+            &theme(),
+            metrics(),
+            PaintOptions {
+                background_alpha: 0.0,
+                focused: true,
+                // The cursor shares the accent colour in this palette.
+                draw_cursor: false,
+                ..Default::default()
+            },
+        );
+        let edges: Vec<&Quad> = scene
+            .quads
+            .iter()
+            .filter(|quad| quad.color == rgba(theme().pane_border_focused, 1.0))
+            .collect();
+        assert_eq!(edges.len(), 4, "the border is four edges, not a fill");
+        assert!(
+            edges.iter().all(|edge| edge.color[3] == 1.0),
+            "edges stay opaque"
+        );
+        assert!(
+            edges
+                .iter()
+                .all(|edge| edge.rect.width.min(edge.rect.height) <= 1),
+            "each edge is thin"
+        );
     }
 
     #[test]
@@ -816,7 +910,11 @@ mod tests {
                 .quads
                 .iter()
                 .copied()
-                .filter(|quad| quad.color == rgba(theme().cursor, 1.0) && quad.rect.width <= 10)
+                .filter(|quad| {
+                    quad.color == rgba(theme().cursor, 1.0)
+                        && quad.rect.width <= 10
+                        && quad.rect.height <= 20
+                })
                 .collect()
         };
         let block_quads = cell_quads(&block);
@@ -867,7 +965,9 @@ mod tests {
             !scene
                 .quads
                 .iter()
-                .any(|quad| quad.color == rgba(theme().cursor, 1.0) && quad.rect.width <= 10),
+                .any(|quad| quad.color == rgba(theme().cursor, 1.0)
+                    && quad.rect.width <= 10
+                    && quad.rect.height <= 20),
             "no cursor cell is painted when the cursor is disabled"
         );
     }
