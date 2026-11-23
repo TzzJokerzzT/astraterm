@@ -167,6 +167,9 @@ pub struct FontConfig {
     pub weight: u16,
     pub line_height: f32,
     pub letter_spacing: f32,
+    /// Opt-in ligatures (`liga`/`calt`); off by default because the grid assumes
+    /// the shaper can lay a row out without glyph substitution.
+    pub ligatures: bool,
     /// Additional families used when a glyph is missing from `family`.
     pub fallbacks: Vec<String>,
 }
@@ -179,6 +182,7 @@ impl Default for FontConfig {
             weight: 400,
             line_height: 1.15,
             letter_spacing: 0.0,
+            ligatures: false,
             fallbacks: vec![
                 "JetBrains Mono".to_owned(),
                 "Symbols Nerd Font".to_owned(),

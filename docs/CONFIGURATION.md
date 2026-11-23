@@ -193,6 +193,7 @@ edits the option, when there is one.
 | `weight` | `400` | Font weight, 100–900 in steps of 100. | You want a heavier or lighter face (variable fonts). Applies live. | Font weight |
 | `line_height` | `1.15` | Multiplier applied to the font size to get the row height. | More air between lines, or more rows on screen. Applies live. | Line height |
 | `letter_spacing` | `0.0` | Extra tracking in logical pixels (−5 to 20). | Wide fonts that feel cramped, or a tighter grid. Applies live. | Letter spacing |
+| `ligatures` | `false` | Enables the font's `liga` and `calt` features. Off, they are explicitly disabled so the grid never depends on a glyph substitution. | You use a font with programming ligatures (`!=`, `->`, `=>`) and want them drawn. Applies live. | — |
 | `fallbacks` | see below | Accepted but not read today: cosmic-text resolves missing glyphs through the system font database. | You expected to control the fallback chain. | — |
 
 Default `fallbacks`: `["JetBrains Mono", "Symbols Nerd Font", "Noto Color Emoji",

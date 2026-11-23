@@ -246,11 +246,14 @@ or the application.
   key events work.
 - **No image protocols.** There is no Sixel or Kitty graphics parsing/rendering
   path; images sent to the terminal are not displayed.
-- **No ligature support.** Rows are shaped as whole strings and glyph positions
-  come from the shaper; AstraTerm does not implement per-cell glyph placement or
-  ligature-aware cells. Cell metrics come from the shaped advance of
-  `MMMMMMMMMM` (`crates/renderer/src/text.rs`), so grid alignment relies on the
-  font's monospace advances, not on ligature handling.
+- **Ligatures are opt-in.** Rows are shaped as whole strings and glyph positions come
+  from the shaper; AstraTerm does not implement per-cell glyph placement. Cell metrics
+  come from the shaped advance of `MMMMMMMMMM` (`crates/renderer/src/text.rs`), so grid
+  alignment relies on the font's monospace advances. Because of that, `font.ligatures`
+  defaults to `false` and disables `liga`/`calt` explicitly; turning it on hands the row
+  to the font, which is fine for strictly monospaced ligature fonts (a ligature that
+  occupies exactly two cells) and can drift for fonts whose substitutions change the
+  advance.
 - **Search is plain substring.** `SearchState` / `find` / `count_matches`
   (`crates/terminal/src/search.rs`) and the interactive overlay (`find_in_snapshot`
   in `crates/app/src/ui.rs`) do substring matching with optional case folding.

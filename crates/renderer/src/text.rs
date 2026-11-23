@@ -11,7 +11,9 @@ use std::collections::HashMap;
 
 use astraterm_config::schema::FontConfig;
 use astraterm_core::CellMetrics;
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, Weight};
+use cosmic_text::{
+    Attrs, Buffer, Family, FeatureTag, FontFeatures, FontSystem, Metrics, Shaping, Style, Weight,
+};
 use glyphon::{Color as GlyphonColor, TextArea, TextBounds};
 
 use crate::paint::{Scene, TextItem};
@@ -22,6 +24,8 @@ pub struct TextStyle {
     pub family: String,
     pub weight: Weight,
     pub letter_spacing: f32,
+    /// Ligatures requested by configuration.
+    pub ligatures: bool,
     pub metrics: Metrics,
     pub cell: CellMetrics,
     pub scale: f32,
@@ -39,6 +43,7 @@ impl TextStyle {
             family: font.family.clone(),
             weight: Weight(font.weight),
             letter_spacing: font.letter_spacing,
+            ligatures: font.ligatures,
             metrics,
             cell,
             scale,
@@ -155,6 +160,7 @@ fn shape(font_system: &mut FontSystem, style: &TextStyle, item: &TextItem) -> Bu
     buffer.set_size(Some(1.0e6), Some(style.metrics.line_height));
 
     let family = style.family.clone();
+    let features = font_features(style.ligatures);
     let spans: Vec<(String, Attrs<'_>)> = item
         .spans
         .iter()
@@ -176,7 +182,8 @@ fn shape(font_system: &mut FontSystem, style: &TextStyle, item: &TextItem) -> Bu
                     (span.color[1] * 255.0) as u8,
                     (span.color[2] * 255.0) as u8,
                     (span.color[3] * 255.0) as u8,
-                ));
+                ))
+                .font_features(features.clone());
             if style.letter_spacing.abs() > f32::EPSILON {
                 attrs = attrs.letter_spacing(style.letter_spacing);
             }
@@ -190,10 +197,30 @@ fn shape(font_system: &mut FontSystem, style: &TextStyle, item: &TextItem) -> Bu
         .collect();
     let default_attrs = Attrs::new()
         .family(Family::Name(&family))
-        .weight(style.weight);
+        .weight(style.weight)
+        .font_features(features);
     buffer.set_rich_text(span_refs, &default_attrs, Shaping::Advanced, None);
     buffer.shape_until_scroll(font_system, false);
     buffer
+}
+
+/// OpenType features that decide whether ligatures reach the shaper.
+///
+/// Both directions are stated explicitly: the shaper enables `liga` and `calt` on
+/// its own, so a terminal that never touched features still gets whatever the font
+/// substitutes. Spelling the value out makes the configuration decide, not the
+/// shaper's defaults.
+pub fn font_features(ligatures: bool) -> FontFeatures {
+    let mut features = FontFeatures::new();
+    if ligatures {
+        features.enable(FeatureTag::STANDARD_LIGATURES);
+        features.enable(FeatureTag::CONTEXTUAL_ALTERNATES);
+    } else {
+        features.disable(FeatureTag::STANDARD_LIGATURES);
+        features.disable(FeatureTag::CONTEXTUAL_ALTERNATES);
+        features.disable(FeatureTag::DISCRETIONARY_LIGATURES);
+    }
+    features
 }
 
 /// Measures the cell advance, line height and baseline for a font configuration.
@@ -236,6 +263,7 @@ fn style_key(font: &FontConfig, scale: f32) -> u64 {
     font.weight.hash(&mut hasher);
     font.line_height.to_bits().hash(&mut hasher);
     font.letter_spacing.to_bits().hash(&mut hasher);
+    font.ligatures.hash(&mut hasher);
     scale.to_bits().hash(&mut hasher);
     hasher.finish()
 }
@@ -336,6 +364,48 @@ mod tests {
         ));
         cache.update(&mut system, &style, &scene);
         assert!(cache.areas(&scene).is_empty());
+    }
+
+    #[test]
+    fn ligature_features_are_explicit_in_both_directions() {
+        let enabled = font_features(true);
+        assert!(contains(&enabled, FeatureTag::STANDARD_LIGATURES, 1));
+        assert!(contains(&enabled, FeatureTag::CONTEXTUAL_ALTERNATES, 1));
+
+        let disabled = font_features(false);
+        assert!(contains(&disabled, FeatureTag::STANDARD_LIGATURES, 0));
+        assert!(contains(&disabled, FeatureTag::CONTEXTUAL_ALTERNATES, 0));
+        assert!(contains(&disabled, FeatureTag::DISCRETIONARY_LIGATURES, 0));
+    }
+
+    #[test]
+    fn ligatures_are_off_by_default() {
+        assert!(!FontConfig::default().ligatures);
+    }
+
+    #[test]
+    fn the_style_carries_the_configured_ligature_choice() {
+        let mut system = FontSystem::new();
+        let off = TextStyle::new(&font(), 1.0, &mut system);
+        let on = TextStyle::new(
+            &FontConfig {
+                ligatures: true,
+                ..font()
+            },
+            1.0,
+            &mut system,
+        );
+        assert!(!off.ligatures);
+        assert!(on.ligatures);
+        // The cache key must change, or toggling ligatures keeps stale rows.
+        assert_ne!(off.key, on.key);
+    }
+
+    fn contains(features: &FontFeatures, tag: FeatureTag, value: u32) -> bool {
+        features
+            .features
+            .iter()
+            .any(|feature| feature.tag == tag && feature.value == value)
     }
 
     #[test]
