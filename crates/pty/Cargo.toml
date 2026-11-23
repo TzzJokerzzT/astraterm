@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 astraterm-core = { workspace = true }
 crossbeam-channel = { workspace = true }
-libc = "0.2"
+libc = { workspace = true }
 portable-pty = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

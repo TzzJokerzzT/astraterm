@@ -26,6 +26,35 @@ const READ_CHUNK: usize = 32 * 1024;
 
 /// Largest amount a single pump pass can overshoot its budget by.
 pub const READ_CHUNK_BYTES: usize = READ_CHUNK;
+
+/// What `/proc/<pid>/stat` tells us about a child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChildState {
+    /// Process state (`R`, `S`, `Z`, …).
+    pub state: char,
+    /// Kernel start time in clock ticks, which identifies a pid unambiguously.
+    pub start_time: u64,
+}
+
+/// Parses `/proc/<pid>/stat`.
+///
+/// Field 2 (`comm`) is wrapped in parentheses and may contain spaces or `)`, so the
+/// line is split after the **last** `)`: state is field 3 and start time field 22,
+/// which is index 19 in the remaining fields.
+pub fn parse_proc_stat(line: &str) -> Option<ChildState> {
+    let close = line.rfind(')')?;
+    let rest = line.get(close + 1..)?.trim_start();
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let start_time = fields.nth(18)?.parse().ok()?;
+    Some(ChildState { state, start_time })
+}
+
+/// Reads the state of a process, if it still exists.
+pub fn read_child_state(pid: u32) -> Option<ChildState> {
+    let line = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_proc_stat(&line)
+}
 /// Bounded output queue depth, in chunks (about 2 MiB per session).
 const OUTPUT_QUEUE: usize = 64;
 /// Bounded input queue depth, in messages.
@@ -108,6 +137,8 @@ pub struct PtyHandle {
     exit: Receiver<ExitReason>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     child_pid: Option<u32>,
+    /// Kernel start time of the child, used to detect pid reuse.
+    start_time: Option<u64>,
     exited: bool,
 }
 
@@ -201,11 +232,33 @@ impl PtyHandle {
         let _ = self.input.try_send(Input::Shutdown);
     }
 
+    /// Whether the spawned child is still alive right now.
+    ///
+    /// This reads `/proc` instead of trusting cached state, so a child that exited
+    /// during a grace period is not treated as alive (which would escalate a polite
+    /// close to a hard kill, and could hit a recycled pid).
+    pub fn child_is_alive(&self) -> bool {
+        let Some(pid) = self.child_pid else {
+            return false;
+        };
+        match (read_child_state(pid), self.start_time) {
+            (Some(state), Some(start_time)) => state.state != 'Z' && state.start_time == start_time,
+            // No `/proc` entry means the process is gone; without a recorded start
+            // time fall back to a plain existence check.
+            (Some(state), None) => state.state != 'Z',
+            (None, _) => false,
+        }
+    }
+
     /// Kills the child's process group with `SIGKILL`.
     ///
     /// The child is a session leader (the PTY layer calls `setsid`), so its process
     /// group id equals its pid: signalling the negative pid also terminates the
     /// grandchildren a shell may have spawned, which is what prevents orphans.
+    ///
+    /// The kill is guarded by the child's start time: a pid that has already been
+    /// reaped may be recycled by an unrelated process, and signalling its new group
+    /// would be a serious bug.
     pub fn kill_hard(&self) {
         let Some(pid) = self.child_pid else {
             // Without a pid the only portable option is the crate's own killer.
@@ -213,6 +266,9 @@ impl PtyHandle {
             let _ = killer.kill();
             return;
         };
+        if !self.child_is_alive() {
+            return;
+        }
         let pid = pid as libc::pid_t;
         // SAFETY: `kill(2)` with a plain integer pid and a constant signal cannot
         // violate memory safety; a failure is reported through the return value,
@@ -332,6 +388,9 @@ pub fn spawn_with_waker(spec: &PtySpec, waker: Option<Waker>) -> Result<PtyHandl
     drop(pair.slave);
 
     let child_pid = child.process_id();
+    let start_time = child_pid
+        .and_then(read_child_state)
+        .map(|state| state.start_time);
     let killer = child.clone_killer();
 
     let mut reader = pair
@@ -436,6 +495,7 @@ pub fn spawn_with_waker(spec: &PtySpec, waker: Option<Waker>) -> Result<PtyHandl
         exit: exit_rx,
         killer,
         child_pid,
+        start_time,
         exited: false,
     })
 }
@@ -479,6 +539,88 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("timed out waiting for the child to exit");
+    }
+
+    #[test]
+    fn proc_stat_parsing_handles_awkward_command_names() {
+        // `comm` may contain spaces and parentheses, so the split must use the last `)`.
+        // Fields after state: ppid pgrp session tty tpgid flags minflt cminflt majflt
+        // cmajflt utime stime cutime cstime priority nice threads itrealvalue starttime.
+        let after_state = [
+            "1", "4242", "4242", "0", "-1", "4194560", "100", "0", "0", "0", "0", "0", "0", "0",
+            "20", "0", "1", "0", "987654", "0",
+        ];
+        let line = format!("4242 (weird ) name) S {} 0", after_state.join(" "));
+        let state = parse_proc_stat(&line).expect("parsed");
+        assert_eq!(state.state, 'S');
+        assert_eq!(state.start_time, 987_654);
+    }
+
+    #[test]
+    fn proc_stat_parsing_works_on_a_real_proc_entry() {
+        let line = std::fs::read_to_string("/proc/self/stat").expect("own stat");
+        let state = parse_proc_stat(&line).expect("parsed");
+        assert!(
+            matches!(state.state, 'R' | 'S' | 'D' | 'T'),
+            "unexpected state {}",
+            state.state
+        );
+        assert!(state.start_time > 0);
+    }
+
+    #[test]
+    fn proc_stat_parsing_rejects_garbage() {
+        assert!(parse_proc_stat("").is_none());
+        assert!(parse_proc_stat("no parens here").is_none());
+        assert!(
+            parse_proc_stat("1 (x) S 1 2").is_none(),
+            "too short to hold field 22"
+        );
+    }
+
+    #[test]
+    fn a_reaped_child_is_not_alive_and_is_never_signalled() {
+        let spec = PtySpec {
+            program: "/bin/true".to_owned(),
+            ..PtySpec::default()
+        };
+        let mut handle = spawn(&spec).unwrap();
+        // Wait for the child to be gone, then a hard kill must be a no-op.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if handle.try_recv_exit().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !handle.child_is_alive(),
+            "an exited child must not look alive"
+        );
+        handle.kill_hard();
+        assert!(handle.try_recv_exit().is_none(), "no new exit is invented");
+    }
+
+    #[test]
+    fn a_running_child_reports_alive_and_dies_on_hard_kill() {
+        let spec = PtySpec {
+            program: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), "trap '' HUP; sleep 30".to_owned()],
+            ..PtySpec::default()
+        };
+        let handle = spawn(&spec).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(handle.child_is_alive());
+        let pid = handle.child_pid().expect("pid");
+        handle.kill_hard();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("child {pid} survived a hard kill");
     }
 
     #[test]

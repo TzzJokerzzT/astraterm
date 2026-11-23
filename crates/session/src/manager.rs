@@ -262,9 +262,19 @@ impl Session {
         }
     }
 
-    /// Whether the child is still alive according to the latest pump.
+    /// Whether the child is still alive.
+    ///
+    /// Combines the exit status observed through the waiter thread with a live
+    /// `/proc` check, so a child that exited during a grace period is not treated as
+    /// alive.
     pub fn child_alive(&self) -> bool {
-        self.exit.is_none()
+        if self.exit.is_some() {
+            return false;
+        }
+        match self.private_pty.as_ref() {
+            Some(pty) => pty.child_is_alive(),
+            None => false,
+        }
     }
 
     /// Reaps a pending exit status so a killed child does not stay a zombie.
@@ -482,20 +492,25 @@ impl SessionManager {
         }
 
         let deadline = Instant::now() + SHUTDOWN_GRACE;
-        while Instant::now() < deadline {
+        loop {
+            // Reap pending statuses first: `child_alive` alone would report a child
+            // that already exited as alive and escalate it to a hard kill.
             let mut alive = false;
             for session in &mut sessions {
+                let _ = session.take_exit();
                 if session.child_alive() {
                     alive = true;
                 }
             }
-            if !alive {
+            if !alive || Instant::now() >= deadline {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
 
         for session in &mut sessions {
+            // `kill_hard` is guarded by the child's start time, so a recycled pid is
+            // never signalled even if the status was not observed in time.
             if session.child_alive() {
                 session.kill_hard();
             }

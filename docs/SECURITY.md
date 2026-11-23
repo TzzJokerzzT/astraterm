@@ -140,7 +140,11 @@ never prints the content.
   group** (`libc::kill(-pid, SIGKILL)`; the child is a session leader, so its
   process group id equals its pid). That also terminates grandchildren a shell may
   have spawned, which is what prevents orphans. It is the only `unsafe` block in
-  the workspace, is three lines long, and cannot violate memory safety.
+  the workspace, is a few lines long, and cannot violate memory safety.
+- The hard kill is **guarded by the child's identity**: `PtyHandle` records the
+  kernel start time from `/proc/<pid>/stat` at spawn, and refuses to signal when
+  the pid is gone, is a zombie, or now belongs to a different process. Without that
+  guard a reaped pid could be recycled and an unrelated process group killed.
 - `PtyHandle::shutdown` is bounded: polite close, one `KILL_GRACE = 400 ms` wait,
   hard kill, short reap. `PtyHandle::drop` performs the same escalation so a dropped
   handle cannot leak a child.
