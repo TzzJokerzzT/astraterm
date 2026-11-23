@@ -21,17 +21,17 @@ use astraterm_platform::paths::StatePaths;
 use astraterm_platform::system::SystemMonitor;
 use astraterm_settings_ui::panel::{PanelAction, PanelKey, SettingsPanel};
 use astraterm_terminal::input::{
-    self, KeyEventType, MouseEvent, MouseKind, encode_key, encode_mouse,
+    self, KeyEventType, MouseEvent, MouseKind, TermKey, encode_key, encode_mouse,
 };
 use astraterm_terminal::snapshot::ModeFlags;
 use astraterm_workspace::snapshot::{WorkspaceSnapshot, restore_window, snapshot_window};
 use astraterm_workspace::{Pane, Tab, WindowState};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
-use winit::window::{Window, WindowId as WinitWindowId};
+use winit::window::{ImePurpose, Window, WindowId as WinitWindowId};
 
 use crate::cli::Cli;
 use crate::keys;
@@ -194,8 +194,12 @@ impl Application {
             .with_transparent(true)
             .with_decorations(config.window.show_window_controls);
         let window = Arc::new(event_loop.create_window(attributes)?);
-        // IME preedit is not implemented yet; text input arrives through key events.
-        window.set_ime_allowed(false);
+        // Composed text reaches the terminal as raw bytes, not as key events:
+        // dead keys (`´` then `a`), and every character an input method composes.
+        // The terminal purpose tells the platform this is not prose, so no
+        // candidate box is offered for ordinary typing.
+        window.set_ime_allowed(true);
+        window.set_ime_purpose(ImePurpose::Terminal);
         // The icon comes from the same logo the desktop entry installs, and the app
         // identity matches `StartupWMClass`/`Icon` so the launcher and the window
         // switcher show it instead of a generic placeholder.
@@ -1924,6 +1928,57 @@ impl Application {
         if let Some(session) = self.sessions.for_pane_mut(pane) {
             session.write(&bytes);
         }
+        // Remembered so a platform that also commits this character through the
+        // input method does not make the PTY insert it twice.
+        if let TermKey::Char(_) = press.key
+            && let Some(text) = event.text.as_ref()
+        {
+            let text = text.to_string();
+            let now = Instant::now();
+            self.with_window(window_id, |ui| ui.last_key_text = Some((text, now)));
+        }
+    }
+
+    /// Delivers text the platform composed (dead keys, input methods) to the pane.
+    ///
+    /// The text is written as raw UTF-8: it never passes through the shortcut or
+    /// key-encoding paths, so `|` from `AltGr+1` and `á` from a dead key reach the
+    /// child process unchanged.
+    fn handle_ime(&mut self, window_id: WinitWindowId, ime: Ime) {
+        match ime {
+            Ime::Commit(text) => self.commit_composed_text(window_id, &text),
+            // Preedit is not drawn: the composition is visible once committed.
+            Ime::Preedit(text, _) => tracing::trace!(preedit = %text, "ime preedit"),
+            Ime::Enabled | Ime::Disabled => {}
+        }
+    }
+
+    fn commit_composed_text(&mut self, window_id: WinitWindowId, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let Some(ui) = self.windows.get(&window_id) else {
+            return;
+        };
+        // Overlays (search, settings, rename, confirmation) read their own text
+        // input from key events and never receive composed terminal text.
+        if !matches!(ui.overlay, Overlay::None) {
+            return;
+        }
+        let Some(pane) = ui.focused_pane() else {
+            return;
+        };
+        let last = ui
+            .last_key_text
+            .as_ref()
+            .map(|(written, at)| (written.as_str(), *at));
+        if keys::commit_repeats_key(text, last, Instant::now()) {
+            return;
+        }
+        let bytes = text.as_bytes();
+        if let Some(session) = self.sessions.for_pane_mut(pane) {
+            session.write(bytes);
+        }
     }
 
     /// Sends a key release to the focused PTY when the application asked for it.
@@ -2471,6 +2526,7 @@ impl ApplicationHandler<UserEvent> for Application {
             WindowEvent::KeyboardInput { event, .. } => {
                 self.handle_key(event_loop, window_id, &event)
             }
+            WindowEvent::Ime(ime) => self.handle_ime(window_id, ime),
             WindowEvent::CursorMoved { position, .. } => {
                 self.handle_cursor_moved(window_id, position.x, position.y);
             }

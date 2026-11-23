@@ -242,6 +242,14 @@ Check, in this order:
     marks stay on their base, emoji and Nerd Font glyphs are not clipped. A wide
     glyph may overflow its cell by a pixel; the column after it must remain
     aligned.
+12. **Layout characters and dead keys.** With a Spanish layout, `AltGr+1` writes
+    `|`, `AltGr+4` writes `~`, `AltGr+2` writes `@` and `AltGr+3` writes `#`; the
+    dead key `´` followed by `a` writes `á`. Verify with a program that shows the
+    bytes, so an `ESC` prefix is visible:
+
+    ```sh
+    cat -v   # AltGr+1 must print |, never ^[|
+    ```
 
 ### tmux
 
@@ -281,14 +289,30 @@ or the application.
   flag is advertised by default, the five flags of the current protocol
   (1/2/4/8/16) are honoured, and the query/set/push/pop sequences are handled by
   the emulation core. What is missing is platform input the window layer does not
-  deliver (see the IME gap below). `terminal.kitty_keyboard = false` restores the
-  historical xterm-only behaviour: no `CSI ? u` answer, a held key is a repeated
-  press, and a release sends nothing.
-- **No IME preedit.** `window.set_ime_allowed(false)` in `crates/app/src/app.rs`.
-  CJK and other IME-based input cannot compose text; only characters delivered as
-  key events work.
-- **No image protocols.** There is no Sixel or Kitty graphics parsing/rendering
-  path; images sent to the terminal are not displayed.
+  deliver (see the composed-text entry below). `terminal.kitty_keyboard = false`
+  restores the historical xterm-only behaviour: no `CSI ? u` answer, a held key
+  is a repeated press, and a release sends nothing.
+- **Composed text is delivered, not drawn.** The window opts into the platform
+  input method (`window.set_ime_allowed(true)` with `ImePurpose::Terminal` in
+  `crates/app/src/app.rs`), so the characters a layout or an input method
+  composes arrive as `WindowEvent::Ime`: `Ime::Commit` is written to the focused
+  pane as raw UTF-8, bypassing the shortcut and key-encoding paths. That covers
+  dead keys (`´` then `a` gives `á`) and IME-based input (pinyin, kana), and it
+  also makes `AltGr` a character rather than Meta: `|`, `~`, `@`, `#` and `\`
+  on the Spanish layout are written as themselves instead of `ESC` + character,
+  and a layout's third level no longer matches an `alt+1`-style binding. `crates/app/src/keys.rs`
+  owns that decision (`altgr_composition`, `chord_modifiers`) and the guard that
+  drops a commit repeating the text a key press just wrote
+  (`commit_repeats_key`). What remains missing:
+  - the **preedit** is not drawn. The text being composed (`´` waiting for a
+    vowel, the pinyin buffer) is invisible until it is committed; there is no
+    inline composition at the cursor and no reflected preedit anywhere else;
+  - the **candidate window is not positioned**: `Window::set_ime_cursor_area` is
+    never called, so a platform that shows candidates places them at the
+    window's default spot instead of at the terminal cursor;
+  - while an **overlay** (search, settings, rename, confirmation) is open, commits
+    are dropped rather than typed into the overlay, because those panels read
+    their own text from key events.
 - **Ligatures are opt-in.** Rows are shaped as whole strings and glyph positions come
   from the shaper; AstraTerm does not implement per-cell glyph placement. Cell metrics
   come from the shaped advance of `MMMMMMMMMM` (`crates/renderer/src/text.rs`), so grid

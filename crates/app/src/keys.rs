@@ -8,6 +8,8 @@
 //! * [`key_press`] answers "what bytes must the PTY receive?", used when no
 //!   shortcut claims the key (and always while literal-next mode is armed).
 
+use std::time::{Duration, Instant};
+
 use astraterm_config::keys::{
     ActionId, Chord, Key as ChordKey, Modifiers as ChordModifiers, NamedKey,
 };
@@ -17,17 +19,102 @@ use astraterm_terminal::snapshot::ModeFlags;
 use winit::event::KeyEvent;
 use winit::keyboard::ModifiersState;
 use winit::keyboard::{Key, NamedKey as WinitNamedKey};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
 /// Converts a winit key press into a configuration chord, if it maps to one.
 pub fn chord_of(event: &KeyEvent, modifiers: ModifiersState) -> Option<Chord> {
     let key = chord_key(&event.logical_key)?;
-    let mods = ChordModifiers {
+    Some(Chord {
+        mods: chord_modifiers(modifiers, altgr_composition_of(event, modifiers)),
+        key,
+    })
+}
+
+/// The chord modifiers of a press, with AltGr composition excluded from `alt`.
+///
+/// AltGr types a character (the third level of the layout), so the chords bound
+/// to `alt+1` and friends must not fire for it; genuine Meta presses still do.
+pub fn chord_modifiers(modifiers: ModifiersState, altgr: bool) -> ChordModifiers {
+    ChordModifiers {
         ctrl: modifiers.control_key(),
-        alt: modifiers.alt_key(),
+        alt: modifiers.alt_key() && !altgr,
         shift: modifiers.shift_key(),
         sup: modifiers.super_key(),
+    }
+}
+
+/// Whether the Alt reported for this press is AltGr composition rather than Meta.
+pub fn altgr_composition_of(event: &KeyEvent, modifiers: ModifiersState) -> bool {
+    modifiers.alt_key()
+        && altgr_composition(
+            &event.logical_key,
+            event.text.as_deref(),
+            &event.key_without_modifiers(),
+            modifiers.shift_key(),
+        )
+}
+
+/// Whether a press produced its character through AltGr rather than as Meta.
+///
+/// Compositors can report the layout's third level (AltGr) as the Alt modifier,
+/// so the modifier alone cannot tell `AltGr+4`, which types `~` on a Spanish
+/// layout, from `Alt+4`, which is Meta-4. The produced text decides:
+///
+/// * the text is one printable character that differs from the logical key, so
+///   composition replaced the character; or
+/// * the compositor already folded the third level into the logical key
+///   (`AltGr+4` arrives as `Character("~")`), so the logical key differs from
+///   the key's unmodified character while Shift is not held.
+///
+/// Alt never changes an xkb layout's character, so plain `Alt+a` stays Meta. Caps
+/// Lock only upper-cases the unmodified character, so the second rule compares
+/// case-insensitively to keep `Alt+a` Meta under Caps Lock.
+pub fn altgr_composition(logical: &Key, text: Option<&str>, unmodified: &Key, shift: bool) -> bool {
+    let Some(ch) = single_char(text) else {
+        return false;
     };
-    Some(Chord { mods, key })
+    if ch.is_control() {
+        return false;
+    }
+    if char_of(logical).is_some_and(|logical| logical != ch) {
+        return true;
+    }
+    if shift {
+        return false;
+    }
+    char_of(unmodified).is_some_and(|base| !base.eq_ignore_ascii_case(&ch))
+}
+
+/// How recently a key press must have written text for an IME commit to count as
+/// the same keystroke.
+pub const IME_ECHO_WINDOW: Duration = Duration::from_millis(200);
+
+/// Whether an IME commit repeats text a key press just wrote.
+///
+/// A platform that delivers both the keystroke and its commit would otherwise
+/// insert the character twice. Text an input method composed from several keys
+/// (dead keys, CJK candidates) never produced a key press, so it is written once.
+pub fn commit_repeats_key(commit: &str, last: Option<(&str, Instant)>, now: Instant) -> bool {
+    match last {
+        Some((text, at)) => text == commit && now.saturating_duration_since(at) <= IME_ECHO_WINDOW,
+        None => false,
+    }
+}
+
+/// The single character a text string carries, if it carries exactly one.
+fn single_char(text: Option<&str>) -> Option<char> {
+    let mut chars = text?.chars();
+    let ch = chars.next()?;
+    chars.next().is_none().then_some(ch)
+}
+
+/// The character a key names, for the keys that carry one.
+fn char_of(key: &Key) -> Option<char> {
+    match key {
+        Key::Character(text) => text.chars().next(),
+        Key::Named(WinitNamedKey::Space) => Some(' '),
+        _ => None,
+    }
 }
 
 fn chord_key(key: &Key) -> Option<ChordKey> {
@@ -84,7 +171,9 @@ fn named_key(named: WinitNamedKey) -> Option<NamedKey> {
 /// represent, so nothing is silently sent to the child process.
 pub fn key_press(event: &KeyEvent, modifiers: ModifiersState) -> Option<KeyPress> {
     let ctrl = modifiers.control_key();
-    let alt = modifiers.alt_key();
+    // AltGr is a character composition, not Meta: `AltGr+4` must send `~`, not
+    // `ESC ~`.
+    let alt = modifiers.alt_key() && !altgr_composition_of(event, modifiers);
     let shift = modifiers.shift_key();
 
     let key = match &event.logical_key {
@@ -123,6 +212,10 @@ pub fn key_press(event: &KeyEvent, modifiers: ModifiersState) -> Option<KeyPress
                 })?;
             TermKey::Char(ch)
         }
+        // A dead key is usually a prefix, not text: the composed character arrives
+        // with the next press. Platforms that do report the character a dead key
+        // stands for deliver it as text, and that character is written.
+        Key::Dead(_) => TermKey::Char(single_char(event.text.as_deref())?),
         _ => return None,
     };
 
@@ -304,6 +397,131 @@ mod tests {
             command_for(ActionId::ScrollToBottom),
             Some(AppCommand::ScrollToBottom)
         ));
+    }
+
+    /// The four cases the layout rule names, stated as the winit data each one
+    /// produces: `logical`, the produced `text`, the unmodified key and Shift.
+    #[test]
+    fn altgr_composition_is_not_meta() {
+        // `AltGr+1` on the Spanish layout types `|`: the produced text is not the
+        // logical key, so the Alt on the press is composition, not Meta.
+        assert!(altgr_composition(
+            &Key::Character("1".into()),
+            Some("|"),
+            &Key::Character("1".into()),
+            false
+        ));
+        // `AltGr+4` types `~` for the same reason.
+        assert!(altgr_composition(
+            &Key::Character("4".into()),
+            Some("~"),
+            &Key::Character("4".into()),
+            false
+        ));
+        // `Alt+a` is Meta: the text is exactly the logical key.
+        assert!(!altgr_composition(
+            &Key::Character("a".into()),
+            Some("a"),
+            &Key::Character("a".into()),
+            false
+        ));
+        // `Alt+1` is Meta-1: no composition changed the character.
+        assert!(!altgr_composition(
+            &Key::Character("1".into()),
+            Some("1"),
+            &Key::Character("1".into()),
+            false
+        ));
+    }
+
+    #[test]
+    fn a_layout_that_folds_altgr_into_the_logical_key_is_composition() {
+        // The compositor applies the third level before winit reports it, so the
+        // logical key already carries `|` and only the unmodified key (`1`) shows
+        // that Alt was AltGr.
+        assert!(altgr_composition(
+            &Key::Character("|".into()),
+            Some("|"),
+            &Key::Character("1".into()),
+            false
+        ));
+        // A layout's second level is Shift, not AltGr: `Alt+Shift+a` stays Meta.
+        assert!(!altgr_composition(
+            &Key::Character("A".into()),
+            Some("A"),
+            &Key::Character("a".into()),
+            true
+        ));
+        // Caps Lock only upper-cases the unmodified character: still Meta.
+        assert!(!altgr_composition(
+            &Key::Character("A".into()),
+            Some("A"),
+            &Key::Character("a".into()),
+            false
+        ));
+    }
+
+    #[test]
+    fn only_single_printable_text_is_composition() {
+        assert!(!altgr_composition(
+            &Key::Character("a".into()),
+            None,
+            &Key::Character("a".into()),
+            false
+        ));
+        assert!(!altgr_composition(
+            &Key::Character("a".into()),
+            Some("abc"),
+            &Key::Character("a".into()),
+            false
+        ));
+        assert!(!altgr_composition(
+            &Key::Named(WinitNamedKey::Enter),
+            Some("\r"),
+            &Key::Named(WinitNamedKey::Enter),
+            false
+        ));
+    }
+
+    /// AltGr types a character, so the chords bound to `alt+1..9` must not fire;
+    /// genuine Meta chords still must.
+    #[test]
+    fn altgr_does_not_reach_meta_bindings() {
+        let altgr = chord_modifiers(ModifiersState::ALT, true);
+        let meta = chord_modifiers(ModifiersState::ALT, false);
+        let digit = Chord {
+            mods: altgr,
+            key: ChordKey::Char('1'),
+        };
+        assert_eq!(
+            keymap().action_for(&digit),
+            None,
+            "AltGr+1 types |, it must not switch to tab 1"
+        );
+        assert_eq!(
+            keymap().action_for(&Chord {
+                mods: meta,
+                key: ChordKey::Char('1')
+            }),
+            Some(ActionId::Tab1),
+            "Alt+1 is still the tab-1 binding"
+        );
+    }
+
+    #[test]
+    fn an_ime_commit_that_repeats_the_last_key_is_dropped() {
+        let now = Instant::now();
+        assert!(commit_repeats_key("a", Some(("a", now)), now));
+        assert!(!commit_repeats_key("a", Some(("b", now)), now));
+        assert!(!commit_repeats_key("a", None, now));
+        // Composition takes longer than the echo window: it is new text.
+        assert!(!commit_repeats_key(
+            "a",
+            Some(("a", now - IME_ECHO_WINDOW - Duration::from_millis(1))),
+            now
+        ));
+        // A dead key commits text no key press wrote, so it is always delivered.
+        assert!(!commit_repeats_key("á", Some(("a", now)), now));
     }
 
     #[test]

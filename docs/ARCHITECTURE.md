@@ -282,7 +282,8 @@ Notes:
   keymap and detects the clipboard backend.
 - `WindowUi` owns the renderer, the workspace, pane metadata and pointer state
   for one window. It never owns sessions.
-- `window.set_ime_allowed(false)` — IME preedit is not implemented.
+- `window.set_ime_allowed(true)` with `ImePurpose::Terminal`: composed text arrives as
+  `WindowEvent::Ime` and is written to the focused pane. Preedit is traced, not drawn.
 - Only one window is created in `resumed`; further windows come from the
   `NewWindow` command.
 

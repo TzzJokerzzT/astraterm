@@ -187,6 +187,9 @@ pub struct WindowUi {
     pub last_click: Option<ClickInfo>,
     pub cursor_phase: bool,
     pub status: Option<(String, Instant)>,
+    /// Text the last key press wrote, so an input-method commit that repeats it is
+    /// dropped instead of inserting the character twice.
+    pub last_key_text: Option<(String, Instant)>,
     /// Session ids bound to panes, so the window can be torn down cleanly.
     pub session_bindings: BTreeMap<PaneId, astraterm_core::SessionId>,
 }
@@ -222,6 +225,7 @@ impl WindowUi {
             last_click: None,
             cursor_phase: true,
             status: None,
+            last_key_text: None,
             session_bindings: BTreeMap::new(),
         }
     }
