@@ -1,0 +1,13 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# Release artefacts
+/dist
+
+# OS clutter
+.DS_Store
+
+# Icon build artefact generated from assets/icons/astraterm.svg
+# (see assets/icons/README.md: the SVG is the source, the PNG is generated).
+/assets/icons/astraterm.png

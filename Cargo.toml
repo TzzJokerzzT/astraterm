@@ -1,0 +1,61 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/app",
+    "crates/core",
+    "crates/config",
+    "crates/workspace",
+    "crates/session",
+    "crates/terminal",
+    "crates/pty",
+    "crates/renderer",
+    "crates/settings-ui",
+    "crates/platform",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://example.invalid/astraterm"
+
+[workspace.dependencies]
+astraterm-core = { path = "crates/core" }
+astraterm-config = { path = "crates/config" }
+astraterm-workspace = { path = "crates/workspace" }
+astraterm-session = { path = "crates/session" }
+astraterm-terminal = { path = "crates/terminal" }
+astraterm-pty = { path = "crates/pty" }
+astraterm-renderer = { path = "crates/renderer" }
+astraterm-settings-ui = { path = "crates/settings-ui" }
+astraterm-platform = { path = "crates/platform" }
+
+alacritty_terminal = "0.26"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+cosmic-text = "0.19"
+crossbeam-channel = "0.5"
+glyphon = "0.12"
+log = "0.4"
+notify = "9"
+portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_ignored = "0.1"
+thiserror = "2"
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wgpu = "30"
+winit = "0.30"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
