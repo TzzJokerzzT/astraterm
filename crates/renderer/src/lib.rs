@@ -1,11 +1,14 @@
 //! GPU rendering for AstraTerm.
 //!
-//! Two pipelines cover everything the application draws:
+//! Three pipelines cover everything the application draws, in this order:
 //!
 //! * a single instanced quad pipeline for backgrounds, selection, cursor, pane
 //!   chrome, tab strip and overlays;
+//! * an instanced textured pipeline for terminal images, one draw call per image
+//!   texture, with a texture cache that keeps GPU memory bounded;
 //! * glyphon (wgpu + cosmic-text) for glyphs, with a shaped-row cache so unchanged
-//!   rows are never re-shaped.
+//!   rows are never re-shaped. Glyphs are drawn last, so text stays on top of the
+//!   images behind it.
 //!
 //! The renderer knows nothing about panes, tabs or sessions: it consumes a [`Scene`]
 //! that the application composes from snapshots.
@@ -13,6 +16,7 @@
 pub mod paint;
 pub mod quad;
 pub mod text;
+pub mod texture;
 
 use std::sync::Arc;
 
@@ -29,7 +33,7 @@ use wgpu::{
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
-pub use paint::{PaintOptions, Quad, Scene, Span, TextItem};
+pub use paint::{ImageItem, ImagePixels, PaintOptions, Quad, Scene, Span, TextItem};
 pub use text::TextStyle;
 
 /// Chooses the surface format, preferring plain 8-bit UNORM.
@@ -104,6 +108,8 @@ pub struct Renderer {
     config: SurfaceConfiguration,
     format: TextureFormat,
     quads: quad::QuadPipeline,
+    images: texture::TexturePipeline,
+    textures: texture::TextureCache,
     font_system: FontSystem,
     swash_cache: SwashCache,
     viewport: Viewport,
@@ -182,6 +188,8 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let quads = quad::QuadPipeline::new(&device, format);
+        let images = texture::TexturePipeline::new(&device, format);
+        let textures = texture::TextureCache::new(&device, texture::image_texture_format(format));
         let mut font_system = FontSystem::new();
         let style = TextStyle::new(&options.font, options.scale, &mut font_system);
         let swash_cache = SwashCache::new();
@@ -211,6 +219,8 @@ impl Renderer {
             config,
             format,
             quads,
+            images,
+            textures,
             font_system,
             swash_cache,
             viewport,
@@ -323,6 +333,18 @@ impl Renderer {
         self.quads
             .upload(&self.device, &self.queue, &instances, size);
 
+        // Images are uploaded only when their generation changed, and the cache
+        // hands back exactly the instances it kept, so an evicted texture is not
+        // drawn with stale pixels.
+        let prepared = self.textures.prepare(
+            &self.device,
+            &self.queue,
+            self.images.texture_layout(),
+            &scene.images,
+        );
+        self.images
+            .upload(&self.device, &self.queue, &prepared.instances, size);
+
         self.rows.update(&mut self.font_system, &self.style, scene);
         let areas = self.rows.areas(scene);
         self.text_renderer
@@ -389,6 +411,19 @@ impl Renderer {
                 multiview_mask: None,
             });
             self.quads.draw(&mut pass);
+            let batches: Vec<texture::Batch<'_>> = prepared
+                .batches
+                .iter()
+                .filter_map(|batch| {
+                    self.textures
+                        .bind_group(batch.id)
+                        .map(|bind_group| texture::Batch {
+                            bind_group,
+                            range: batch.range.clone(),
+                        })
+                })
+                .collect();
+            self.images.draw(&mut pass, &batches);
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .map_err(|error| RendererError::Render(error.to_string()))?;

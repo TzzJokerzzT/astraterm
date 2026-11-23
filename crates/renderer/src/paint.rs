@@ -1,8 +1,10 @@
 //! Rasterisation-independent painting: turns terminal snapshots and UI state into
-//! a flat list of coloured quads and text runs.
+//! a flat list of coloured quads, image items and text runs.
 //!
 //! Keeping this pure means colour resolution, selection highlighting, cursor shapes
 //! and cell layout are unit-tested without a window, a GPU or a font.
+
+use std::sync::Arc;
 
 use astraterm_config::palette::{Palette, Rgb};
 use astraterm_core::{CellMetrics, Padding, Rect};
@@ -79,12 +81,84 @@ impl TextItem {
 }
 
 /// One frame's worth of drawing instructions.
+///
+/// The lists are drawn in a fixed order that ignores the order they were pushed
+/// in: `quads` (backgrounds, selection, cursor, chrome), then `images`, then
+/// `texts`. Terminal images are therefore always behind the glyphs that sit on
+/// top of them.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Scene {
     /// Window clear colour (the terminal background of the active pane).
     pub clear: [f32; 4],
     pub quads: Vec<Quad>,
+    pub images: Vec<ImageItem>,
     pub texts: Vec<TextItem>,
+}
+
+/// Decoded RGBA pixels of one image, shared with whoever produced them.
+///
+/// The buffer is allocated once by the producer and never copied per frame: the
+/// renderer uploads it when the generation changes and the scene only holds an
+/// `Arc` to it. Cloning the scene (linearisation, transparent-surface conversion)
+/// clones the pointer, not the pixels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImagePixels {
+    pub width: u32,
+    pub height: u32,
+    /// Tightly packed RGBA, 4 bytes per pixel, row-major.
+    pub rgba: Vec<u8>,
+}
+
+impl ImagePixels {
+    /// Wraps decoded pixels, refusing a buffer that does not match the size.
+    pub fn new(width: u32, height: u32, rgba: Vec<u8>) -> Option<Self> {
+        if width == 0 || height == 0 || rgba.len() != width as usize * height as usize * 4 {
+            return None;
+        }
+        Some(Self {
+            width,
+            height,
+            rgba,
+        })
+    }
+
+    /// Bytes this image occupies, on the CPU and on the GPU.
+    pub fn byte_len(&self) -> usize {
+        self.rgba.len()
+    }
+}
+
+/// A decoded image placed on the canvas.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageItem {
+    /// Stable identifier: the texture cache is keyed by it, so an item that keeps
+    /// its identifier is never uploaded twice for the same generation.
+    pub id: u64,
+    /// Destination rectangle in device pixels.
+    pub rect: Rect,
+    pub pixels: Arc<ImagePixels>,
+    /// Changes whenever `pixels` holds new content, forcing a re-upload.
+    pub generation: u64,
+    /// Source sub-rectangle in normalised UV coordinates (`u0, v0, u1, v1`).
+    pub uv: [f32; 4],
+}
+
+impl ImageItem {
+    pub fn new(id: u64, rect: Rect, pixels: Arc<ImagePixels>, generation: u64) -> Self {
+        Self {
+            id,
+            rect,
+            pixels,
+            generation,
+            uv: [0.0, 0.0, 1.0, 1.0],
+        }
+    }
+
+    /// Draws only a sub-rectangle of the texture, for an image that is clipped.
+    pub fn with_uv(mut self, uv: [f32; 4]) -> Self {
+        self.uv = uv;
+        self
+    }
 }
 
 impl Scene {
@@ -103,6 +177,9 @@ impl Scene {
     }
 
     /// Converts every colour in the scene to linear light, for sRGB targets.
+    ///
+    /// Image pixels are untouched: their bytes stay sRGB and the texture is
+    /// uploaded as an sRGB view, so the GPU converts while sampling.
     pub fn linearize(&mut self) {
         self.clear = linear_rgba(self.clear);
         for quad in &mut self.quads {
@@ -118,8 +195,7 @@ impl Scene {
     pub fn with_clear(color: Rgb, opacity: f32) -> Self {
         Self {
             clear: rgba(color, opacity),
-            quads: Vec::new(),
-            texts: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -145,6 +221,15 @@ impl Scene {
             return;
         }
         self.texts.push(item);
+    }
+
+    /// Queues an image. It is drawn above every quad and below every glyph,
+    /// whatever order the caller pushes items in.
+    pub fn push_image(&mut self, item: ImageItem) {
+        if item.rect.is_empty() || item.pixels.rgba.is_empty() {
+            return;
+        }
+        self.images.push(item);
     }
 }
 
@@ -1045,5 +1130,78 @@ mod tests {
         assert_eq!(a.content_hash(), b.content_hash());
         assert_ne!(a.content_hash(), c.content_hash());
         assert_ne!(a.content_hash(), d.content_hash());
+    }
+
+    fn pixels() -> Arc<ImagePixels> {
+        Arc::new(ImagePixels::new(2, 1, vec![0xff; 8]).expect("two RGBA pixels"))
+    }
+
+    #[test]
+    fn images_are_queued_apart_from_quads_and_text() {
+        let pixels = pixels();
+        let mut scene = Scene::default();
+        // Pushed in the wrong order on purpose: the lists, not the push order,
+        // decide that quads are painted first, then images, then glyphs.
+        scene.push_text(TextItem::plain(
+            0,
+            (0.0, 0.0),
+            "text",
+            [1.0; 4],
+            Rect::new(0, 0, 10, 10),
+        ));
+        scene.push_image(ImageItem::new(
+            7,
+            Rect::new(4, 5, 20, 10),
+            Arc::clone(&pixels),
+            3,
+        ));
+        scene.push_quad(Rect::new(0, 0, 10, 10), theme().background, 1.0);
+
+        assert_eq!(scene.quads.len(), 1);
+        assert_eq!(scene.images.len(), 1);
+        assert_eq!(scene.texts.len(), 1);
+        let image = &scene.images[0];
+        assert_eq!(image.id, 7);
+        assert_eq!(image.rect, Rect::new(4, 5, 20, 10));
+        assert_eq!(image.generation, 3);
+        assert_eq!(image.uv, [0.0, 0.0, 1.0, 1.0]);
+        assert!(
+            Arc::ptr_eq(&image.pixels, &pixels),
+            "the pixels are shared with the producer, never copied into the scene"
+        );
+    }
+
+    #[test]
+    fn linearizing_a_scene_leaves_image_pixels_untouched() {
+        let pixels = Arc::new(ImagePixels::new(1, 1, vec![10, 20, 30, 255]).expect("one pixel"));
+        let mut scene = Scene::with_clear(Rgb::new(0x80, 0x40, 0x20), 1.0);
+        scene.push_image(ImageItem::new(1, Rect::new(0, 0, 1, 1), pixels, 1));
+        scene.linearize();
+        assert_eq!(
+            scene.images[0].pixels.rgba,
+            vec![10, 20, 30, 255],
+            "the sRGB texture view converts while sampling"
+        );
+    }
+
+    #[test]
+    fn an_image_that_cannot_be_drawn_is_not_queued() {
+        assert!(ImagePixels::new(0, 4, Vec::new()).is_none());
+        assert!(
+            ImagePixels::new(2, 2, vec![0; 4]).is_none(),
+            "the buffer must match width * height * 4"
+        );
+        let pixels = pixels();
+        let mut scene = Scene::default();
+        scene.push_image(ImageItem::new(
+            1,
+            Rect::new(0, 0, 0, 10),
+            Arc::clone(&pixels),
+            1,
+        ));
+        assert!(
+            scene.images.is_empty(),
+            "an empty destination rectangle draws nothing"
+        );
     }
 }
