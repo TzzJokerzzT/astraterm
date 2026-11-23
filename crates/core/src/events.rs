@@ -40,29 +40,65 @@ impl ExitReason {
 /// settings panel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppCommand {
-    NewTab { profile: Option<ProfileId> },
-    CloseTab { tab: TabId },
-    RenameTab { tab: TabId, title: String },
-    MoveTab { from: usize, to: usize },
+    NewTab {
+        profile: Option<ProfileId>,
+    },
+    CloseTab {
+        tab: TabId,
+    },
+    RenameTab {
+        tab: TabId,
+        title: String,
+    },
+    MoveTab {
+        from: usize,
+        to: usize,
+    },
+    /// Moves the active tab by `delta` positions (negative moves left).
+    MoveTabRelative {
+        delta: i32,
+    },
     NextTab,
     PreviousTab,
-    SelectTab { index: usize },
-    SplitPane { pane: PaneId, axis: SplitAxis },
-    ClosePane { pane: PaneId },
-    FocusPane { pane: PaneId },
-    FocusDirection { direction: FocusDirection },
-    ResizeDivider { axis: SplitAxis, delta_percent: i16 },
+    SelectTab {
+        index: usize,
+    },
+    SplitPane {
+        pane: PaneId,
+        axis: SplitAxis,
+    },
+    ClosePane {
+        pane: PaneId,
+    },
+    FocusPane {
+        pane: PaneId,
+    },
+    FocusDirection {
+        direction: FocusDirection,
+    },
+    ResizeDivider {
+        axis: SplitAxis,
+        delta_percent: i16,
+    },
     EqualizeSplits,
     ToggleZoom,
-    NewWindow { profile: Option<ProfileId> },
-    CloseWindow { window: WindowId },
+    NewWindow {
+        profile: Option<ProfileId>,
+    },
+    CloseWindow {
+        window: WindowId,
+    },
     CopySelection,
     Paste,
-    Search { forward: bool },
+    Search {
+        forward: bool,
+    },
     SearchNext,
     SearchPrevious,
     CloseSearch,
-    ScrollLines { delta: i32 },
+    ScrollLines {
+        delta: i32,
+    },
     ScrollToBottom,
     IncreaseFontSize,
     DecreaseFontSize,

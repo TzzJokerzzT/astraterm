@@ -34,8 +34,8 @@ use winit::window::{Window, WindowId as WinitWindowId};
 use crate::cli::Cli;
 use crate::keys;
 use crate::ui::{
-    ClickInfo, ConfirmDialog, DragState, Overlay, PendingAction, SearchOverlay, SplitIdRef,
-    WindowUi, url_at,
+    ClickInfo, ConfirmDialog, DragState, Overlay, PendingAction, RenameOverlay, SearchOverlay,
+    SplitIdRef, WindowUi, url_at,
 };
 
 /// Events the application sends itself from other threads.
@@ -658,12 +658,42 @@ impl Application {
                 self.persist_workspace();
             }
             AppCommand::RenameTab { tab, title } => {
-                self.with_window(window_id, |ui| {
-                    if let Some(tab) = ui.workspace.tab_mut(tab) {
-                        tab.title = title;
-                    }
-                    ui.window.request_redraw();
-                });
+                // An empty title means "ask the user"; a non-empty one is a direct set.
+                if title.is_empty() {
+                    let current = self
+                        .windows
+                        .get(&window_id)
+                        .and_then(|ui| ui.workspace.tab(tab))
+                        .map(|tab| tab.title.clone())
+                        .unwrap_or_default();
+                    self.with_window(window_id, |ui| {
+                        ui.overlay = Overlay::Rename(RenameOverlay::new(tab, &current));
+                        ui.window.request_redraw();
+                    });
+                } else {
+                    self.with_window(window_id, |ui| {
+                        if let Some(tab) = ui.workspace.tab_mut(tab) {
+                            tab.title = title;
+                        }
+                        ui.window.request_redraw();
+                    });
+                }
+            }
+            AppCommand::MoveTabRelative { delta } => {
+                let moved = self
+                    .with_window(window_id, |ui| {
+                        let Some(from) = ui.workspace.active_index() else {
+                            return false;
+                        };
+                        let count = ui.workspace.tabs.len() as i32;
+                        let to = (from as i32 + delta).clamp(0, count - 1) as usize;
+                        ui.workspace.move_tab(from, to)
+                    })
+                    .unwrap_or(false);
+                if moved {
+                    self.with_window(window_id, |ui| ui.window.request_redraw());
+                    self.persist_workspace();
+                }
             }
             AppCommand::ResizeDivider {
                 axis,
@@ -1299,11 +1329,13 @@ impl Application {
             Overlay::Search(_) => 1,
             Overlay::Settings(_) => 2,
             Overlay::Confirm(_) => 3,
+            Overlay::Rename(_) => 4,
         });
         match overlay {
             Some(2) => self.handle_settings_key(window_id, event),
             Some(3) => self.handle_confirm_key(event_loop, window_id, event),
             Some(1) => self.handle_search_key(window_id, event),
+            Some(4) => self.handle_rename_key(window_id, event),
             _ => self.handle_terminal_key(event_loop, window_id, event),
         }
     }
@@ -1446,6 +1478,67 @@ impl Application {
             PendingAction::ClosePane(pane) => self.close_pane(window_id, pane),
             PendingAction::CloseTab(tab) => self.close_tab(window_id, tab),
             PendingAction::CloseWindow(_) | PendingAction::Quit => self.finish(event_loop),
+        }
+    }
+
+    fn handle_rename_key(&mut self, window_id: WinitWindowId, event: &winit::event::KeyEvent) {
+        use winit::keyboard::{Key, NamedKey as WK};
+        enum RenameKey {
+            Char(char),
+            Backspace,
+            Commit,
+            Cancel,
+        }
+        let key = match &event.logical_key {
+            Key::Named(WK::Escape) => RenameKey::Cancel,
+            Key::Named(WK::Enter) => RenameKey::Commit,
+            Key::Named(WK::Backspace) => RenameKey::Backspace,
+            Key::Named(WK::Space) => RenameKey::Char(' '),
+            Key::Character(text) => match text.chars().next() {
+                Some(ch) => RenameKey::Char(ch),
+                None => return,
+            },
+            _ => return,
+        };
+
+        let committed = self
+            .with_window(window_id, |ui| {
+                let Overlay::Rename(rename) = &mut ui.overlay else {
+                    return None;
+                };
+                match key {
+                    RenameKey::Cancel => {
+                        ui.overlay = Overlay::None;
+                        ui.window.request_redraw();
+                        None
+                    }
+                    RenameKey::Backspace => {
+                        rename.pop();
+                        ui.window.request_redraw();
+                        None
+                    }
+                    RenameKey::Char(ch) => {
+                        rename.push(ch);
+                        ui.window.request_redraw();
+                        None
+                    }
+                    RenameKey::Commit => {
+                        let tab = rename.tab;
+                        let title = rename.committed_title();
+                        ui.overlay = Overlay::None;
+                        Some((tab, title))
+                    }
+                }
+            })
+            .flatten();
+        if let Some((tab, title)) = committed {
+            self.with_window(window_id, |ui| {
+                if let Some(tab) = ui.workspace.tab_mut(tab) {
+                    tab.title = title;
+                }
+                ui.window.request_redraw();
+            });
+            self.persist_workspace();
         }
     }
 

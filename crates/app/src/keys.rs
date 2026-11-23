@@ -138,6 +138,8 @@ pub fn command_for(action: ActionId) -> Option<AppCommand> {
     Some(match action {
         ActionId::NewTab => AppCommand::NewTab { profile: None },
         ActionId::PreviousTab => AppCommand::PreviousTab,
+        ActionId::MoveTabLeft => AppCommand::MoveTabRelative { delta: -1 },
+        ActionId::MoveTabRight => AppCommand::MoveTabRelative { delta: 1 },
         ActionId::NextTab => AppCommand::NextTab,
         ActionId::Tab1 => AppCommand::SelectTab { index: 0 },
         ActionId::Tab2 => AppCommand::SelectTab { index: 1 },
@@ -162,7 +164,11 @@ pub fn command_for(action: ActionId) -> Option<AppCommand> {
         ActionId::CloseTab => AppCommand::CloseTab {
             tab: astraterm_core::TabId::from_raw(0),
         },
-        ActionId::RenameTab => return None,
+        // Rename opens an inline prompt, so it carries no title here.
+        ActionId::RenameTab => AppCommand::RenameTab {
+            tab: astraterm_core::TabId::from_raw(0),
+            title: String::new(),
+        },
         ActionId::FocusLeft => AppCommand::FocusDirection {
             direction: FocusDirection::Left,
         },
@@ -250,15 +256,22 @@ mod tests {
     }
 
     #[test]
-    fn actions_map_to_dispatchable_commands() {
-        // Rename needs a text input, so it is not a plain command.
-        assert!(command_for(ActionId::RenameTab).is_none());
+    fn every_action_maps_to_a_command() {
         for action in ActionId::ALL {
-            if action == ActionId::RenameTab {
-                continue;
-            }
             assert!(command_for(action).is_some(), "{action} has no command");
         }
+    }
+
+    #[test]
+    fn tab_moves_are_relative() {
+        assert!(matches!(
+            command_for(ActionId::MoveTabLeft),
+            Some(AppCommand::MoveTabRelative { delta }) if delta < 0
+        ));
+        assert!(matches!(
+            command_for(ActionId::MoveTabRight),
+            Some(AppCommand::MoveTabRelative { delta }) if delta > 0
+        ));
     }
 
     #[test]

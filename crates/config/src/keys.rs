@@ -353,6 +353,8 @@ pub enum ActionId {
     RenameTab,
     NextTab,
     PreviousTab,
+    MoveTabLeft,
+    MoveTabRight,
     Tab1,
     Tab2,
     Tab3,
@@ -396,12 +398,14 @@ pub enum ActionId {
 }
 
 impl ActionId {
-    pub const ALL: [ActionId; 45] = [
+    pub const ALL: [ActionId; 47] = [
         ActionId::NewTab,
         ActionId::CloseTab,
         ActionId::RenameTab,
         ActionId::NextTab,
         ActionId::PreviousTab,
+        ActionId::MoveTabLeft,
+        ActionId::MoveTabRight,
         ActionId::Tab1,
         ActionId::Tab2,
         ActionId::Tab3,
@@ -452,6 +456,8 @@ impl ActionId {
             ActionId::RenameTab => "rename-tab",
             ActionId::NextTab => "next-tab",
             ActionId::PreviousTab => "previous-tab",
+            ActionId::MoveTabLeft => "move-tab-left",
+            ActionId::MoveTabRight => "move-tab-right",
             ActionId::Tab1 => "tab-1",
             ActionId::Tab2 => "tab-2",
             ActionId::Tab3 => "tab-3",
@@ -503,6 +509,8 @@ impl ActionId {
             ActionId::RenameTab => "Rename tab",
             ActionId::NextTab => "Next tab",
             ActionId::PreviousTab => "Previous tab",
+            ActionId::MoveTabLeft => "Move tab left",
+            ActionId::MoveTabRight => "Move tab right",
             ActionId::Tab1 => "Go to tab 1",
             ActionId::Tab2 => "Go to tab 2",
             ActionId::Tab3 => "Go to tab 3",
@@ -574,6 +582,8 @@ pub fn default_keybindings() -> BTreeMap<String, String> {
         (RenameTab, "ctrl+shift+r"),
         (NextTab, "ctrl+pagedown"),
         (PreviousTab, "ctrl+pageup"),
+        (MoveTabLeft, "ctrl+shift+alt+left"),
+        (MoveTabRight, "ctrl+shift+alt+right"),
         (Tab1, "alt+1"),
         (Tab2, "alt+2"),
         (Tab3, "alt+3"),

@@ -55,8 +55,40 @@ pub fn blink_due(now: Instant, deadline: Option<Instant>) -> (bool, Instant) {
 pub enum Overlay {
     None,
     Search(SearchOverlay),
+    Rename(RenameOverlay),
     Settings(Box<SettingsPanel>),
     Confirm(ConfirmDialog),
+}
+
+/// Inline rename prompt for the active tab.
+#[derive(Clone, Debug)]
+pub struct RenameOverlay {
+    pub tab: TabId,
+    pub buffer: String,
+}
+
+impl RenameOverlay {
+    pub fn new(tab: TabId, current: &str) -> Self {
+        Self {
+            tab,
+            buffer: current.to_owned(),
+        }
+    }
+
+    /// Title to apply: trimmed, and empty means "go back to the derived title".
+    pub fn committed_title(&self) -> String {
+        self.buffer.trim().to_owned()
+    }
+
+    pub fn push(&mut self, ch: char) {
+        if self.buffer.chars().count() < 120 {
+            self.buffer.push(ch);
+        }
+    }
+
+    pub fn pop(&mut self) {
+        self.buffer.pop();
+    }
 }
 
 impl std::fmt::Debug for Overlay {
@@ -64,6 +96,7 @@ impl std::fmt::Debug for Overlay {
         match self {
             Overlay::None => write!(f, "Overlay::None"),
             Overlay::Search(search) => write!(f, "Overlay::Search({:?})", search.query),
+            Overlay::Rename(rename) => write!(f, "Overlay::Rename({:?})", rename.buffer),
             Overlay::Settings(_) => write!(f, "Overlay::Settings"),
             Overlay::Confirm(confirm) => write!(f, "Overlay::Confirm({:?})", confirm.message),
         }
@@ -601,6 +634,39 @@ impl WindowUi {
                     ));
                 }
             }
+            Overlay::Rename(rename) => {
+                let height = self.metrics.height + CHROME_PADDING;
+                let rect = Rect::new(
+                    0,
+                    self.size
+                        .height
+                        .saturating_sub(height + self.status_bar_height())
+                        as i32,
+                    self.size.width,
+                    height,
+                );
+                scene.push_quad(rect, self.theme.palette.tab_bar_background, 0.95);
+                scene.push_text(TextItem::plain(
+                    1_210_000,
+                    (
+                        (rect.x + 8) as f32,
+                        (rect.y + CHROME_PADDING as i32 / 2) as f32,
+                    ),
+                    format!("rename tab: {}▏", rename.buffer),
+                    paint::rgba(self.theme.palette.tab_active_foreground, 1.0),
+                    rect,
+                ));
+                scene.push_text(TextItem::plain(
+                    1_210_001,
+                    (
+                        rect.right() as f32 - (28.0 * self.metrics.width) - 8.0,
+                        (rect.y + CHROME_PADDING as i32 / 2) as f32,
+                    ),
+                    "enter save · esc cancel".to_owned(),
+                    paint::rgba(self.theme.palette.tab_inactive_foreground, 1.0),
+                    rect,
+                ));
+            }
             Overlay::Confirm(confirm) => {
                 let width = (self.size.width as f32 * 0.5).clamp(320.0, 720.0) as u32;
                 let line_height = self.metrics.height + CHROME_PADDING;
@@ -909,6 +975,26 @@ mod tests {
             next > late,
             "the next deadline is in the future, so no burst"
         );
+    }
+
+    #[test]
+    fn rename_buffer_is_trimmed_and_bounded() {
+        let mut rename = RenameOverlay::new(TabId::from_raw(1), "work");
+        rename.push(' ');
+        rename.push('x');
+        assert_eq!(rename.committed_title(), "work x");
+        for _ in 0..200 {
+            rename.push('y');
+        }
+        assert!(rename.buffer.chars().count() <= 120);
+        rename.pop();
+        assert!(rename.buffer.ends_with('y'));
+    }
+
+    #[test]
+    fn empty_rename_clears_the_title() {
+        let rename = RenameOverlay::new(TabId::from_raw(1), "   ");
+        assert_eq!(rename.committed_title(), "");
     }
 
     #[test]
