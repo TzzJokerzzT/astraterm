@@ -49,9 +49,9 @@ S5.3 Ninguna imagen rompe el grid ni la salida de texto normal: las secuencias m
 | T2 | S2.2, S2.3 | Pegado asíncrono (hilo de portapapeles) y payload grande sin truncar ni congelar | inline | `2a716b3` |
 | T3 | S3.1–S3.3 | Ligaduras opt-in con `font.ligatures` y verificación de alineación | inline | `7410eb6` |
 | T4 | S4.1–S4.4 | Kitty keyboard: flag, flags expuestos y encoder completo + docs | inline + worker | `a37ee4b` |
-| T5 | S5.1, S5.3 | Scanner APC/OSC/DCS incremental con reensamble entre chunks + modelo de anclaje | inline | — |
-| T6 | S5.1, S5.2 | Renderer: textura, sampler, UV y orden de dibujo; decoder PNG con límites | worker | — |
-| T7 | S5.2 | Decoders kitty graphics y sixel, eviction de memoria y política de seguridad | worker | — |
+| T5 | S5.1, S5.3 | Scanner APC/OSC/DCS incremental con reensamble entre chunks + modelo de anclaje | inline + worker | `662c512` |
+| T6 | S5.2 | Decoders (kitty graphics, iTerm2, sixel) con límites de dimensión y memoria; puro y testeable sin GPU | worker | — |
+| T7 | S5.1, S5.2 | Texturas en el renderer (sampler, UV, z-order), cableado en la app y `docs/SECURITY.md` | worker | — |
 
 T5–T7 no empiezan hasta que T1–T4 estén cerrados y verificados: son subsistema, no feature.
 
@@ -79,4 +79,8 @@ L5 (decisiones de alcance, tomadas al autorizar; se registran con el cierre):
 - Se sigue el orden propuesto: zoom, ligaduras, Kitty keyboard, imágenes. El pegado entra en segundo lugar, antes de ligaduras, por frecuencia de uso declarada por el usuario.
 - El pegado ya funciona (`ctrl+shift+v` → `AppCommand::Paste` → `App::paste` → `encode_paste`); lo que se corrige es el bloqueo del event loop al leer el portapapeles y el manejo de payloads grandes.
 - La persistencia del zoom se guarda en el estado de la aplicación (`StatePaths`, `crates/platform/src/paths.rs`), no en el TOML del usuario: escribir config dispararía el watcher y realimentaría `ConfigChanged`.
-- Imágenes queda como documento propio en la práctica: T5–T7 se ejecutan como slices separadas y con la superficie de seguridad resuelta antes de exponerla.
+L6 (decisión de secuenciación, T5 cerrado):
+- T5 cerrado en `662c512`: scanner + límites + modelo de anclaje, 9 tests nuevos, suite en 389 verde. El worker declaró que no pudo observar RED real (módulo nuevo) y lo sustituyó por dos mutaciones temporales revertidas; se acepta porque los tests muerden.
+- Se invierte el orden de T6 y T7 respecto al plan inicial: primero los decoders (puros, testeables sin GPU) y al final las texturas y el cableado. Motivo: el decoder es donde vive el riesgo de seguridad (bytes no confiables de un host remoto) y puede verificarse sin ventana; la GPU no.
+- Riesgos heredados de T5 que T7 debe resolver: remapeo de líneas en resize (`retain_anchored` hoy solo descarta), presupuesto de `ImageStore` sin calibrar (64 MiB por defecto) y constantes de límite que deberían pasar a `EngineOptions` si se quiere configurar por sesión.
+- Coste conocido y aceptado: cada `process` copia el passthrough en un `Vec` nuevo (32 KiB por lectura de PTY), despreciable frente al parseo VT.
