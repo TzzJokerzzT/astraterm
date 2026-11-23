@@ -18,6 +18,7 @@ use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape, CursorStyle, NamedColor, Processor,
 };
 
+use crate::image::{ImageMessage, ImageScanner};
 use crate::snapshot::{
     CellFlags, CellSnapshot, CursorSnapshot, CursorVisual, KittyFlags, ModeFlags, RowSnapshot,
     Snapshot, SnapshotColor,
@@ -175,6 +176,11 @@ pub struct TerminalEngine {
     term: Term<Listener>,
     parser: Processor,
     listener: Listener,
+    /// Pulls kitty graphics, iTerm2 inline images and sixel out of the stream
+    /// before the VT parser sees them; the core parses none of them.
+    images: ImageScanner,
+    /// Image sequences captured since the last [`Self::take_images`].
+    image_messages: Vec<ImageMessage>,
     base: Point,
     cols: u16,
     rows: u16,
@@ -217,6 +223,8 @@ impl TerminalEngine {
             term,
             parser: Processor::new(),
             listener,
+            images: ImageScanner::new(),
+            image_messages: Vec::new(),
             base: Point::new(Line(0), Column(0)),
             cols,
             rows,
@@ -227,13 +235,32 @@ impl TerminalEngine {
         engine
     }
 
-    /// Feeds raw PTY output through the VT parser.
+    /// Feeds raw PTY output through the image scanner and then the VT parser.
+    ///
+    /// A chunk boundary is meaningless here: the scanner keeps partial image
+    /// sequences across calls, and for any stream without image sequences the
+    /// bytes reach the parser unchanged.
     pub fn process(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
-        self.parser.advance(&mut self.term, bytes);
+        let output = self.images.scan(bytes);
+        if !output.messages.is_empty() {
+            self.image_messages.extend(output.messages);
+        }
+        if !output.passthrough.is_empty() {
+            self.parser.advance(&mut self.term, &output.passthrough);
+        }
         self.dirty = true;
+    }
+
+    /// Drains the image sequences captured since the last call.
+    ///
+    /// Nothing is decoded or drawn yet (S5.1): the renderer slice turns these
+    /// payloads into textures, and the anchoring model in [`crate::image`] places
+    /// them on the grid.
+    pub fn take_images(&mut self) -> Vec<ImageMessage> {
+        std::mem::take(&mut self.image_messages)
     }
 
     /// Resizes the grid, letting the core reflow the scrollback.
