@@ -195,6 +195,7 @@ Default bindings (`default_keybindings()`):
 | `new-tab` | `ctrl+shift+t` | `next-tab` | `ctrl+pagedown` |
 | `close-tab` | `ctrl+shift+alt+w` | `previous-tab` | `ctrl+pageup` |
 | `rename-tab` | `ctrl+shift+r` | `tab-1`…`tab-9` | `alt+1`…`alt+9` |
+| `move-tab-left` | `ctrl+shift+alt+left` | `move-tab-right` | `ctrl+shift+alt+right` |
 | `new-split-horizontal` | `ctrl+shift+d` | `focus-left`/`right`/`up`/`down` | `alt+left`/`right`/`up`/`down` |
 | `new-split-vertical` | `ctrl+shift+e` | `resize-left`/`right`/`up`/`down` | `ctrl+alt+left`/`right`/`up`/`down` |
 | `close-pane` | `ctrl+shift+w` | `equalize-splits` | `ctrl+shift+0` |
@@ -447,6 +448,8 @@ previous-tab = "ctrl+pageup"
 quit = "ctrl+shift+q"
 reload-config = "ctrl+shift+comma"
 rename-tab = "ctrl+shift+r"
+move-tab-left = "ctrl+shift+alt+left"
+move-tab-right = "ctrl+shift+alt+right"
 reset-font-size = "ctrl+0"
 resize-down = "ctrl+alt+down"
 resize-left = "ctrl+alt+left"

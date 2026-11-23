@@ -136,6 +136,7 @@ table of `config.toml`.
 | New tab | `Ctrl+Shift+T` |
 | Close tab | `Ctrl+Shift+Alt+W` |
 | Rename tab | `Ctrl+Shift+R` |
+| Move tab left / right | `Ctrl+Shift+Alt+Left` / `Ctrl+Shift+Alt+Right` |
 | Next tab | `Ctrl+PageDown` |
 | Previous tab | `Ctrl+PageUp` |
 | Go to tab 1–9 | `Alt+1` … `Alt+9` |
