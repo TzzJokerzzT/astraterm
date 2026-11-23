@@ -612,14 +612,7 @@ impl Application {
 
         match command {
             AppCommand::Quit => self.request_quit(event_loop, PendingAction::Quit),
-            AppCommand::CloseWindow { .. } => {
-                let id = self
-                    .windows
-                    .get(&window_id)
-                    .map(|ui| ui.id)
-                    .unwrap_or_else(WindowId::next);
-                self.request_quit(event_loop, PendingAction::CloseWindow(id));
-            }
+            AppCommand::CloseWindow { .. } => self.request_close_window(event_loop, window_id),
             AppCommand::NewWindow { .. } => {
                 if let Err(error) = self.create_window(event_loop, false) {
                     tracing::error!(error = %error, "could not open a new window");
@@ -1157,6 +1150,58 @@ impl Application {
         self.persist_workspace();
     }
 
+    /// Closes one window: its sessions end, the other windows keep running.
+    ///
+    /// The application exits only when the last window is gone, so a window-scoped
+    /// action can never destroy another window's shells.
+    fn request_close_window(&mut self, event_loop: &ActiveEventLoop, window_id: WinitWindowId) {
+        let Some(ui) = self.windows.get(&window_id) else {
+            return;
+        };
+        let running = ui.panes.values().any(|pane| {
+            self.sessions
+                .for_pane(pane.id)
+                .map(|session| session.is_running())
+                .unwrap_or(false)
+        });
+        let confirm = running && self.config.config().terminal.confirm_on_close;
+        if confirm {
+            self.with_window(window_id, |ui| {
+                ui.overlay = Overlay::Confirm(ConfirmDialog {
+                    message: "Close this window and end its sessions?".to_owned(),
+                    action: PendingAction::CloseWindow(ui.id),
+                });
+                ui.window.request_redraw();
+            });
+            return;
+        }
+        self.close_window(event_loop, window_id);
+    }
+
+    /// Tears down exactly one window.
+    fn close_window(&mut self, event_loop: &ActiveEventLoop, window_id: WinitWindowId) {
+        let Some(ui) = self.windows.remove(&window_id) else {
+            return;
+        };
+        let sessions: Vec<SessionId> = ui.session_bindings.values().copied().collect();
+        for session in sessions {
+            self.sessions.close(session);
+        }
+        ui.window.set_visible(false);
+        drop(ui);
+
+        if self.focused == Some(window_id) {
+            self.focused = self.windows.keys().next().copied();
+        }
+        if self.windows.is_empty() {
+            self.finish(event_loop);
+        } else {
+            // Persist immediately so the closed window disappears from the layout.
+            self.persist_workspace();
+            self.refresh_titles();
+        }
+    }
+
     fn request_quit(&mut self, event_loop: &ActiveEventLoop, action: PendingAction) {
         let running = self.sessions.iter().any(|session| session.is_running());
         let confirm = running && self.config.config().terminal.confirm_on_close;
@@ -1316,19 +1361,10 @@ impl Application {
     // --- Workspace persistence ----------------------------------------------
 
     fn persist_workspace(&self) {
-        let windows = self
-            .windows
-            .values()
-            .map(|ui| {
-                let mut snapshot = snapshot_window(&ui.workspace, &ui.panes);
-                snapshot.width = ui.size.width;
-                snapshot.height = ui.size.height;
-                snapshot
-            })
-            .collect();
-        let snapshot = WorkspaceSnapshot {
-            version: astraterm_workspace::snapshot::SNAPSHOT_VERSION,
-            windows,
+        // An empty window list means the app never got a window (for example a GPU
+        // failure at startup): writing it would destroy the user's saved layout.
+        let Some(snapshot) = workspace_snapshot(&self.windows) else {
+            return;
         };
         let Ok(text) = toml::to_string_pretty(&snapshot) else {
             return;
@@ -1504,7 +1540,19 @@ impl Application {
         match action {
             PendingAction::ClosePane(pane) => self.close_pane(window_id, pane),
             PendingAction::CloseTab(tab) => self.close_tab(window_id, tab),
-            PendingAction::CloseWindow(_) | PendingAction::Quit => self.finish(event_loop),
+            PendingAction::CloseWindow(id) => {
+                let target = self
+                    .windows
+                    .values()
+                    .find(|ui| ui.id == id)
+                    .map(|ui| ui.window.id());
+                match target {
+                    Some(winit_id) => self.close_window(event_loop, winit_id),
+                    // The window disappeared while the prompt was open.
+                    None => self.finish(event_loop),
+                }
+            }
+            PendingAction::Quit => self.finish(event_loop),
         }
     }
 
@@ -2057,6 +2105,29 @@ impl Application {
     }
 }
 
+/// Builds the persisted workspace, or `None` when there is nothing to persist.
+///
+/// Writing an empty snapshot would replace a saved layout with nothing, which is
+/// exactly what a failed window creation must never do.
+fn workspace_snapshot(windows: &BTreeMap<WinitWindowId, WindowUi>) -> Option<WorkspaceSnapshot> {
+    if windows.is_empty() {
+        return None;
+    }
+    let windows = windows
+        .values()
+        .map(|ui| {
+            let mut snapshot = snapshot_window(&ui.workspace, &ui.panes);
+            snapshot.width = ui.size.width;
+            snapshot.height = ui.size.height;
+            snapshot
+        })
+        .collect();
+    Some(WorkspaceSnapshot {
+        version: astraterm_workspace::snapshot::SNAPSHOT_VERSION,
+        windows,
+    })
+}
+
 impl ApplicationHandler<UserEvent> for Application {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.started {
@@ -2094,10 +2165,7 @@ impl ApplicationHandler<UserEvent> for Application {
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => {
-                let action = PendingAction::CloseWindow(WindowId::next());
-                self.request_quit(event_loop, action);
-            }
+            WindowEvent::CloseRequested => self.request_close_window(event_loop, window_id),
             WindowEvent::Resized(size) => {
                 self.with_window(window_id, |ui| ui.resize(size));
                 self.sync_sizes(window_id);
@@ -2163,7 +2231,20 @@ impl ApplicationHandler<UserEvent> for Application {
                 }
             }
             WindowEvent::Destroyed => {
+                // The compositor destroyed the window without a close request, so its
+                // sessions must not be left running without a UI.
+                let sessions: Vec<SessionId> = self
+                    .windows
+                    .get(&window_id)
+                    .map(|ui| ui.session_bindings.values().copied().collect())
+                    .unwrap_or_default();
+                for session in sessions {
+                    self.sessions.close(session);
+                }
                 self.windows.remove(&window_id);
+                if self.focused == Some(window_id) {
+                    self.focused = self.windows.keys().next().copied();
+                }
                 if self.windows.is_empty() {
                     self.finish(event_loop);
                 }
@@ -2210,5 +2291,21 @@ impl ApplicationHandler<UserEvent> for Application {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.persist_workspace();
         self.sessions.shutdown_all();
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use std::collections::BTreeMap;
+
+    use super::workspace_snapshot;
+
+    #[test]
+    fn an_empty_window_list_is_never_persisted() {
+        let windows = BTreeMap::new();
+        assert!(
+            workspace_snapshot(&windows).is_none(),
+            "a failed startup must not overwrite the saved layout"
+        );
     }
 }
