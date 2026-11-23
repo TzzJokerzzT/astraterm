@@ -51,8 +51,8 @@ S5.3 Ninguna imagen rompe el grid ni la salida de texto normal: las secuencias m
 | T4 | S4.1–S4.4 | Kitty keyboard: flag, flags expuestos y encoder completo + docs | inline + worker | `a37ee4b` |
 | T5 | S5.1, S5.3 | Scanner APC/OSC/DCS incremental con reensamble entre chunks + modelo de anclaje | inline + worker | `662c512` |
 | T6 | S5.2 | Decoders (kitty graphics, iTerm2, sixel) con límites de dimensión y memoria; puro y testeable sin GPU | worker | `06e1f53` |
-| T7 | S5.1 | Renderer: ítems de imagen en `Scene`, pipeline texturizado, sampler/UV y caché de texturas con desalojo | worker | — |
-| T8 | S5.1, S5.2 | Cableado en la app (decode → anclaje → escena), opción `terminal.images` y `docs/SECURITY.md` | worker | — |
+| T7 | S5.1 | Renderer: ítems de imagen en `Scene`, pipeline texturizado, sampler/UV y caché de texturas con desalojo | worker | `d9ab57d` |
+| T8 | S5.1, S5.2 | Cableado en la app (decode → anclaje → escena), opción `terminal.images` y `docs/SECURITY.md` | worker | `44af738` + `0cfe9c0` |
 
 T5–T7 no empiezan hasta que T1–T4 estén cerrados y verificados: son subsistema, no feature.
 
@@ -85,3 +85,10 @@ L6 (decisión de secuenciación, T5 cerrado):
 - Se invierte el orden de T6 y T7 respecto al plan inicial: primero los decoders (puros, testeables sin GPU) y al final las texturas y el cableado. Motivo: el decoder es donde vive el riesgo de seguridad (bytes no confiables de un host remoto) y puede verificarse sin ventana; la GPU no.
 - Riesgos heredados de T5 que T7 debe resolver: remapeo de líneas en resize (`retain_anchored` hoy solo descarta), presupuesto de `ImageStore` sin calibrar (64 MiB por defecto) y constantes de límite que deberían pasar a `EngineOptions` si se quiere configurar por sesión.
 - Coste conocido y aceptado: cada `process` copia el passthrough en un `Vec` nuevo (32 KiB por lectura de PTY), despreciable frente al parseo VT.
+
+L7 (cierre de la feature, evidencia):
+- T7 `d9ab57d`: pipeline texturizado dibujado entre fondo y glifos, píxeles en `Arc` con generación y `TextureCache` con política pura. El worker de este slice murió con `invalid_request` de infraestructura **después** de escribir el código; se revisó y se dio por bueno el trabajo ya presente en el árbol, no se relanzó a ciegas.
+- T8 `44af738` (opción `terminal.images`, default `false`) + `0cfe9c0` (cableado completo).
+- Verificación total: 436 tests, 0 fallos; `cargo clippy --workspace --all-targets` sin advertencias; `cargo fmt --check` limpio; `cargo build --release` ok.
+- **Verificación visual real** (lo que ningún test cubre): binario release con `terminal.images = true` y `--config` bajo `/tmp`, imagen PNG 96×64 enviada como iTerm2 `OSC 1337;File=inline=1`, captura de pantalla con `grim`. Resultado: la imagen aparece en la rejilla, dentro del pane, con el texto todavía legible debajo. Artefactos temporales borrados.
+- Límites que quedan fuera, documentados en `docs/TERMINAL_COMPATIBILITY.md`: transferencia por chunks de kitty (`m=1`), paletas sixel HLS e `inline=0` devuelven `Unsupported`; no hay reanclaje en resize (solo descarte); en scrollback saturado un ancla muy antigua puede quedarse fija; `compose_images` replica el padding de `paint::paint_pane` en local y hay que mantenerlos sincronizados si esa geometría cambia.
