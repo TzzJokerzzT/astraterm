@@ -85,3 +85,23 @@ hit testing (`crates/app/src/chrome.rs`), the `/proc` parsers and clock
 (`crates/platform/src/system.rs`), the panel editor
 (`crates/settings-ui/src/panel.rs`) and the save/select workflow
 (`crates/config/tests/theme_workflow.rs`).
+
+### L4 — documentation pass and a border regression caught by it
+
+Writing the option reference exposed a real defect the earlier screenshots had not
+reached: `paint_pane` drew the pane border as a **filled rectangle** covered by the
+pane background. Painting the background at alpha 0 (which is what makes the
+window translucent without compositing alpha twice) left the fill visible, so a
+split pane became a solid accent-coloured block.
+
+The border is now four thin edges painted opaque over a translucent background, so
+chrome stays readable while the terminal surface fades. Covered by
+`the_border_stays_opaque_when_the_pane_background_is_transparent`, and verified on
+screen with a restored two-pane workspace at `opacity = 0.82`.
+
+`docs/CONFIGURATION.md` was rewritten as the single reference: per-option
+description and purpose (plus the panel row that edits it), recipes for opacity,
+compositor blur (Hyprland/Omarchy, KDE, GNOME, Sway), the status bar, right-hand
+tabs and theme creation. A verification script confirms the document covers every
+field of `Config`, every `Profile` field, every `ActionId` and that each TOML block
+in it parses.

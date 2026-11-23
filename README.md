@@ -46,13 +46,18 @@ It is **not** a terminal emulator built on Electron or a webview, and it does
 Rendering and desktop niceties that ship today:
 
 - **Translucent background**: `[window] opacity` (0.1–1.0) applies live; only the
-  background fades, text stays crisp. Blur is a compositor rule.
+  background fades, text stays crisp. Blur is a compositor rule — see
+  [docs/CONFIGURATION.md](docs/CONFIGURATION.md#blur-behind-the-window) for the
+  Hyprland/Omarchy, KDE and GNOME steps.
 - **Status bar** with session information on the left and **CPU, RAM and the clock**
   on the right, sampled from `/proc` once per second and only while it is visible.
 - **Tabs on top, bottom, hidden, or on the right** as a Warp-style vertical strip
   with a configurable width.
 - **Theme editor** in the settings panel: adjust the palette with live preview, name
   the result and save it to `~/.config/astraterm/themes/`.
+
+Every option is documented with what it does and when to change it in
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md#option-reference).
 
 ## Requirements
 
