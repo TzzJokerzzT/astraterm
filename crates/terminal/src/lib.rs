@@ -9,6 +9,7 @@
 
 pub mod engine;
 pub mod image;
+pub mod image_decode;
 pub mod input;
 pub mod search;
 pub mod snapshot;

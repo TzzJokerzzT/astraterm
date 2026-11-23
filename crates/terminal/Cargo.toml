@@ -7,4 +7,5 @@ license.workspace = true
 [dependencies]
 astraterm-core = { workspace = true }
 alacritty_terminal = { workspace = true }
+png = { workspace = true }
 tracing = { workspace = true }
