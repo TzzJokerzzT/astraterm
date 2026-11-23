@@ -137,3 +137,31 @@ queue room instead of blocking forever, `reap_exited` (dead code that could re-e
 an exit) was removed, `input_drops` logs on the first drop instead of being silent,
 and `docs/SECURITY.md` now describes the real `SIGKILL` escalation and the single
 documented `unsafe` site.
+
+### L5 — native review of the application slice (approved)
+
+Reviewing the application commit as a 3594-line candidate in a worktree bound to
+that commit fitted the provider's lens budget (the earlier 5946-line candidate did
+not). The four lenses reported five CRITICAL findings, all introduced by this
+slice, and all were fixed inside the bounded correction (120 diff lines):
+
+- `R1-001`, `R2-002`, `R3-002` — closing one window (both `CloseRequested` and the
+  close-window action) went straight to application quit, terminating every shell in
+  every other window. Closing a window now closes only that window; the application
+  exits when the last window is gone, and a compositor-destroyed window also closes
+  its bound sessions.
+- `R3-001` — a failed startup (transient GPU/renderer failure) persisted an empty
+  window list, destroying the saved layout. `persist_workspace` now refuses to write
+  an empty snapshot.
+- `R4-001` / `R3-003` — a renderer error requested a redraw from inside the redraw
+  handler, spinning the event loop on a persistent device or surface error. The
+  retry is gone.
+
+Outcome: targeted validation admitted the correction, the lineage
+(`review-26070e8b42aee608`) closed `approved` and its authority was acknowledged
+and burned. The evidence commit is preserved on branch `review/app-slice-approved`.
+
+The same review also produced advisory findings that were handled as follow-up
+work in later commits rather than in the bounded correction (empty-snapshot guard
+tests, per-pane search highlights, wheel encoding through the input encoder,
+`ScrollToTop` versus page-up, bottom tab bar overlapping the status bar).
