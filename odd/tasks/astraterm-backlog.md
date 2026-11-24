@@ -56,6 +56,20 @@ primera tarea de este bloque es justamente esa.
 La regla corta, que es la que hay que recordar: **si toca una feature de cara al
 usuario, sube la versión**. Y si la rompe, sube el número mayor.
 
+### Política de tags y releases
+
+Decidido; no se vuelve a discutir en cada release:
+
+- **Los tags llevan `v`**: `v1.0.0`, `v1.1.0`, `v2.0.0`. No se crean tags sin `v`.
+  `scripts/setup.sh --version` normaliza lo que escriba el usuario y compara siempre
+  contra la forma canónica `vX.Y.Z`.
+- **Cada release publicada lleva las notas del `CHANGELOG.md`**: el cuerpo de la release
+  es la entrada correspondiente del CHANGELOG (sus secciones `Added`, `Changed`, `Fixed`
+  y su fecha), tal cual. No se escribe un resumen aparte a mano, porque en cuanto uno de
+  los dos textos se actualiza quedan contradiciéndose.
+- **El tag y la release son el mismo hecho**: ni tag sin release, ni release sin tag.
+  Mientras no haya release publicada, `1.0.0` solo existe en el código.
+
 ### Checklist de release
 
 En este orden, siempre:
@@ -69,14 +83,16 @@ En este orden, siempre:
    `cargo fmt --check`.
 6. Commit `chore(release): x.y.z` y tag anotado `git tag -a vX.Y.Z -m "..."`.
 7. `cargo build --release --locked` y `./scripts/setup.sh --dry-run`, para confirmar que
-   las dependencias declaradas siguen siendo las reales.
-
-### Pendiente de decidir
-
-- Si los tags llevan `v` (`v1.0.0`) o no.
-- Si la release se publica en GitHub con las notas del `CHANGELOG.md` o solo con el tag.
-- Si `scripts/setup.sh` debe aceptar `--version <tag>` para instalar una release concreta
-  en vez de compilar el árbol actual.
+   las dependencias declaradas siguen siendo las reales. Añadir también
+   `./scripts/setup.sh --dry-run --version vX.Y.Z`, que debe decir que el árbol ya está
+   en ese tag.
+8. Publicar la release con el tag `vX.Y.Z` y con las notas copiadas de la entrada del
+   `CHANGELOG.md` para esa versión: esas notas son el cuerpo de la release, no un
+   resumen nuevo.
+9. Probar el camino del usuario en una copia limpia:
+   `git checkout vX.Y.Z && ./scripts/setup.sh --version vX.Y.Z --install`. Desde otra
+   rama, `--version vX.Y.Z` debe negarse con código `4` y decir qué versión sí está en
+   el árbol, porque el script verifica y no mueve el checkout.
 
 ---
 
