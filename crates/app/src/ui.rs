@@ -36,6 +36,13 @@ const TAB_INDICATOR_WIDTH: u32 = 3;
 /// Blink period of the text cursor.
 pub const CURSOR_BLINK_PERIOD: Duration = Duration::from_millis(530);
 
+/// Scene item id base of the floating terminal.
+///
+/// Chrome uses the fixed ranges from 1_000_000 up and terminal rows use
+/// `(pane_index + 1) * 0x1000`, so this range is unique in the scene and its shaped
+/// rows stay cached across frames.
+const FLOATING_ID_BASE: u64 = 0x20_0000;
+
 /// Decides whether the cursor blink should toggle now, and when to check again.
 ///
 /// A blink that re-armed itself on every frame would spin the event loop at frame
@@ -138,6 +145,81 @@ pub enum PendingAction {
     Quit,
 }
 
+/// The window's floating terminal.
+///
+/// It is deliberately *outside* the split tree: the mosaic layout and the
+/// reflow never see it, so splits, zooms and divider drags ignore it. A window
+/// owns at most one, and it keeps its own session, which survives being hidden:
+/// hiding only flips `visible` and never touches the PTY.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Floating {
+    /// Pane the session is registered under, which is how the keyboard, paste and
+    /// the mouse reach it. It is not part of the workspace.
+    pub pane: PaneId,
+    /// Session of the floating shell; a hide/show cycle never replaces it.
+    pub session: SessionId,
+    /// Whether it is currently drawn and owns the keyboard.
+    pub visible: bool,
+}
+
+impl Floating {
+    /// A floating terminal showing `session`, created by the first toggle press.
+    pub fn new(pane: PaneId, session: SessionId) -> Self {
+        Self {
+            pane,
+            session,
+            visible: true,
+        }
+    }
+
+    /// Shows or hides it without touching the session.
+    pub fn set_visible(&mut self, visible: bool) {
+        self.visible = visible;
+    }
+
+    /// Whether it exists but is not on screen: the status bar reports this state.
+    pub fn is_hidden(&self) -> bool {
+        !self.visible
+    }
+}
+
+/// What a `toggle-floating` press does next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloatingPress {
+    /// Nothing open yet: create a session and show it.
+    Create,
+    /// Hidden: show it again with the shell state it kept.
+    Show,
+    /// Visible: hide it, leaving the session and its PTY alone.
+    Hide,
+}
+
+/// Decides what `toggle-floating` does, given the current floating terminal.
+pub fn plan_floating_press(floating: Option<&Floating>) -> FloatingPress {
+    match floating {
+        None => FloatingPress::Create,
+        Some(floating) if floating.visible => FloatingPress::Hide,
+        Some(_) => FloatingPress::Show,
+    }
+}
+
+/// Pane that owns the keyboard: the floating terminal while it is visible,
+/// otherwise the mosaic pane of the active tab.
+///
+/// Hiding the floating terminal hands the keyboard back to the mosaic pane that
+/// kept the focus all along, so no focus has to be remembered across a hide.
+pub fn keyboard_pane(floating: Option<&Floating>, mosaic: Option<PaneId>) -> Option<PaneId> {
+    match floating {
+        Some(floating) if floating.visible => Some(floating.pane),
+        _ => mosaic,
+    }
+}
+
+/// Whether `ClosePane` aims at the floating terminal instead of a mosaic pane.
+pub fn closes_floating(floating: Option<&Floating>, pane: PaneId) -> bool {
+    floating.is_some_and(|floating| floating.pane == pane)
+}
+
 /// Pointer drag in progress.
 #[derive(Clone, Debug)]
 pub enum DragState {
@@ -192,6 +274,8 @@ pub struct WindowUi {
     pub last_key_text: Option<(String, Instant)>,
     /// Session ids bound to panes, so the window can be torn down cleanly.
     pub session_bindings: BTreeMap<PaneId, astraterm_core::SessionId>,
+    /// The floating terminal, if one was opened in this window.
+    pub floating: Option<Floating>,
 }
 
 impl WindowUi {
@@ -227,6 +311,7 @@ impl WindowUi {
             status: None,
             last_key_text: None,
             session_bindings: BTreeMap::new(),
+            floating: None,
         }
     }
 
@@ -353,15 +438,35 @@ impl WindowUi {
 
     /// Pane under a pointer position.
     pub fn pane_at(&self, x: f64, y: f64) -> Option<PaneId> {
+        // The floating terminal is drawn over the mosaic, so it answers first.
+        if let Some(floating) = self.floating.as_ref()
+            && let Some(rect) = self.floating_rect()
+            && rect.contains(x, y)
+        {
+            return Some(floating.pane);
+        }
         self.pane_rects()
             .into_iter()
             .find(|(_, rect)| rect.contains(x, y))
             .map(|(pane, _)| pane)
     }
 
+    /// Rectangle of a pane on screen, mosaic or floating.
+    pub fn pane_rect(&self, pane: PaneId) -> Option<Rect> {
+        if let Some(rect) = self.floating_rect()
+            && closes_floating(self.floating.as_ref(), pane)
+        {
+            return Some(rect);
+        }
+        self.pane_rects()
+            .into_iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| rect)
+    }
+
     /// Cell coordinates inside a pane for a pointer position.
     pub fn cell_at(&self, pane: PaneId, x: f64, y: f64) -> Option<(u16, u16)> {
-        let rect = self.pane_rects().into_iter().find(|(id, _)| *id == pane)?.1;
+        let rect = self.pane_rect(pane)?;
         let padding = self.padding();
         let origin = (rect.x + padding.x as i32, rect.y + padding.y as i32);
         if x < origin.0 as f64 || y < origin.1 as f64 {
@@ -435,11 +540,29 @@ impl WindowUi {
         Some(tab.zoomed.unwrap_or(tab.active_pane))
     }
 
-    /// Currently focused pane of the active tab.
-    pub fn focused_pane(&self) -> Option<PaneId> {
+    /// Currently focused pane of the active tab, ignoring the floating terminal.
+    pub fn mosaic_pane(&self) -> Option<PaneId> {
         self.workspace
             .active_tab()
             .map(|tab| tab.zoomed.unwrap_or(tab.active_pane))
+    }
+
+    /// Pane that owns the keyboard right now.
+    ///
+    /// A visible floating terminal always has the focus; hiding it returns the
+    /// keyboard to the mosaic pane the tab had selected all along.
+    pub fn focused_pane(&self) -> Option<PaneId> {
+        keyboard_pane(self.floating.as_ref(), self.mosaic_pane())
+    }
+
+    /// Rectangle of the floating terminal, or `None` when there is none or it is
+    /// hidden. It is the single source of truth for drawing, hit testing and the
+    /// PTY size of the floating pane.
+    pub fn floating_rect(&self) -> Option<Rect> {
+        let floating = self.floating.as_ref()?;
+        floating
+            .visible
+            .then(|| chrome::float_rect(self.terminal_rect()))
     }
 
     /// Sets a transient status message.
@@ -513,9 +636,61 @@ impl WindowUi {
             }
         }
 
+        self.compose_floating(&mut scene, sessions, images);
         self.compose_status_bar(&mut scene, sessions, system);
         self.compose_overlay(&mut scene, sessions);
         scene
+    }
+
+    /// Paints the floating terminal over the mosaic, below the modal overlays.
+    ///
+    /// Composition order is the whole z-order: the mosaic is painted first, the
+    /// floating terminal covers its centre with an opaque background, and the
+    /// status bar and overlays are composed afterwards, so a dialog still wins.
+    fn compose_floating(
+        &self,
+        scene: &mut Scene,
+        sessions: &mut SessionManager,
+        images: &BTreeMap<SessionId, SessionImages>,
+    ) {
+        let Some(floating) = self.floating.as_ref() else {
+            return;
+        };
+        let Some(rect) = self.floating_rect() else {
+            return;
+        };
+        let Some(session) = sessions.get_mut(floating.session) else {
+            return;
+        };
+        let snapshot = session.snapshot();
+        let session_id = session.id;
+        let options = PaintOptions {
+            padding: self.padding(),
+            // A visible floating terminal always has the focus, so its cursor
+            // follows the same blink phase as any other focused pane.
+            draw_cursor: self.cursor_phase,
+            cursor_override: Some(self.cursor_style()),
+            // Opaque: the floating terminal covers the mosaic, and the mosaic must
+            // not show through its cells.
+            background_alpha: 1.0,
+            focused: true,
+            show_border: true,
+        };
+        paint::paint_pane(
+            scene,
+            FLOATING_ID_BASE,
+            rect,
+            &snapshot,
+            &self.theme.palette,
+            self.metrics,
+            options,
+        );
+        if let Some(anchored) = images.get(&session_id) {
+            self.compose_images(scene, rect, true, &snapshot, anchored);
+        }
+        if let Overlay::Search(search) = &self.overlay {
+            self.paint_search_highlights(scene, rect, &snapshot, search);
+        }
     }
 
     /// Queues the images anchored to one pane into the scene.
@@ -713,9 +888,10 @@ impl WindowUi {
         }
     }
 
-    /// Right-hand status segments: CPU, RAM and the clock.
+    /// Right-hand status segments: the hidden floating terminal, CPU, RAM and clock.
     fn status_bar_segments(&self, system: &SystemSnapshot) -> String {
         chrome::status_segments(
+            self.floating.as_ref().is_some_and(Floating::is_hidden),
             self.config.appearance.status_bar_cpu,
             self.config.appearance.status_bar_ram,
             self.config.appearance.status_bar_clock,
@@ -1922,6 +2098,74 @@ mod tests {
             snapshot.lines[0].text().trim_end(),
             "",
             "the payload is captured, not printed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod floating_tests {
+    use super::*;
+
+    /// A floating terminal with a fixed session, visible unless asked otherwise.
+    fn floating(visible: bool) -> Floating {
+        let mut floating = Floating::new(PaneId::from_raw(7), SessionId::from_raw(21));
+        floating.set_visible(visible);
+        floating
+    }
+
+    #[test]
+    fn the_first_press_creates_and_the_next_ones_hide_and_show_the_same_session() {
+        assert_eq!(plan_floating_press(None), FloatingPress::Create);
+
+        let mut open = floating(true);
+        assert_eq!(plan_floating_press(Some(&open)), FloatingPress::Hide);
+        open.set_visible(false);
+        assert!(open.is_hidden());
+        assert_eq!(
+            open.session,
+            SessionId::from_raw(21),
+            "hiding never replaces the session, so the shell keeps its state"
+        );
+
+        assert_eq!(plan_floating_press(Some(&open)), FloatingPress::Show);
+        open.set_visible(true);
+        assert!(open.visible);
+        assert_eq!(
+            open.session,
+            SessionId::from_raw(21),
+            "showing reuses the session that stayed alive"
+        );
+    }
+
+    #[test]
+    fn hiding_hands_the_keyboard_back_to_the_mosaic() {
+        let mosaic = Some(PaneId::from_raw(3));
+        assert_eq!(
+            keyboard_pane(Some(&floating(true)), mosaic),
+            Some(PaneId::from_raw(7)),
+            "a visible floating terminal always owns the focus"
+        );
+        assert_eq!(
+            keyboard_pane(Some(&floating(false)), mosaic),
+            mosaic,
+            "hiding it returns the focus to the mosaic pane that kept it"
+        );
+        assert_eq!(keyboard_pane(None, mosaic), mosaic);
+    }
+
+    #[test]
+    fn closing_the_floating_terminal_destroys_it_and_restores_the_mosaic_focus() {
+        let open = floating(true);
+        assert!(closes_floating(Some(&open), PaneId::from_raw(7)));
+        assert!(
+            !closes_floating(Some(&open), PaneId::from_raw(3)),
+            "a mosaic pane is never the floating one"
+        );
+        assert!(!closes_floating(None, PaneId::from_raw(7)));
+        // Once destroyed there is no floating left, so focus resolves to the mosaic.
+        assert_eq!(
+            keyboard_pane(None, Some(PaneId::from_raw(3))),
+            Some(PaneId::from_raw(3))
         );
     }
 }

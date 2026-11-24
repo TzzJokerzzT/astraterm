@@ -393,12 +393,13 @@ pub enum ActionId {
     ReloadConfig,
     ToggleStatusBar,
     NewWindow,
+    ToggleFloating,
     SendLiteralNext,
     Quit,
 }
 
 impl ActionId {
-    pub const ALL: [ActionId; 47] = [
+    pub const ALL: [ActionId; 48] = [
         ActionId::NewTab,
         ActionId::CloseTab,
         ActionId::RenameTab,
@@ -444,6 +445,7 @@ impl ActionId {
         ActionId::ReloadConfig,
         ActionId::ToggleStatusBar,
         ActionId::NewWindow,
+        ActionId::ToggleFloating,
         ActionId::SendLiteralNext,
         ActionId::Quit,
     ];
@@ -496,6 +498,7 @@ impl ActionId {
             ActionId::ReloadConfig => "reload-config",
             ActionId::ToggleStatusBar => "toggle-status-bar",
             ActionId::NewWindow => "new-window",
+            ActionId::ToggleFloating => "toggle-floating",
             ActionId::SendLiteralNext => "send-literal-next",
             ActionId::Quit => "quit",
         }
@@ -549,6 +552,7 @@ impl ActionId {
             ActionId::ReloadConfig => "Reload configuration",
             ActionId::ToggleStatusBar => "Toggle status bar",
             ActionId::NewWindow => "New window",
+            ActionId::ToggleFloating => "Show or hide the floating terminal",
             ActionId::SendLiteralNext => "Send next key literally",
             ActionId::Quit => "Quit",
         }
@@ -622,6 +626,7 @@ pub fn default_keybindings() -> BTreeMap<String, String> {
         (ReloadConfig, "ctrl+shift+comma"),
         (ToggleStatusBar, "ctrl+shift+s"),
         (NewWindow, "ctrl+shift+n"),
+        (ToggleFloating, "ctrl+shift+grave"),
         (SendLiteralNext, "ctrl+shift+enter"),
         (Quit, "ctrl+shift+q"),
     ];
@@ -784,11 +789,31 @@ mod tests {
             ("ctrl+shift+v", ActionId::Paste),
             ("ctrl+comma", ActionId::OpenSettings),
             ("ctrl+shift+n", ActionId::NewWindow),
+            ("ctrl+shift+grave", ActionId::ToggleFloating),
         ];
         for (chord, action) in cases {
             let chord: Chord = chord.parse().unwrap();
             assert_eq!(keymap.action_for(&chord), Some(action), "{chord}");
         }
+    }
+
+    #[test]
+    fn the_floating_terminal_is_bound_by_default() {
+        let keymap = Keymap::build(&default_keybindings());
+        let chord: Chord = "ctrl+shift+grave".parse().unwrap();
+        assert_eq!(chord.key, Key::Char('`'));
+        assert_eq!(keymap.action_for(&chord), Some(ActionId::ToggleFloating));
+        assert_eq!(ActionId::ToggleFloating.as_str(), "toggle-floating");
+        assert_eq!(
+            ActionId::ToggleFloating.label(),
+            "Show or hide the floating terminal"
+        );
+        assert_eq!(
+            default_keybindings()
+                .get("toggle-floating")
+                .map(String::as_str),
+            Some("ctrl+shift+grave")
+        );
     }
 
     #[test]

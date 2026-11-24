@@ -107,6 +107,8 @@ pub enum AppCommand {
     ReloadConfig,
     ConfirmClose,
     ToggleStatusBar,
+    /// Shows, hides or creates the window's floating terminal.
+    ToggleFloating,
     SendLiteralNext,
     Quit,
 }

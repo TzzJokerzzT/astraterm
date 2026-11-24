@@ -328,6 +328,7 @@ Every action is configurable in `[keys]`. Defaults:
 | `reload-config` | `ctrl+shift+comma` | Re-reads the configuration file |
 | `toggle-status-bar` | `ctrl+shift+s` | Shows/hides the status bar and persists it |
 | `new-window` | `ctrl+shift+n` | Opens another window in the same process |
+| `toggle-floating` | `ctrl+shift+grave` | Creates, hides or shows the window's floating terminal; hiding keeps its shell running |
 | `send-literal-next` | `ctrl+shift+enter` | Sends the next key to the application instead of the keymap |
 | `quit` | `ctrl+shift+q` | Quits, asking first when sessions are running |
 
@@ -544,6 +545,7 @@ tab-6 = "alt+6"
 tab-7 = "alt+7"
 tab-8 = "alt+8"
 tab-9 = "alt+9"
+toggle-floating = "ctrl+shift+grave"
 toggle-status-bar = "ctrl+shift+s"
 toggle-zoom = "ctrl+shift+z"
 

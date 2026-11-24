@@ -76,6 +76,42 @@ pub fn status_rect(visible: bool, size: Size, height: u32) -> Rect {
     )
 }
 
+/// Rectangle of the floating terminal: 4/5 of the width and 3/4 of the height of
+/// `content`, centred and aligned to whole pixels.
+///
+/// The floating terminal is composed over the mosaic instead of being laid out
+/// with it, so its geometry is one pure function of the content area: nothing to
+/// negotiate with the split tree, and the same rectangle for drawing, hit testing
+/// and the PTY size. Fractions are computed as `extent * numerator / denominator`
+/// with integers, so the result can never exceed `content`.
+pub fn float_rect(content: Rect) -> Rect {
+    centred(
+        content,
+        fraction(content.width, 4, 5),
+        fraction(content.height, 3, 4),
+    )
+}
+
+/// `extent` scaled by `numerator/denominator`, rounded down, saturating.
+fn fraction(extent: u32, numerator: u32, denominator: u32) -> u32 {
+    if denominator == 0 {
+        return 0;
+    }
+    ((extent as u64 * numerator as u64) / denominator as u64).min(u32::MAX as u64) as u32
+}
+
+/// Places a `width` by `height` rectangle in the middle of `content`.
+fn centred(content: Rect, width: u32, height: u32) -> Rect {
+    let width = width.min(content.width);
+    let height = height.min(content.height);
+    Rect::new(
+        content.x + (content.width - width) as i32 / 2,
+        content.y + (content.height - height) as i32 / 2,
+        width,
+        height,
+    )
+}
+
 /// Hit test for the vertical tab strip.
 pub fn vertical_tab_hit(strip: Rect, row_height: u32, count: usize, y: f64) -> Option<usize> {
     if !strip.contains(strip.x as f64, y) || row_height == 0 {
@@ -114,8 +150,15 @@ pub fn fit_label(label: &str, max_width: u32, cell_width: f32) -> String {
     out
 }
 
-/// Right-hand status bar text: CPU, RAM and clock segments.
+/// Status bar segment shown while a floating terminal exists but is hidden.
+///
+/// It is the only trace of a floating terminal that is not on screen, which is
+/// what tells the user its shell is still alive and one press brings it back.
+pub const FLOATING_HIDDEN_LABEL: &str = "float hidden";
+
+/// Right-hand status bar text: the hidden floating terminal, CPU, RAM and clock.
 pub fn status_segments(
+    floating_hidden: bool,
     cpu: bool,
     ram: bool,
     clock: bool,
@@ -123,6 +166,9 @@ pub fn status_segments(
     system: &SystemSnapshot,
 ) -> String {
     let mut segments: Vec<String> = Vec::new();
+    if floating_hidden {
+        segments.push(FLOATING_HIDDEN_LABEL.to_owned());
+    }
     if cpu {
         segments.push(match system.cpu_percent {
             Some(percent) => format!("CPU {:>3.0}%", percent),
@@ -244,21 +290,91 @@ mod tests {
     }
 
     #[test]
+    fn float_rect_is_centred_inside_the_content_area() {
+        let content = Rect::new(0, 24, 1200, 800);
+        let rect = float_rect(content);
+        assert_eq!(rect.width, 960, "4/5 of the width");
+        assert_eq!(rect.height, 600, "3/4 of the height");
+        assert_eq!(
+            rect.x - content.x,
+            content.right() - rect.right(),
+            "centred horizontally"
+        );
+        assert_eq!(
+            rect.y - content.y,
+            content.bottom() - rect.bottom(),
+            "centred vertically"
+        );
+        assert!(rect.x >= content.x && rect.y >= content.y);
+        assert!(rect.right() <= content.right() && rect.bottom() <= content.bottom());
+    }
+
+    #[test]
+    fn float_rect_never_escapes_a_diminutive_content_area() {
+        for size in [(1u32, 1u32), (2, 3), (11, 7), (40, 10), (7, 40)] {
+            let content = Rect::new(5, 7, size.0, size.1);
+            let rect = float_rect(content);
+            assert!(rect.width <= content.width, "{size:?}: {rect:?}");
+            assert!(rect.height <= content.height, "{size:?}: {rect:?}");
+            assert!(rect.x >= content.x, "{size:?}: {rect:?}");
+            assert!(rect.y >= content.y, "{size:?}: {rect:?}");
+            assert!(rect.right() <= content.right(), "{size:?}: {rect:?}");
+            assert!(rect.bottom() <= content.bottom(), "{size:?}: {rect:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_content_area_yields_an_empty_float_rect() {
+        assert!(float_rect(Rect::new(4, 5, 0, 0)).is_empty());
+        assert!(
+            float_rect(Rect::new(4, 5, 3, 0)).is_empty(),
+            "no height to fill"
+        );
+    }
+
+    #[test]
+    fn the_status_bar_reports_a_hidden_floating_terminal() {
+        let system = SystemSnapshot {
+            cpu_percent: None,
+            ram_percent: None,
+            clock_epoch: None,
+        };
+        assert_eq!(
+            status_segments(true, false, false, false, "%H:%M", &system),
+            "float hidden",
+            "an existing but hidden floating terminal is the only segment"
+        );
+        assert_eq!(
+            status_segments(true, true, false, false, "%H:%M", &system),
+            "float hidden  ·  CPU  --",
+            "the segment leads the other ones"
+        );
+        assert_eq!(
+            status_segments(false, false, false, false, "%H:%M", &system),
+            "",
+            "nothing to show when it is visible or absent"
+        );
+    }
+
+    #[test]
     fn status_segments_respect_the_enabled_parts() {
         let system = SystemSnapshot {
             cpu_percent: Some(12.4),
             ram_percent: Some(41.6),
             clock_epoch: Some(1_700_000_000),
         };
-        let all = status_segments(true, true, true, "%H:%M", &system);
+        let all = status_segments(false, true, true, true, "%H:%M", &system);
         assert!(all.contains("CPU  12%"), "{all}");
         assert!(all.contains("RAM  42%"), "{all}");
         assert_eq!(all.matches('·').count(), 2);
         assert_eq!(
-            status_segments(true, false, false, "%H:%M", &system),
+            status_segments(false, true, false, false, "%H:%M", &system),
             "CPU  12%"
         );
-        assert_eq!(status_segments(false, false, false, "%H:%M", &system), "");
+        assert_eq!(
+            status_segments(false, false, false, false, "%H:%M", &system),
+            ""
+        );
     }
 
     #[test]
@@ -269,7 +385,7 @@ mod tests {
             clock_epoch: None,
         };
         assert_eq!(
-            status_segments(true, true, true, "%H:%M", &system),
+            status_segments(false, true, true, true, "%H:%M", &system),
             "CPU  --"
         );
     }

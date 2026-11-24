@@ -39,8 +39,9 @@ use crate::keys;
 use crate::paste;
 use crate::prefs::{FONT_SIZE_STEP, Preferences, next_font_size};
 use crate::ui::{
-    ClickInfo, ConfirmDialog, DragState, ExitCleanup, Overlay, PendingAction, RenameOverlay,
-    SearchOverlay, SessionImages, SplitIdRef, WindowUi, plan_exit_cleanup, url_at,
+    ClickInfo, ConfirmDialog, DragState, ExitCleanup, Floating, FloatingPress, Overlay,
+    PendingAction, RenameOverlay, SearchOverlay, SessionImages, SplitIdRef, WindowUi,
+    closes_floating, plan_exit_cleanup, plan_floating_press, url_at,
 };
 
 /// Characters of notification body repeated in the status bar.
@@ -468,7 +469,10 @@ impl Application {
             let metrics = self
                 .windows
                 .values()
-                .find(|ui| ui.panes.contains_key(&pane))
+                .find(|ui| {
+                    ui.panes.contains_key(&pane)
+                        || ui.floating.is_some_and(|floating| floating.session == id)
+                })
                 .map(|ui| ui.metrics)
                 .unwrap_or_default();
             let top_line = session.engine.line_range().0;
@@ -620,6 +624,25 @@ impl Application {
         };
         let description = reason.describe();
 
+        // The floating terminal is outside the split tree, so its exit cannot be
+        // planned as a pane close: the floating goes away and the next toggle opens
+        // a fresh shell.
+        let floating_window = self
+            .windows
+            .iter()
+            .find(|(_, ui)| {
+                ui.floating
+                    .is_some_and(|floating| floating.session == session_id)
+            })
+            .map(|(window_id, _)| *window_id);
+        if let Some(window_id) = floating_window {
+            self.close_floating(window_id);
+            self.with_window(window_id, |ui| {
+                ui.set_status(format!("floating session {description}"));
+            });
+            return;
+        }
+
         if close_pane {
             let mut changed = Vec::new();
             let mut kept_open = false;
@@ -729,8 +752,12 @@ impl Application {
     }
 
     /// Pushes the grid size of every visible pane to its PTY.
+    ///
+    /// The floating terminal sees its own size: the cells that fit in `float_rect`,
+    /// never the size of the window. A hidden floating terminal is not resized at
+    /// all, so hiding it never reflows its buffer.
     fn sync_sizes(&mut self, window_id: WinitWindowId) {
-        let Some((sizes, cell)) = self.windows.get(&window_id).map(|ui| {
+        let Some((sizes, cell, floating_size)) = self.windows.get(&window_id).map(|ui| {
             let sizes: Vec<(PaneId, (u16, u16))> = ui
                 .pane_rects()
                 .into_iter()
@@ -740,7 +767,11 @@ impl Application {
                 ui.metrics.width.round().max(1.0) as u16,
                 ui.metrics.height.max(1) as u16,
             );
-            (sizes, cell)
+            let floating_size = ui.floating.as_ref().and_then(|floating| {
+                ui.floating_rect()
+                    .map(|rect| (floating.session, ui.grid_size(rect)))
+            });
+            (sizes, cell, floating_size)
         }) else {
             return;
         };
@@ -754,6 +785,14 @@ impl Application {
                 resized_grids.push((session.id, cols, rows));
                 resized = true;
             }
+        }
+        if let Some((session_id, (cols, rows))) = floating_size
+            && let Some(session) = self.sessions.get_mut(session_id)
+            && session.engine.size() != (cols, rows)
+        {
+            session.resize(cols, rows, cell.0, cell.1);
+            resized_grids.push((session.id, cols, rows));
+            resized = true;
         }
         // A resize reflows the buffer, and an image anchor is a bare line number:
         // nothing can be re-anchored, so the anchors the new grid cannot show are
@@ -814,12 +853,29 @@ impl Application {
             AppCommand::CloseTab { .. } => self.request_close_tab(window_id, active_tab),
             AppCommand::ClosePane { .. } => {
                 if let Some(pane) = focused_pane {
-                    self.request_close_pane(window_id, pane);
+                    // The floating terminal is not in the split tree, so closing it
+                    // destroys it instead of closing a pane of the mosaic.
+                    if self
+                        .windows
+                        .get(&window_id)
+                        .is_some_and(|ui| closes_floating(ui.floating.as_ref(), pane))
+                    {
+                        self.close_floating(window_id);
+                    } else {
+                        self.request_close_pane(window_id, pane);
+                    }
                 }
             }
             AppCommand::SplitPane { axis, .. } => {
                 tracing::debug!(?axis, ?focused_pane, "split requested");
-                match focused_pane {
+                // A new pane joins the mosaic, so the split always targets a pane of
+                // the split tree even while the floating terminal has the focus.
+                let target = self
+                    .windows
+                    .get(&window_id)
+                    .and_then(WindowUi::mosaic_pane)
+                    .or(focused_pane);
+                match target {
                     Some(pane) => {
                         if let Err(error) = self.split_pane(window_id, pane, axis) {
                             tracing::error!(error = %error, "could not split the pane");
@@ -992,6 +1048,7 @@ impl Application {
                 }
                 self.apply_config();
             }
+            AppCommand::ToggleFloating => self.toggle_floating(window_id),
             AppCommand::ConfirmClose => {
                 self.with_window(window_id, |ui| {
                     ui.overlay = Overlay::None;
@@ -1204,6 +1261,139 @@ impl Application {
         self.sync_sizes(window_id);
         self.persist_workspace();
         Ok(())
+    }
+
+    /// `toggle-floating`: creates, shows or hides the window's floating terminal.
+    ///
+    /// The three states are deliberate and small:
+    ///
+    /// * nothing open yet — create its own session and show it;
+    /// * visible — hide it, leaving the session and its PTY untouched;
+    /// * hidden — show it again with the shell state it kept.
+    ///
+    /// Hiding never resizes or writes to the session, so a long-running job in the
+    /// floating shell keeps running at the size it had.
+    fn toggle_floating(&mut self, window_id: WinitWindowId) {
+        let Some(press) = self
+            .windows
+            .get(&window_id)
+            .map(|ui| plan_floating_press(ui.floating.as_ref()))
+        else {
+            return;
+        };
+        match press {
+            FloatingPress::Create => {
+                if let Err(error) = self.open_floating(window_id) {
+                    tracing::error!(error = %error, "could not open the floating terminal");
+                    self.with_window(window_id, |ui| {
+                        ui.set_status(format!("floating terminal failed: {error}"));
+                    });
+                }
+            }
+            FloatingPress::Hide => {
+                self.with_window(window_id, |ui| {
+                    if let Some(floating) = ui.floating.as_mut() {
+                        floating.set_visible(false);
+                    }
+                    ui.window.request_redraw();
+                });
+            }
+            FloatingPress::Show => {
+                self.with_window(window_id, |ui| {
+                    if let Some(floating) = ui.floating.as_mut() {
+                        floating.set_visible(true);
+                    }
+                    ui.window.request_redraw();
+                });
+                // The window may have changed size while it was hidden, so the PTY
+                // catches up with the rectangle before the first frame is drawn.
+                self.sync_sizes(window_id);
+            }
+        }
+    }
+
+    /// Creates the floating terminal: its own session, the spec a new pane gets.
+    ///
+    /// The session is created at the grid that fits the floating rectangle, never at
+    /// the size of the window, so it starts at the size it is drawn at.
+    fn open_floating(&mut self, window_id: WinitWindowId) -> anyhow::Result<()> {
+        let config = self.config.config().clone();
+        let Some((cols, rows, cell, cwd, profile_id)) = self.windows.get(&window_id).map(|ui| {
+            let (cols, rows) = ui.grid_size(crate::chrome::float_rect(ui.terminal_rect()));
+            let mosaic = ui.mosaic_pane();
+            let cwd = mosaic
+                .and_then(|pane| ui.panes.get(&pane))
+                .and_then(|meta| meta.cwd.clone());
+            let profile_id = mosaic
+                .and_then(|pane| ui.panes.get(&pane))
+                .and_then(|meta| meta.profile);
+            (
+                cols,
+                rows,
+                (
+                    ui.metrics.width.round().max(1.0) as u16,
+                    ui.metrics.height.max(1) as u16,
+                ),
+                cwd,
+                profile_id,
+            )
+        }) else {
+            return Ok(());
+        };
+
+        let profile_ref =
+            profile_id.and_then(|id| config.profiles.get(id.raw().saturating_sub(1) as usize));
+        let pane = PaneId::next();
+        let spec = astraterm_session::session_spec(
+            &config,
+            profile_ref,
+            profile_id,
+            cwd.clone(),
+            cols,
+            rows,
+            cell,
+        );
+        let session = self.sessions.create(pane, &spec, cols, rows)?;
+
+        // The metadata and the binding keep the floating session in the window's
+        // lifecycle: closing or destroying the window closes it like any other pane.
+        let mut meta = Pane::new(pane);
+        meta.cwd = cwd;
+        meta.profile = profile_id;
+        if let Some(label) = spec.label.clone() {
+            meta.title = label;
+        }
+        self.with_window(window_id, |ui| {
+            ui.panes.insert(pane, meta);
+            ui.session_bindings.insert(pane, session);
+            ui.floating = Some(Floating::new(pane, session));
+            ui.window.request_redraw();
+        });
+        self.sync_sizes(window_id);
+        Ok(())
+    }
+
+    /// Destroys the floating terminal and its session.
+    ///
+    /// Used by `ClosePane` while the floating terminal has the focus and by the exit
+    /// of its shell. Focus needs no bookkeeping: with no floating terminal left the
+    /// keyboard resolves to the mosaic, exactly as before it was opened.
+    fn close_floating(&mut self, window_id: WinitWindowId) {
+        let Some((pane, session)) = self.windows.get(&window_id).and_then(|ui| {
+            ui.floating
+                .map(|floating| (floating.pane, floating.session))
+        }) else {
+            return;
+        };
+        self.with_window(window_id, |ui| {
+            ui.floating = None;
+            ui.panes.remove(&pane);
+            ui.session_bindings.remove(&pane);
+            ui.window.request_redraw();
+        });
+        self.sessions.close(session);
+        self.last_notification.remove(&session);
+        self.sync_sizes(window_id);
     }
 
     fn request_close_tab(&mut self, window_id: WinitWindowId, tab: TabId) {
@@ -2180,6 +2370,11 @@ impl Application {
         }
 
         let Some(pane) = ui.pane_at(x, y) else { return };
+        // A click inside the floating terminal never grabs the divider that lies
+        // behind it.
+        let floating_hit = ui
+            .floating
+            .is_some_and(|floating| floating.visible && floating.pane == pane);
         let Some((column, row, modes)) = ui.cell_at(pane, x, y).and_then(|(column, row)| {
             self.sessions
                 .for_pane(pane)
@@ -2223,7 +2418,7 @@ impl Application {
             if button != MouseButton::Left {
                 return;
             }
-            if let Some(drag) = self.divider_at(window_id, x, y) {
+            if !floating_hit && let Some(drag) = self.divider_at(window_id, x, y) {
                 self.with_window(window_id, |ui| ui.drag = drag);
                 return;
             }

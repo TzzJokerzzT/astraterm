@@ -318,6 +318,7 @@ pub fn command_for(action: ActionId) -> Option<AppCommand> {
         ActionId::OpenSettings => AppCommand::OpenSettings,
         ActionId::ReloadConfig => AppCommand::ReloadConfig,
         ActionId::ToggleStatusBar => AppCommand::ToggleStatusBar,
+        ActionId::ToggleFloating => AppCommand::ToggleFloating,
         ActionId::NewWindow => AppCommand::NewWindow { profile: None },
         ActionId::SendLiteralNext => AppCommand::SendLiteralNext,
         ActionId::Quit => AppCommand::Quit,

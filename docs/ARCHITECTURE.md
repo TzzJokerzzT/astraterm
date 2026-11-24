@@ -282,6 +282,9 @@ Notes:
   keymap and detects the clipboard backend.
 - `WindowUi` owns the renderer, the workspace, pane metadata and pointer state
   for one window. It never owns sessions.
+- `WindowUi` also owns at most one optional floating terminal (`Floating`), which
+  lives outside the split tree: the mosaic layout and the reflow never see it, it
+  keeps its own session, and it is drawn above the panes and below the overlays.
 - `window.set_ime_allowed(true)` with `ImePurpose::Terminal`: composed text arrives as
   `WindowEvent::Ime` and is written to the focused pane. Preedit is traced, not drawn.
 - Only one window is created in `resumed`; further windows come from the
