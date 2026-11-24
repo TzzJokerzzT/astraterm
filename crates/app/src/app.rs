@@ -49,6 +49,18 @@ use crate::ui::{
 /// line, so the status message keeps only its beginning.
 const STATUS_NOTIFICATION_CHARS: usize = 80;
 
+/// Minimum gap between two delivered notifications from the same session.
+///
+/// A program can print thousands of `OSC 9` sequences in one 32 KiB PTY read.
+/// Without this gate each one would sanitise its text, repaint every window and
+/// spawn a helper process, so a remote host could freeze the window.
+const NOTIFICATION_MIN_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Whether a session may deliver a notification at `now`.
+fn notification_due(last: Option<&Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.duration_since(*last) >= NOTIFICATION_MIN_INTERVAL)
+}
+
 /// Events the application sends itself from other threads.
 #[derive(Clone, Debug)]
 pub enum UserEvent {
@@ -78,6 +90,9 @@ pub struct Application {
     /// act on, is set once and is never cleared when focus moves away, so it cannot
     /// answer "is the user looking at this window right now?".
     focused_windows: BTreeSet<WinitWindowId>,
+    /// Last delivered notification per session, so a flood of OSC 9 costs one
+    /// comparison each instead of a redraw and a process per sequence.
+    last_notification: BTreeMap<SessionId, Instant>,
     /// Desktop notification backend. Degrades silently when `notify-send` is absent.
     notifications: Notifications,
     proxy: EventLoopProxy<UserEvent>,
@@ -168,6 +183,7 @@ impl Application {
             windows: BTreeMap::new(),
             focused: None,
             focused_windows: BTreeSet::new(),
+            last_notification: BTreeMap::new(),
             notifications: Notifications::new(),
             proxy,
             cli,
@@ -534,6 +550,14 @@ impl Application {
     /// the session does not have focus, so a program cannot interrupt the work in
     /// progress.
     fn handle_notification(&mut self, session: SessionId, title: Option<String>, body: String) {
+        // Gate first: sanitising, painting every window and spawning a helper are
+        // what turn a stream of OSC 9 sequences into a frozen UI.
+        let now = Instant::now();
+        if !notification_due(self.last_notification.get(&session), now) {
+            return;
+        }
+        self.last_notification.insert(session, now);
+
         let label = self
             .sessions
             .get(session)
@@ -1351,6 +1375,7 @@ impl Application {
         let sessions: Vec<SessionId> = ui.session_bindings.values().copied().collect();
         for session in sessions {
             self.sessions.close(session);
+            self.last_notification.remove(&session);
         }
         ui.window.set_visible(false);
         drop(ui);
@@ -2742,6 +2767,31 @@ impl ApplicationHandler<UserEvent> for Application {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.persist_workspace();
         self.sessions.shutdown_all();
+    }
+}
+
+#[cfg(test)]
+mod notification_gate_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{NOTIFICATION_MIN_INTERVAL, notification_due};
+
+    #[test]
+    fn a_flood_of_notifications_is_coalesced_per_session() {
+        let now = Instant::now();
+        assert!(notification_due(None, now), "the first one always passes");
+        assert!(
+            !notification_due(Some(&now), now),
+            "a second sequence in the same instant is dropped"
+        );
+        assert!(!notification_due(
+            Some(&(now - Duration::from_millis(1))),
+            now
+        ));
+        assert!(notification_due(
+            Some(&(now - NOTIFICATION_MIN_INTERVAL)),
+            now
+        ));
     }
 }
 
