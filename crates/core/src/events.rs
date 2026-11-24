@@ -132,6 +132,14 @@ pub enum SessionEvent {
     },
     /// The terminal requested a bell.
     Bell { session: SessionId },
+    /// The running program asked for a desktop notification (OSC 9 or
+    /// `OSC 777;notify;`). The text is untrusted and still raw: the application
+    /// sanitizes it and applies the `[notifications]` policy.
+    Notification {
+        session: SessionId,
+        title: Option<String>,
+        body: String,
+    },
     /// An application asked for a colour (OSC 4/10/11). The application resolves it
     /// against the active theme and replies through the session.
     ColorQuery { session: SessionId, index: usize },

@@ -240,6 +240,34 @@ Default `fallbacks`: `["JetBrains Mono", "Symbols Nerd Font", "Noto Color Emoji"
 | `low_power_mode` | `false` | Asks for the low-power GPU adapter on new windows and disables cursor blinking. | Battery use, or a fan that never stops. | Low power mode |
 | `max_fps_when_idle` | `1` | Accepted but not applied today: there is no idle redraw loop to cap. | You expected to throttle idle redraws. | Max idle FPS |
 
+### `[notifications]` — desktop notifications from programs
+
+Programs ask for a notification with `OSC 9;<body>` or
+`OSC 777;notify;<title>;<body>` (the sequences used by `notify-send` wrappers,
+tmux, `llvm` builds and most "tell me when this finishes" scripts). AstraTerm
+consumes both before the VT parser, shows the text in the status bar, and — under
+the policy below — files a desktop notification through `notify-send`.
+
+| Option | Default | What it does | When you would change it | Panel |
+|---|---|---|---|---|
+| `on` | `"unfocused"` | When to notify: `unfocused` only while the window showing that session does not have focus, `always` even while you are looking at it, `never` for the status-bar message alone. | `always` for long builds you watch anyway; `never` when a polling script would flood the desktop. | — |
+
+The policy is read per notification, so it applies live. It also gates the window
+attention hint (the compositor's "urgent" mark): with `never` nothing is raised,
+not even the hint.
+
+The text is untrusted terminal output. Control characters are removed, whitespace
+is collapsed, the title is cut to 120 characters and the body to 1024, and the
+result is passed to `notify-send` as an argument vector — never through a shell.
+A missing `notify-send` (or no notification daemon) degrades silently: the status
+bar still reports the message. See `docs/SECURITY.md`.
+
+```toml
+[notifications]
+# "unfocused" (default), "always" or "never".
+on = "unfocused"
+```
+
 ### `[keys]`
 
 `[keys]` maps an **action name** to one or more chords. See
@@ -387,7 +415,8 @@ Live without a restart: theme and palette, cursor shape/blink, padding, pane gap
 divider thickness, tab bar position, strip width, compact tabs, status bar and its
 segments, clock format, font family/size/weight/line height/letter spacing,
 opacity, all keybindings, `confirm_on_close`, `copy_on_select`,
-`open_urls_on_click`, `close_pane_when_shell_exits`, `low_power_mode`.
+`open_urls_on_click`, `close_pane_when_shell_exits`, `low_power_mode`,
+`notifications.on`.
 
 Requires a new session or window (`Field::requires_restart()`):
 `terminal.term`, `terminal.scrollback_lines`, `terminal.working_directory`,
@@ -465,6 +494,9 @@ close_pane_when_shell_exits = true
 gpu_acceleration = true
 low_power_mode = false
 max_fps_when_idle = 1
+
+[notifications]
+on = "unfocused"
 
 [keys]
 close-pane = "ctrl+shift+w"

@@ -5,18 +5,19 @@
 //! happen only when something changed, and the only timers are the cursor blink and
 //! the configuration-watcher debounce.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use astraterm_config::keys::{ActionId, Keymap};
-use astraterm_config::schema::Config;
+use astraterm_config::schema::{Config, should_notify};
 use astraterm_config::service::{ConfigService, ConfigWatcher, ReloadOutcome, SaveError};
 use astraterm_config::themes::{Theme, available_themes};
 use astraterm_core::events::{AppCommand, ExitReason, SessionEvent};
 use astraterm_core::{PaneId, ProfileId, SessionId, Size, SplitAxis, TabId, WindowId};
 use astraterm_platform::clipboard::{Clipboard, Selection as ClipboardSelection};
 use astraterm_platform::linux;
+use astraterm_platform::notifications::{MAX_BODY_CHARS, MAX_TITLE_CHARS, Notifications, sanitize};
 use astraterm_platform::paths::StatePaths;
 use astraterm_platform::system::SystemMonitor;
 use astraterm_settings_ui::panel::{PanelAction, PanelKey, SettingsPanel};
@@ -31,7 +32,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
-use winit::window::{ImePurpose, Window, WindowId as WinitWindowId};
+use winit::window::{ImePurpose, UserAttentionType, Window, WindowId as WinitWindowId};
 
 use crate::cli::Cli;
 use crate::keys;
@@ -41,6 +42,12 @@ use crate::ui::{
     ClickInfo, ConfirmDialog, DragState, ExitCleanup, Overlay, PendingAction, RenameOverlay,
     SearchOverlay, SessionImages, SplitIdRef, WindowUi, plan_exit_cleanup, url_at,
 };
+
+/// Characters of notification body repeated in the status bar.
+///
+/// The body itself is bounded by [`MAX_BODY_CHARS`], but the status bar has one
+/// line, so the status message keeps only its beginning.
+const STATUS_NOTIFICATION_CHARS: usize = 80;
 
 /// Events the application sends itself from other threads.
 #[derive(Clone, Debug)]
@@ -65,6 +72,14 @@ pub struct Application {
     sessions: astraterm_session::SessionManager,
     windows: BTreeMap<WinitWindowId, WindowUi>,
     focused: Option<WinitWindowId>,
+    /// Windows that currently hold the input focus.
+    ///
+    /// Deliberately distinct from `focused`: that one names the window keybindings
+    /// act on, is set once and is never cleared when focus moves away, so it cannot
+    /// answer "is the user looking at this window right now?".
+    focused_windows: BTreeSet<WinitWindowId>,
+    /// Desktop notification backend. Degrades silently when `notify-send` is absent.
+    notifications: Notifications,
     proxy: EventLoopProxy<UserEvent>,
     cli: Cli,
     mods: ModifiersState,
@@ -152,6 +167,8 @@ impl Application {
             sessions: astraterm_session::SessionManager::new(),
             windows: BTreeMap::new(),
             focused: None,
+            focused_windows: BTreeSet::new(),
+            notifications: Notifications::new(),
             proxy,
             cli,
             mods: ModifiersState::empty(),
@@ -468,6 +485,11 @@ impl Application {
                 }
                 self.refresh_titles();
             }
+            SessionEvent::Notification {
+                session,
+                title,
+                body,
+            } => self.handle_notification(session, title, body),
             SessionEvent::Bell { session } => {
                 let label = self
                     .sessions
@@ -501,6 +523,70 @@ impl Application {
             }
             SessionEvent::Exited { session, reason } => self.handle_exit(session, reason),
         }
+    }
+
+    /// Turns one OSC 9 / OSC 777 request into a status message and, when the
+    /// policy allows it, a window attention hint plus a desktop notification.
+    ///
+    /// The text comes from whatever runs in the terminal, including a remote host:
+    /// it is sanitized here, before it reaches the status bar or `notify-send`, and
+    /// it is never executed. The default policy only fires while the window showing
+    /// the session does not have focus, so a program cannot interrupt the work in
+    /// progress.
+    fn handle_notification(&mut self, session: SessionId, title: Option<String>, body: String) {
+        let label = self
+            .sessions
+            .get(session)
+            .map(|session| {
+                session
+                    .title
+                    .clone()
+                    .or_else(|| session.label.clone())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let body = sanitize(&body, MAX_BODY_CHARS);
+        let title = title
+            .map(|title| sanitize(&title, MAX_TITLE_CHARS))
+            .filter(|title| !title.is_empty());
+
+        // The status line follows the bell: every window shows what happened, even
+        // when the notification itself is suppressed.
+        let status = if body.is_empty() {
+            format!("notify: {label}")
+        } else {
+            format!("notify: {}", sanitize(&body, STATUS_NOTIFICATION_CHARS))
+        };
+        for ui in self.windows.values_mut() {
+            ui.status = Some((status.clone(), Instant::now()));
+            ui.window.request_redraw();
+        }
+
+        let window_id = self.window_for_session(session);
+        let window_focused = window_id.is_some_and(|id| self.focused_windows.contains(&id));
+        if !should_notify(self.config.config().notifications.on, window_focused) {
+            return;
+        }
+        if let Some(ui) = window_id.and_then(|id| self.windows.get(&id)) {
+            ui.window
+                .request_user_attention(Some(UserAttentionType::Informational));
+        }
+        let title = title.unwrap_or_else(|| {
+            if label.is_empty() {
+                "AstraTerm".to_owned()
+            } else {
+                sanitize(&label, MAX_TITLE_CHARS)
+            }
+        });
+        self.notifications.send(&title, &body);
+    }
+
+    /// First window whose panes are bound to `session`, if any.
+    fn window_for_session(&self, session: SessionId) -> Option<WinitWindowId> {
+        self.windows
+            .iter()
+            .find(|(_, ui)| ui.session_bindings.values().any(|bound| *bound == session))
+            .map(|(id, _)| *id)
     }
 
     fn handle_exit(&mut self, session_id: SessionId, reason: ExitReason) {
@@ -1269,6 +1355,7 @@ impl Application {
         ui.window.set_visible(false);
         drop(ui);
 
+        self.focused_windows.remove(&window_id);
         if self.focused == Some(window_id) {
             self.focused = self.windows.keys().next().copied();
         }
@@ -2510,13 +2597,19 @@ impl ApplicationHandler<UserEvent> for Application {
             }
             WindowEvent::Focused(focused) => {
                 if focused {
+                    self.focused_windows.insert(window_id);
                     self.focused = Some(window_id);
                     self.with_window(window_id, |ui| {
                         ui.cursor_phase = true;
+                        // The user is looking at this window now, so no attention
+                        // hint is owed. Wayland treats `None` as a no-op; X11 clears
+                        // the urgency flag with it.
+                        ui.window.request_user_attention(None);
                         ui.window.request_redraw();
                     });
                     self.report_focus(window_id, true);
                 } else {
+                    self.focused_windows.remove(&window_id);
                     self.report_focus(window_id, false);
                 }
             }

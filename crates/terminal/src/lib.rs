@@ -18,7 +18,7 @@ pub use alacritty_terminal::index::Side;
 pub use engine::{EngineOptions, SelectionKind, TerminalEngine, TerminalEvent};
 pub use image::{
     ImageMessage, ImagePlacement, ImageProtocol, ImageScanner, ImageStore, MAX_IMAGE_BYTES,
-    MAX_PENDING_BYTES, ScanOutput,
+    MAX_PENDING_BYTES, ScanOutput, TerminalNotification,
 };
 pub use input::{
     Direction, KeyPress, MouseEvent, MouseKind, TermKey, encode_key, encode_mouse, encode_paste,

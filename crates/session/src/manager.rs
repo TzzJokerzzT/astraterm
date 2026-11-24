@@ -227,6 +227,13 @@ impl Session {
                     self.bell = true;
                     events.push(SessionEvent::Bell { session: self.id });
                 }
+                TerminalEvent::Notification { title, body } => {
+                    events.push(SessionEvent::Notification {
+                        session: self.id,
+                        title,
+                        body,
+                    });
+                }
                 TerminalEvent::ClipboardStore(text) => clipboard.push(text),
                 TerminalEvent::ClipboardLoad => clipboard.push(String::new()),
                 TerminalEvent::PtyReply(bytes) => replies.push((self.id, bytes)),
@@ -578,6 +585,36 @@ mod tests {
         assert_eq!(manager.len(), 1);
         let text = pump_until(&mut manager, "session-output");
         assert!(text.contains("session-output"));
+    }
+
+    #[test]
+    fn a_notification_sequence_becomes_a_session_event() {
+        let mut manager = SessionManager::new();
+        manager
+            .create(
+                PaneId::next(),
+                &spec(
+                    "/bin/sh",
+                    &["-c", "printf '%b' '\\033]9;hello from the child\\007'"],
+                ),
+                40,
+                10,
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            manager.pump();
+            for event in manager.drain_events() {
+                if let SessionEvent::Notification { title, body, .. } = event {
+                    assert_eq!(title, None);
+                    assert_eq!(body, "hello from the child");
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for the notification event");
     }
 
     #[test]

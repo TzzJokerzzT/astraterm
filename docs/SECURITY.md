@@ -99,7 +99,7 @@ untrusted as any other terminal output, so the whole path is gated and bounded.
   `MAX_PENDING_BYTES` (8 MiB + 8 KiB), so a malformed sequence cannot swallow the
   text that follows it. Cancelled, unterminated and oversized sequences are
   counted and dropped; foreign APC/OSC/DCS sequences are passed through byte for
-  byte. Only the three image introducers are ever buffered.
+  byte. Only the image and notification introducers are ever buffered.
 - **Declared sizes are checked before allocation**
   (`crates/terminal/src/image_decode.rs`, `DecodeLimits::default()`): a payload is
   limited to 8 MiB, a decoded image to 4096 pixels on either axis and to
@@ -133,6 +133,34 @@ untrusted as any other terminal output, so the whole path is gated and bounded.
 
 No `unsafe` is involved: the decoders are safe Rust over slices, and the only
 allocation sizes derive from the checked dimensions above.
+
+### Desktop notifications come from untrusted output
+
+`OSC 9` and `OSC 777;notify;` let the running program ask for a desktop
+notification, so the title and body are attacker-controlled in exactly the same
+way as any other terminal output — including when the shell is a remote host over
+SSH. Three rules keep that safe (`crates/platform/src/notifications.rs`,
+`Application::handle_notification` in `crates/app/src/app.rs`):
+
+- **The text is sanitized, not rendered.** Control characters (newlines, `ESC`,
+  `NUL`) are removed, whitespace is collapsed, the title is cut to 120 characters
+  and the body to 1024, counted in characters so a multibyte character is never
+  split. A program cannot use a notification to smuggle escape sequences into the
+  status bar or a terminal that logs the notification through `notify-send`.
+- **Nothing is executed.** The helper is `notify-send` with an argument vector
+  (`--app-name=AstraTerm`, title, body); no `sh -c`, no shell string, no
+  program or path taken from the payload. The test
+  `the_helper_is_invoked_with_an_argument_vector` pins the argv shape.
+- **The user is not interrupted while looking.** `[notifications] on` defaults to
+  `unfocused`: a notification is delivered only while the window showing that
+  session lacks focus, and the policy also gates the compositor attention hint.
+  `never` suppresses both and leaves only the status-bar message. A missing
+  `notify-send` degrades silently with a single `warn`, never a dialog or a retry
+  loop.
+
+Notifications are not logged: the body is untrusted terminal content and logging
+it would be logging what the program printed. A notification whose body is empty
+after sanitizing is dropped rather than sent.
 
 ### URL opening is restricted and gesture-driven
 

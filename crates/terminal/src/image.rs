@@ -1,5 +1,14 @@
-//! Image protocol capture: an incremental scanner for kitty graphics, iTerm2
-//! `OSC 1337;File=` and sixel, plus the pure anchoring model for decoded images.
+//! Sequence capture in front of the VT parser: an incremental scanner for kitty
+//! graphics, iTerm2 `OSC 1337;File=`, sixel and the two notification OSCs, plus
+//! the pure anchoring model for decoded images.
+//!
+//! Besides images, the scanner extracts terminal-level sequences the core drops:
+//! `OSC 9` and `OSC 777;notify;` ask for a desktop notification, and
+//! `alacritty_terminal` dispatches unknown OSC bodies to `unhandled`, which only
+//! logs at debug level, with no hook for the embedder. Consuming them here is the
+//! only way to see them. The module name still says "image" and is now too narrow:
+//! renaming it is known debt, deliberately not paid in the same change as the
+//! behaviour.
 //!
 //! `alacritty_terminal` 0.26 parses no image protocol at all, so a kitty
 //! graphics APC, an iTerm2 `File=` payload or a sixel DCS currently reaches the
@@ -21,9 +30,9 @@
 //!   sequence is abandoned once it reaches [`MAX_PENDING_BYTES`], which is what
 //!   keeps a malformed sequence from swallowing the text that follows it (S5.3).
 //!
-//! Only the three image introducers are buffered. Every other escape sequence —
-//! CSI, any other OSC, any other APC or DCS — is streamed through byte for byte
-//! as it arrives, so a `CSI ? u` or an `OSC 8` hyperlink costs no allocation.
+//! Only the five sequences above are buffered. Every other escape sequence — CSI,
+//! any other OSC, any other APC or DCS — is streamed through byte for byte as it
+//! arrives, so a `CSI ? u` or an `OSC 8` hyperlink costs no allocation.
 
 /// Largest image payload the scanner will hand to a decoder.
 ///
@@ -54,8 +63,26 @@ const DCS_INTRO: u8 = b'P';
 
 /// kitty graphics is the only APC body this scanner owns.
 const KITTY_APC_BODY: u8 = b'G';
-/// iTerm2 inline images are the only OSC 1337 body this scanner owns.
-const ITERM2_MARKER: &[u8] = b"1337;File=";
+
+/// OSC bodies this scanner owns, identified by their introducer prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OscKind {
+    /// `1337;File=` — iTerm2 inline image.
+    Iterm2,
+    /// `9;` — an OSC 9 notification, body only.
+    Notify9,
+    /// `777;notify;` — an rxvt-style notification, `title;body`.
+    Notify777,
+}
+
+/// The OSC introducers the scanner buffers. No prefix is a prefix of another, so
+/// `9;` can never shadow `1337;File=` or `777;notify;`.
+const OSC_INTROS: [(&[u8], OscKind); 3] = [
+    (b"1337;File=", OscKind::Iterm2),
+    (b"9;", OscKind::Notify9),
+    (b"777;notify;", OscKind::Notify777),
+];
+
 /// A DCS with the final byte `q` (and no intermediate) is sixel.
 const SIXEL_FINAL: u8 = b'q';
 /// `ESC \` closes an APC, a DCS and an OSC.
@@ -106,6 +133,18 @@ impl ImageMessage {
     }
 }
 
+/// One notification sequence captured from the byte stream.
+///
+/// Both parts are raw and untrusted: the scanner only strips the introducer and
+/// splits the title from the body. The application sanitizes the text before it
+/// reaches the status bar or the notification daemon. OSC 9 carries a body only,
+/// so `title` is `None` there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalNotification {
+    pub title: Option<String>,
+    pub body: String,
+}
+
 /// Result of one [`ImageScanner::scan`] call.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScanOutput {
@@ -113,9 +152,12 @@ pub struct ScanOutput {
     pub passthrough: Vec<u8>,
     /// Image sequences completed during this call, in stream order.
     pub messages: Vec<ImageMessage>,
-    /// Image sequences discarded during this call: over [`MAX_IMAGE_BYTES`],
+    /// Notification sequences completed during this call, in stream order.
+    pub notifications: Vec<TerminalNotification>,
+    /// Sequences discarded during this call: over [`MAX_IMAGE_BYTES`],
     /// unterminated past [`MAX_PENDING_BYTES`], empty, or cancelled with
-    /// `CAN`/`SUB`. Non-image sequences are never counted here.
+    /// `CAN`/`SUB`. Foreign sequences are never counted here, and a notification
+    /// whose body is empty is ignored without being counted.
     pub dropped: usize,
 }
 
@@ -140,11 +182,13 @@ enum State {
     Kitty,
     /// Consumed `ESC ] 1337;File=`; collecting an iTerm2 payload.
     Iterm2,
+    /// Consumed an OSC introducer this scanner owns; collecting its body.
+    Notification(OscKind),
     /// Consumed the sixel `q`; collecting sixel data.
     Sixel,
 }
 
-/// Incremental image-sequence scanner.
+/// Incremental sequence scanner for the image and notification protocols.
 ///
 /// Feed the bytes in whatever pieces they arrive and keep the scanner alive for
 /// the lifetime of the stream; it remembers partial sequences across calls.
@@ -186,7 +230,7 @@ impl ImageScanner {
                 State::Osc => self.step_osc(bytes, pos, &mut out),
                 State::DcsHeader => self.step_dcs_header(bytes, pos, &mut out),
                 State::Foreign { osc } => self.step_foreign(bytes, pos, osc, &mut out),
-                State::Kitty | State::Iterm2 | State::Sixel => {
+                State::Kitty | State::Iterm2 | State::Sixel | State::Notification(_) => {
                     self.step_payload(bytes, pos, &mut out)
                 }
             };
@@ -257,12 +301,21 @@ impl ImageScanner {
 
     fn step_osc(&mut self, bytes: &[u8], pos: usize, out: &mut ScanOutput) -> usize {
         self.scratch.push(bytes[pos]);
-        if ITERM2_MARKER.starts_with(&self.scratch) {
-            if self.scratch.len() == ITERM2_MARKER.len() {
-                self.begin_payload(State::Iterm2);
-            }
-        } else {
-            // Not an inline image: flush the `ESC ]` and the candidate prefix.
+        if let Some((_, kind)) = OSC_INTROS
+            .iter()
+            .find(|(prefix, _)| *prefix == self.scratch.as_slice())
+        {
+            let state = match kind {
+                OscKind::Iterm2 => State::Iterm2,
+                kind => State::Notification(*kind),
+            };
+            self.begin_payload(state);
+        } else if !OSC_INTROS
+            .iter()
+            .any(|(prefix, _)| prefix.starts_with(&self.scratch))
+        {
+            // Neither an inline image nor a notification: flush the `ESC ]` and
+            // the candidate prefix and stream the rest through verbatim.
             out.passthrough.extend_from_slice(&[ESC, OSC_INTRO]);
             out.passthrough.append(&mut self.scratch);
             self.state = State::Foreign { osc: true };
@@ -339,7 +392,7 @@ impl ImageScanner {
     }
 
     fn step_payload(&mut self, bytes: &[u8], mut pos: usize, out: &mut ScanOutput) -> usize {
-        let bel_terminates = self.state == State::Iterm2;
+        let bel_terminates = matches!(self.state, State::Iterm2 | State::Notification(_));
         while pos < bytes.len() {
             // Copy the run of plain payload bytes in one go; only the delimiters
             // need byte-wise attention.
@@ -435,9 +488,23 @@ impl ImageScanner {
             State::Sixel => Some(ImageProtocol::Sixel),
             _ => None,
         };
+        let notification = match self.state {
+            State::Notification(kind) => Some(kind),
+            _ => None,
+        };
         let payload = std::mem::take(&mut self.payload);
         self.esc_pending = false;
         self.state = State::Ground;
+        if let Some(kind) = notification {
+            if payload.len() > MAX_IMAGE_BYTES {
+                self.dropped += 1;
+                return;
+            }
+            if let Some(notification) = notification_from(kind, &payload) {
+                out.notifications.push(notification);
+            }
+            return;
+        }
         let Some(protocol) = protocol else {
             return;
         };
@@ -449,6 +516,53 @@ impl ImageScanner {
         }
         out.messages.push(ImageMessage { protocol, payload });
     }
+}
+
+/// Splits a captured notification body into its title and text.
+///
+/// The payload is lossily decoded so a mangled UTF-8 run cannot drop the whole
+/// notification; the application sanitizes the text before use. A body that is
+/// empty once trimmed carries nothing to say, so it is ignored rather than
+/// reported: `OSC 9;` alone is not a notification.
+fn notification_from(kind: OscKind, payload: &[u8]) -> Option<TerminalNotification> {
+    let text = String::from_utf8_lossy(payload);
+    let (title, body) = match kind {
+        OscKind::Notify9 => {
+            let body = text.as_ref();
+            if is_progress_report(body) {
+                return None;
+            }
+            (None, body)
+        }
+        OscKind::Notify777 => {
+            let (title, body) = text.split_once(';')?;
+            (Some(title), body)
+        }
+        OscKind::Iterm2 => return None,
+    };
+    let body = body.trim().to_owned();
+    if body.is_empty() {
+        return None;
+    }
+    let title = title
+        .map(|title| title.trim().to_owned())
+        .filter(|title| !title.is_empty());
+    Some(TerminalNotification { title, body })
+}
+
+/// Whether an `OSC 9` body is a progress report rather than a message.
+///
+/// ConEmu and Windows Terminal report progress as `OSC 9 ; 4 ; state ; percent`,
+/// sharing the introducer with notifications but carrying no message. Treating it
+/// as one would raise a desktop notification on every progress tick.
+fn is_progress_report(body: &str) -> bool {
+    let mut fields = body.split(';');
+    let (Some("4"), Some(state), Some(percent), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    state.parse::<u8>().is_ok() && (percent.is_empty() || percent.parse::<u32>().is_ok())
 }
 
 /// Offset of the first byte that needs byte-wise handling inside a payload.
@@ -579,5 +693,170 @@ impl Default for ImageStore {
     /// still bounding the untrusted allocation.
     fn default() -> Self {
         Self::new(64 * 1024 * 1024)
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::{
+        ImageScanner, OscKind, ScanOutput, TerminalNotification, is_progress_report,
+        notification_from,
+    };
+
+    #[test]
+    fn progress_reports_are_not_notifications() {
+        // ConEmu/Windows Terminal progress shares the OSC 9 introducer but is not a
+        // message, so it must not reach the notification path.
+        for body in ["4;1;50", "4;0;", "4;3;100"] {
+            assert!(is_progress_report(body), "{body}");
+            assert!(
+                notification_from(OscKind::Notify9, body.as_bytes()).is_none(),
+                "{body} must not become a notification"
+            );
+        }
+        for body in ["hello", "4; foo", "4;1", "44;1;50", "build done"] {
+            assert!(!is_progress_report(body), "{body}");
+            assert!(
+                notification_from(OscKind::Notify9, body.as_bytes()).is_some(),
+                "{body} is a message"
+            );
+        }
+    }
+    /// Scans `chunks` with one scanner, merging the per-call results.
+    fn scan(chunks: &[&[u8]]) -> ScanOutput {
+        let mut scanner = ImageScanner::new();
+        let mut merged = ScanOutput::default();
+        for chunk in chunks {
+            let output = scanner.scan(chunk);
+            merged.passthrough.extend(output.passthrough);
+            merged.messages.extend(output.messages);
+            merged.notifications.extend(output.notifications);
+            merged.dropped += output.dropped;
+        }
+        merged
+    }
+
+    fn only_notification(output: &ScanOutput) -> &TerminalNotification {
+        assert_eq!(
+            output.notifications.len(),
+            1,
+            "expected exactly one notification, got {:?}",
+            output.notifications
+        );
+        &output.notifications[0]
+    }
+
+    #[test]
+    fn osc_9_with_a_bel_terminator_is_captured() {
+        let output = scan(&[b"before\x1b]9;build finished\x07after"]);
+        assert_eq!(output.passthrough, b"beforeafter");
+        let notification = only_notification(&output);
+        assert_eq!(notification.title, None, "OSC 9 carries no title");
+        assert_eq!(notification.body, "build finished");
+    }
+
+    #[test]
+    fn osc_9_with_an_st_terminator_is_captured() {
+        let output = scan(&[b"\x1b]9;done\x1b\\tail"]);
+        assert_eq!(output.passthrough, b"tail");
+        let notification = only_notification(&output);
+        assert_eq!(notification.title, None);
+        assert_eq!(notification.body, "done");
+    }
+
+    #[test]
+    fn osc_777_notify_carries_a_title_and_a_body() {
+        let output = scan(&[b"\x1b]777;notify;Build;done in 4s\x07"]);
+        assert!(output.passthrough.is_empty());
+        let notification = only_notification(&output);
+        assert_eq!(notification.title.as_deref(), Some("Build"));
+        assert_eq!(notification.body, "done in 4s");
+
+        // ST closes it too.
+        let output = scan(&[b"\x1b]777;notify;Build;done in 5s\x1b\\"]);
+        let notification = only_notification(&output);
+        assert_eq!(notification.title.as_deref(), Some("Build"));
+        assert_eq!(notification.body, "done in 5s");
+    }
+
+    #[test]
+    fn osc_777_with_another_subcommand_is_ignored() {
+        const INPUT: &[u8] = b"\x1b]777;other;payload\x07after";
+        let output = scan(&[INPUT]);
+        assert!(
+            output.notifications.is_empty(),
+            "only `777;notify` is a desktop notification"
+        );
+        assert_eq!(
+            output.passthrough, INPUT,
+            "an OSC we do not own must stay byte-identical"
+        );
+    }
+
+    #[test]
+    fn a_notification_split_into_one_byte_chunks_is_reassembled() {
+        const INPUT: &[u8] = b"\x1b]9;hello world\x07tail";
+        let chunks: Vec<&[u8]> = INPUT.chunks(1).collect();
+        let output = scan(&chunks);
+        assert_eq!(output.passthrough, b"tail");
+        let notification = only_notification(&output);
+        assert_eq!(notification.body, "hello world");
+
+        const TITLED: &[u8] = b"\x1b]777;notify;A title;A body\x1b\\";
+        let chunks: Vec<&[u8]> = TITLED.chunks(1).collect();
+        let output = scan(&chunks);
+        assert!(output.passthrough.is_empty(), "{:?}", output.passthrough);
+        let notification = only_notification(&output);
+        assert_eq!(notification.title.as_deref(), Some("A title"));
+        assert_eq!(notification.body, "A body");
+    }
+
+    #[test]
+    fn a_foreign_osc_next_to_a_notification_stays_byte_identical() {
+        // Everything that is neither an image nor a notification has to reach the
+        // parser untouched, even in the same chunk as a captured sequence.
+        let input: &[u8] =
+            b"\x1b]0;title\x07\x1b]9;note\x07\x1b]8;;https://example.invalid/a\x1b\\\
+link\x1b]8;;\x1b\\\x1b]1337;SetMark\x07\x1b]52;c;YWJj\x07text";
+        let output = scan(&[input]);
+        let expected: &[u8] = b"\x1b]0;title\x07\x1b]8;;https://example.invalid/a\x1b\\\
+link\x1b]8;;\x1b\\\x1b]1337;SetMark\x07\x1b]52;c;YWJj\x07text";
+        assert_eq!(
+            output.passthrough,
+            expected,
+            "got {:?}",
+            String::from_utf8_lossy(&output.passthrough)
+        );
+        let notification = only_notification(&output);
+        assert_eq!(notification.body, "note");
+    }
+
+    #[test]
+    fn an_unterminated_notification_never_swallows_the_text_after_it() {
+        // Abandoned at the pending bound: the scanner resyncs and nothing is
+        // reported, exactly like an oversized image payload.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"\x1b]9;");
+        input.extend(std::iter::repeat_n(b'A', super::MAX_PENDING_BYTES + 1));
+        let mut scanner = ImageScanner::new();
+        let first = scanner.scan(&input);
+        assert!(first.notifications.is_empty());
+        assert_eq!(
+            first.dropped, 1,
+            "the abandoned sequence must be counted, not delivered"
+        );
+        assert_eq!(
+            scanner.pending_bytes(),
+            0,
+            "nothing may stay buffered after abandoning a sequence"
+        );
+        let second = scanner.scan(b"after");
+        assert!(second.notifications.is_empty());
+        let mut passthrough = first.passthrough;
+        passthrough.extend(second.passthrough);
+        assert_eq!(
+            passthrough, b"after",
+            "the scanner must resync instead of swallowing later text"
+        );
     }
 }

@@ -20,6 +20,7 @@ pub struct Config {
     pub appearance: AppearanceConfig,
     pub workspace: WorkspaceConfig,
     pub performance: PerformanceConfig,
+    pub notifications: NotificationsConfig,
     /// Action name to key chord, for example `new-tab = "ctrl+shift+t"`.
     pub keys: BTreeMap<String, String>,
     /// Named profiles. The first profile is the implicit default unless a
@@ -36,6 +37,7 @@ impl Default for Config {
             appearance: AppearanceConfig::default(),
             workspace: WorkspaceConfig::default(),
             performance: PerformanceConfig::default(),
+            notifications: NotificationsConfig::default(),
             keys: default_keybindings(),
             profiles: Vec::new(),
         }
@@ -365,6 +367,68 @@ impl Default for PerformanceConfig {
     }
 }
 
+/// When the terminal raises a desktop notification.
+///
+/// The text comes from an untrusted process, so the default only surfaces it when
+/// the user is not looking at that window: a program cannot interrupt the work in
+/// progress, only tell the user something happened elsewhere.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationPolicy {
+    /// Notify only while the window showing the session does not have focus.
+    #[default]
+    Unfocused,
+    /// Notify even while the user is looking at the window.
+    Always,
+    /// Never send a desktop notification; the status bar message still appears.
+    Never,
+}
+
+impl NotificationPolicy {
+    pub fn label(self) -> &'static str {
+        match self {
+            NotificationPolicy::Unfocused => "unfocused",
+            NotificationPolicy::Always => "always",
+            NotificationPolicy::Never => "never",
+        }
+    }
+
+    pub const ALL: [NotificationPolicy; 3] = [
+        NotificationPolicy::Unfocused,
+        NotificationPolicy::Always,
+        NotificationPolicy::Never,
+    ];
+}
+
+/// `[notifications]` — desktop notifications requested by OSC 9 and OSC 777.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    /// When to raise a notification: `unfocused` (default), `always` or `never`.
+    pub on: NotificationPolicy,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            on: NotificationPolicy::Unfocused,
+        }
+    }
+}
+
+/// Whether a notification should be delivered for a window in this focus state.
+///
+/// Pure so the policy matrix is testable without a window: the application asks
+/// once per notification and the answer decides both the desktop notification and
+/// the window attention request.
+pub fn should_notify(policy: NotificationPolicy, window_focused: bool) -> bool {
+    match policy {
+        NotificationPolicy::Unfocused => !window_focused,
+        NotificationPolicy::Always => true,
+        NotificationPolicy::Never => false,
+    }
+}
+
 /// A named launch profile.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -420,6 +484,52 @@ mod tests {
         assert!(config.terminal.images);
         let config: Config = toml::from_str("[terminal]\nscrollback_lines = 100\n").unwrap();
         assert!(!config.terminal.images);
+    }
+
+    #[test]
+    fn notifications_are_on_for_unfocused_windows_by_default() {
+        assert_eq!(
+            NotificationsConfig::default().on,
+            NotificationPolicy::Unfocused
+        );
+        assert_eq!(
+            Config::default().notifications.on,
+            NotificationPolicy::Unfocused
+        );
+        // Absent table and absent key both fall back to the default.
+        let config: Config = toml::from_str("[terminal]\nimages = true\n").unwrap();
+        assert_eq!(config.notifications.on, NotificationPolicy::Unfocused);
+        let config: Config = toml::from_str("[notifications]\non = \"always\"\n").unwrap();
+        assert_eq!(config.notifications.on, NotificationPolicy::Always);
+        let config: Config = toml::from_str("[notifications]\non = \"never\"\n").unwrap();
+        assert_eq!(config.notifications.on, NotificationPolicy::Never);
+    }
+
+    #[test]
+    fn the_notification_policy_matrix_only_fires_when_it_should() {
+        let policies = [
+            NotificationPolicy::Unfocused,
+            NotificationPolicy::Always,
+            NotificationPolicy::Never,
+        ];
+        let expected = [
+            // (unfocused window, focused window) for each policy.
+            (true, false),
+            (true, true),
+            (false, false),
+        ];
+        for (policy, (when_unfocused, when_focused)) in policies.into_iter().zip(expected) {
+            assert_eq!(
+                should_notify(policy, false),
+                when_unfocused,
+                "{policy:?} with an unfocused window"
+            );
+            assert_eq!(
+                should_notify(policy, true),
+                when_focused,
+                "{policy:?} with a focused window"
+            );
+        }
     }
 
     #[test]

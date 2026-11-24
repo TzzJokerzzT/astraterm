@@ -64,6 +64,10 @@ pub enum TerminalEvent {
     ClipboardLoad,
     /// The bell rang.
     Bell,
+    /// The running program asked for a desktop notification (OSC 9 or
+    /// `OSC 777;notify;`). Both fields are raw terminal input; the application
+    /// sanitizes them before use.
+    Notification { title: Option<String>, body: String },
     /// Escape sequence with a direct reply for the PTY, already encoded.
     PtyReply(Vec<u8>),
     /// OSC 4/10/11 colour query: the app should resolve and reply.
@@ -235,10 +239,10 @@ impl TerminalEngine {
         engine
     }
 
-    /// Feeds raw PTY output through the image scanner and then the VT parser.
+    /// Feeds raw PTY output through the sequence scanner and then the VT parser.
     ///
-    /// A chunk boundary is meaningless here: the scanner keeps partial image
-    /// sequences across calls, and for any stream without image sequences the
+    /// A chunk boundary is meaningless here: the scanner keeps partial image and
+    /// notification sequences across calls, and for any stream without them the
     /// bytes reach the parser unchanged.
     pub fn process(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
@@ -251,10 +255,22 @@ impl TerminalEngine {
         if !output.passthrough.is_empty() {
             self.parser.advance(&mut self.term, &output.passthrough);
         }
+        // Notifications go straight to the event sink: unlike images they carry no
+        // payload for another subsystem, so `drain_events` is enough. Pushing them
+        // after the parser keeps the events of one chunk in stream order.
+        for notification in output.notifications {
+            self.listener.push(TerminalEvent::Notification {
+                title: notification.title,
+                body: notification.body,
+            });
+        }
         self.dirty = true;
     }
 
     /// Drains the image sequences captured since the last call.
+    ///
+    /// Notifications do not come through here: they are pushed as
+    /// [`TerminalEvent::Notification`] and drained by [`Self::drain_events`].
     ///
     /// Nothing is decoded or drawn yet (S5.1): the renderer slice turns these
     /// payloads into textures, and the anchoring model in [`crate::image`] places
@@ -756,6 +772,66 @@ mod color_reply_tests {
         assert!(
             background.starts_with("\x1b]11;rgb:1c1c/1f1f/2626"),
             "{background:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod notification_event_tests {
+    use super::{EngineOptions, TerminalEngine, TerminalEvent};
+
+    fn notifications(engine: &mut TerminalEngine) -> Vec<TerminalEvent> {
+        engine
+            .drain_events()
+            .into_iter()
+            .filter(|event| matches!(event, TerminalEvent::Notification { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn osc_9_and_osc_777_reach_the_application_as_events() {
+        let mut engine = TerminalEngine::new(EngineOptions {
+            cols: 40,
+            rows: 4,
+            ..Default::default()
+        });
+        engine.process(b"\x1b]9;first notification\x07");
+        engine.process(b"\x1b]777;notify;Build;done in 4s\x1b\\");
+
+        assert_eq!(
+            notifications(&mut engine),
+            vec![
+                TerminalEvent::Notification {
+                    title: None,
+                    body: "first notification".to_owned(),
+                },
+                TerminalEvent::Notification {
+                    title: Some("Build".to_owned()),
+                    body: "done in 4s".to_owned(),
+                },
+            ],
+            "both notification protocols must surface as events"
+        );
+        assert!(
+            notifications(&mut engine).is_empty(),
+            "drain_events must take the notifications with it"
+        );
+    }
+
+    #[test]
+    fn a_foreign_osc_raises_no_notification_event() {
+        let mut engine = TerminalEngine::new(EngineOptions {
+            cols: 40,
+            rows: 4,
+            ..Default::default()
+        });
+        engine.process(b"\x1b]777;other;payload\x07\x1b]0;title\x07");
+        assert!(notifications(&mut engine).is_empty());
+        let snapshot = engine.snapshot();
+        assert_eq!(
+            snapshot.lines[0].text(),
+            "",
+            "the foreign OSC must not print anything either"
         );
     }
 }

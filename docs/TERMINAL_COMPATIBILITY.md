@@ -26,6 +26,7 @@ names the test that covers it.
 | Cursor visibility and shape | `?25h/l`, DECSCUSR (`CSI n SP q`) | `cursor_visibility_and_shape_follow_decscusr` |
 | OSC title | OSC 0 and OSC 2, BEL and ST terminators | `osc_title_is_reported_as_an_event` |
 | Bell | BEL is reported as an event | `bell_is_reported` |
+| Notifications (OSC 9, OSC 777) | `OSC 9;<body>` and `OSC 777;notify;<title>;<body>`, BEL or ST terminated; consumed before the VT parser, reported as a session event, the text sanitized and the desktop notification gated by `[notifications] on` | `osc_9_and_osc_777_reach_the_application_as_events`, `osc_9_with_a_bel_terminator_is_captured`, `osc_9_with_an_st_terminator_is_captured`, `osc_777_notify_carries_a_title_and_a_body`, `osc_777_with_another_subcommand_is_ignored`, `a_notification_split_into_one_byte_chunks_is_reassembled`, `a_foreign_osc_next_to_a_notification_stays_byte_identical` (`crates/terminal/src/image.rs`); `a_notification_sequence_becomes_a_session_event` (`crates/session/src/manager.rs`); `the_notification_policy_matrix_only_fires_when_it_should` (`crates/config/src/schema.rs`); `control_characters_are_removed_and_whitespace_is_collapsed`, `both_parts_are_cut_to_their_character_budget`, `multibyte_characters_are_never_split` (`crates/platform/src/notifications.rs`) |
 | Scrollback | bounded history, scroll into history and back | `scrollback_holds_older_lines_and_scrolling_shows_them` |
 | Reflow on resize | wrapped text reflows, cursor anchored | `resize_reflows_wrapped_text` |
 | Wide characters | double-width cells with a spacer cell | `wide_characters_use_two_columns` |
@@ -36,6 +37,14 @@ names the test that covers it.
 | OSC 52 | disabled by default | `osc52_is_disabled_by_default` |
 | Images (opt-in) | kitty graphics, iTerm2 `OSC 1337;File=` and sixel captured before the VT parser; decode, anchoring and drawing behind `terminal.images` | `the_engine_keeps_the_text_and_hands_the_images_over`, `arbitrary_chunking_does_not_change_the_result` (`crates/terminal/tests/image_scanner.rs`); `png_over_max_dimension_is_rejected_before_expanding`, `kitty_chunked_transfer_is_unsupported`, `iterm2_inline_zero_is_unsupported` (`crates/terminal/src/image_decode.rs`); `a_captured_kitty_image_is_anchored_and_drawn`, `images_are_discarded_without_decoding_when_the_option_is_off`, `a_partially_visible_image_is_clipped_instead_of_overflowing` (`crates/app/src/ui.rs`) |
 | Malformed sequences | never corrupt the grid | `malformed_escape_sequences_do_not_corrupt_the_grid` |
+
+`OSC 9` and `OSC 777;notify;` are handled the same way as the image protocols:
+`alacritty_terminal`'s `vte` dispatches an unknown OSC body to `unhandled`, which
+only logs at debug level and offers no hook to the embedder, so the sequence has to
+be captured in front of the parser or it is lost silently. A `777` with any other
+subcommand is not a notification and stays byte-identical on its way to the
+parser. Nothing here claims the rest of the desktop-notification ecosystem
+(urgency, icons, actions); the emitted notification is plain title plus body.
 
 Supporting unit tests live in `crates/terminal/src/input.rs` (encoding),
 `crates/terminal/src/search.rs` (search) and `crates/terminal/src/engine.rs`
