@@ -65,7 +65,11 @@ pub fn notify_command(title: &str, body: &str) -> (&'static str, Vec<String>) {
         title => title,
     };
     let body = sanitize(body, MAX_BODY_CHARS);
-    let mut args = vec![format!("--app-name={APP_NAME}"), title];
+    // `--` ends option parsing: the title and body come from untrusted output, and
+    // without it a message starting with `-` is read as a notify-send flag such as
+    // `--urgency=critical` or `--wait`, spoofing the notification or parking a
+    // child process until the user closes it.
+    let mut args = vec![format!("--app-name={APP_NAME}"), "--".to_owned(), title];
     if !body.is_empty() {
         args.push(body);
     }
@@ -169,6 +173,25 @@ mod tests {
     }
 
     #[test]
+    fn an_option_like_title_is_still_a_message() {
+        // The title and body come from terminal output. Without the `--` terminator a
+        // message starting with `-` is parsed as a notify-send flag.
+        let (_, args) = notify_command("--urgency=critical", "--wait");
+        let terminator = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("the argv ends option parsing");
+        let message: Vec<&str> = args[terminator + 1..].iter().map(String::as_str).collect();
+        assert_eq!(message, ["--urgency=critical", "--wait"]);
+        assert!(
+            args[..terminator]
+                .iter()
+                .all(|arg| arg.starts_with("--app-name=")),
+            "only our own options may precede the terminator: {args:?}"
+        );
+    }
+
+    #[test]
     fn the_helper_is_invoked_with_an_argument_vector() {
         let (program, args) = notify_command("Build", "done in 4s");
         assert_eq!(program, "notify-send");
@@ -187,7 +210,7 @@ mod tests {
         // An empty summary falls back to the application name, and an empty body
         // is left out instead of being sent as one empty argument.
         let (_, args) = notify_command("", "   ");
-        assert_eq!(args, vec!["--app-name=AstraTerm", "AstraTerm"]);
+        assert_eq!(args, vec!["--app-name=AstraTerm", "--", "AstraTerm"]);
 
         // The sanitizer runs before the argv is built, so nothing control-ish
         // reaches the notification daemon.
