@@ -32,6 +32,8 @@ const TAB_STRIP_ROWS: f32 = 1.0;
 const CHROME_PADDING: u32 = 6;
 /// Width of the active-tab indicator, in device pixels.
 const TAB_INDICATOR_WIDTH: u32 = 3;
+/// How long a transient status message stays on screen.
+const STATUS_LIFETIME: Duration = Duration::from_secs(4);
 
 /// Blink period of the text cursor.
 pub const CURSOR_BLINK_PERIOD: Duration = Duration::from_millis(530);
@@ -911,7 +913,7 @@ impl WindowUi {
             }
         }
         if let Some((message, at)) = &self.status
-            && at.elapsed() < Duration::from_secs(4)
+            && at.elapsed() < STATUS_LIFETIME
         {
             parts.push(message.clone());
         }
@@ -1189,6 +1191,41 @@ impl WindowUi {
                 ));
             }
         }
+
+        self.compose_settings_feedback(scene);
+    }
+
+    /// Repaints the transient status message above the modal dim.
+    ///
+    /// The settings panel dims every pixel behind it, including the status bar,
+    /// so a save or reload notice written there would be unreadable while the
+    /// panel is open. Painting it again last keeps the confirmation legible in
+    /// the place where the user already looks for status.
+    fn compose_settings_feedback(&self, scene: &mut Scene) {
+        let Some((message, at)) = &self.status else {
+            return;
+        };
+        if at.elapsed() >= STATUS_LIFETIME {
+            return;
+        }
+        let height = self.status_bar_height();
+        let rect = Rect::new(
+            0,
+            self.size.height.saturating_sub(height) as i32,
+            self.size.width,
+            height,
+        );
+        scene.push_quad(rect, self.theme.palette.tab_bar_background, 1.0);
+        scene.push_text(TextItem::plain(
+            1_500_000,
+            (
+                (rect.x + 8) as f32,
+                (rect.y + CHROME_PADDING as i32 / 2) as f32,
+            ),
+            message.clone(),
+            paint::rgba(self.theme.palette.tab_inactive_foreground, 1.0),
+            rect,
+        ));
     }
 
     /// Whether the cursor should blink right now (used to schedule wakeups).

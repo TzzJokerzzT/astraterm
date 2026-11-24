@@ -256,6 +256,15 @@ The policy is read per notification, so it applies live. It also gates the windo
 attention hint (the compositor's "urgent" mark): with `never` nothing is raised,
 not even the hint.
 
+AstraTerm's own save and reload notices use the same policy. A successful panel
+save reports `settings saved` (or `theme saved` from **Save theme as…**), and a
+file reloaded from disk reports `config reloaded`; while the settings panel is
+open the notice is painted above the dimmed status bar, which the panel would
+otherwise cover. A failed save reports the real error (`could not save settings:
+…`) instead of a generic message. When the window does not have focus the notice
+is also filed as a desktop notification, and an identical notice from one burst
+of file events is shown and notified once.
+
 The text is untrusted terminal output. Control characters are removed, whitespace
 is collapsed, the title is cut to 120 characters and the body to 1024, and the
 result is passed to `notify-send` as an argument vector — never through a shell.
@@ -404,6 +413,10 @@ with the dotted path and the text "unknown setting; it has no effect".
   parse error, and a deleted file resets to defaults.
 - **No silent overwrite**: the panel refuses to save when the file changed since it
   was last loaded and tells you to reload first.
+- **Feedback**: every save and reload reports its result in the status bar (a
+  failure names the real error), and with the window unfocused the same notice
+  becomes a desktop notification under `notifications.on`. An identical notice
+  repeated by a burst of file events is shown once.
 
 ## What applies live
 

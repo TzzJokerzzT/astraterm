@@ -62,6 +62,52 @@ fn notification_due(last: Option<&Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.duration_since(*last) >= NOTIFICATION_MIN_INTERVAL)
 }
 
+/// Minimum gap before an identical save or reload notice is repeated.
+///
+/// The watcher already debounces file events, but one burst can still reach the
+/// event loop more than once. Repeating an identical notice would repaint the
+/// window and file another desktop notification for the same event.
+const FEEDBACK_MIN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Whether the notice `message` may be shown again at `now`.
+///
+/// A different message always passes: only an identical repeat is coalesced.
+fn feedback_due(last: Option<&(String, Instant)>, message: &str, now: Instant) -> bool {
+    match last {
+        Some((previous, at)) if previous == message => {
+            now.duration_since(*at) >= FEEDBACK_MIN_INTERVAL
+        }
+        _ => true,
+    }
+}
+
+/// Text for one settings save: what was written, or the real error.
+///
+/// The error is the underlying failure (validation, the external-change guard,
+/// the writer, the theme file), so a failed save says why instead of a generic
+/// "could not save".
+fn save_feedback(what: &str, result: Result<(), String>) -> String {
+    match result {
+        Ok(()) => format!("{what} saved"),
+        Err(error) => format!("could not save {what}: {error}"),
+    }
+}
+
+/// Text for one configuration reload; `None` when the file did not change.
+///
+/// An invalid edit keeps its previous wording: the parse error is what tells the
+/// user why the old configuration is still in force.
+fn reload_feedback(outcome: &ReloadOutcome) -> Option<String> {
+    match outcome {
+        ReloadOutcome::Unchanged => None,
+        ReloadOutcome::Reloaded(_) | ReloadOutcome::Reset(_) => Some("config reloaded".to_owned()),
+        ReloadOutcome::Invalid(issues) => Some(match issues.first() {
+            Some(issue) => format!("config error: {}", issue.describe()),
+            None => "config error".to_owned(),
+        }),
+    }
+}
+
 /// Events the application sends itself from other threads.
 #[derive(Clone, Debug)]
 pub enum UserEvent {
@@ -94,6 +140,8 @@ pub struct Application {
     /// Last delivered notification per session, so a flood of OSC 9 costs one
     /// comparison each instead of a redraw and a process per sequence.
     last_notification: BTreeMap<SessionId, Instant>,
+    /// Last save or reload notice, so a burst of identical ones is shown once.
+    last_feedback: Option<(String, Instant)>,
     /// Desktop notification backend. Degrades silently when `notify-send` is absent.
     notifications: Notifications,
     proxy: EventLoopProxy<UserEvent>,
@@ -185,6 +233,7 @@ impl Application {
             focused: None,
             focused_windows: BTreeSet::new(),
             last_notification: BTreeMap::new(),
+            last_feedback: None,
             notifications: Notifications::new(),
             proxy,
             cli,
@@ -607,6 +656,62 @@ impl Application {
             }
         });
         self.notifications.send(&title, &body);
+    }
+
+    /// Shows a transient notice in `window_id`, dropping an identical repeat
+    /// inside [`FEEDBACK_MIN_INTERVAL`].
+    ///
+    /// Returns whether the notice was shown, so the caller only files a desktop
+    /// notification for a notice that actually happened.
+    fn show_feedback(&mut self, window_id: Option<WinitWindowId>, message: &str) -> bool {
+        let now = Instant::now();
+        if !feedback_due(self.last_feedback.as_ref(), message, now) {
+            return false;
+        }
+        self.last_feedback = Some((message.to_owned(), now));
+        if let Some(window_id) = window_id {
+            self.with_window(window_id, |ui| ui.set_status(message));
+        }
+        true
+    }
+
+    /// Shows a save or reload notice and, under the `[notifications] on` policy,
+    /// files one desktop notification when the window does not have focus.
+    ///
+    /// The status line is the in-app feedback; the desktop notification is for a
+    /// window the user is not looking at, which is the usual case for a reload
+    /// triggered by an external edit.
+    fn announce_feedback(
+        &mut self,
+        window_id: Option<WinitWindowId>,
+        title: &str,
+        message: String,
+    ) {
+        if !self.show_feedback(window_id, &message) {
+            return;
+        }
+        let window_focused = window_id.is_some_and(|id| self.focused_windows.contains(&id));
+        if !should_notify(self.config.config().notifications.on, window_focused) {
+            return;
+        }
+        if let Some(ui) = window_id.and_then(|id| self.windows.get(&id)) {
+            ui.window
+                .request_user_attention(Some(UserAttentionType::Informational));
+        }
+        self.notifications.send(title, &message);
+    }
+
+    /// Shows a settings-panel message in the panel footer and announces it.
+    ///
+    /// The footer keeps the text for as long as the panel is open, while the
+    /// status line expires; a failed save keeps both.
+    fn panel_feedback(&mut self, window_id: WinitWindowId, message: String) {
+        self.with_window(window_id, |ui| {
+            if let Overlay::Settings(panel) = &mut ui.overlay {
+                panel.set_message(message.clone());
+            }
+        });
+        self.announce_feedback(Some(window_id), "AstraTerm", message);
     }
 
     /// First window whose panes are bound to `session`, if any.
@@ -1728,7 +1833,8 @@ impl Application {
     }
 
     fn reload_config(&mut self) {
-        match self.config.reload_if_changed() {
+        let outcome = self.config.reload_if_changed();
+        match &outcome {
             ReloadOutcome::Unchanged => {}
             ReloadOutcome::Reloaded(_) | ReloadOutcome::Reset(_) => {
                 tracing::info!("configuration reloaded from disk");
@@ -1740,12 +1846,19 @@ impl Application {
                     .map(|issue| issue.describe())
                     .unwrap_or_default();
                 tracing::warn!(%message, "external configuration edit is invalid; keeping the previous configuration");
-                if let Some(window_id) = self.focused {
-                    self.with_window(window_id, |ui| {
-                        ui.set_status(format!("config error: {message}"))
-                    });
-                }
             }
+        }
+
+        let Some(message) = reload_feedback(&outcome) else {
+            return;
+        };
+        // An invalid edit keeps its previous behaviour: it is reported in the
+        // window the user works in and never raises the desktop, because nothing
+        // changed and the notice is a correction, not an interruption.
+        if matches!(&outcome, ReloadOutcome::Invalid(_)) {
+            self.show_feedback(self.focused, &message);
+        } else {
+            self.announce_feedback(self.focused, "AstraTerm", message);
         }
     }
 
@@ -1894,7 +2007,7 @@ impl Application {
             PanelAction::SaveTheme { name, palette } => {
                 let dir = self.config.themes_dir().to_path_buf();
                 match astraterm_config::save_theme(&dir, &name, *palette) {
-                    Ok((stem, path)) => {
+                    Ok((stem, _)) => {
                         self.config.refresh_themes();
                         match self
                             .config
@@ -1905,32 +2018,27 @@ impl Application {
                                 let themes = self.config.themes().to_vec();
                                 let issues = self.config.issues().to_vec();
                                 let config = self.config.config().clone();
-                                let message = format!("saved {}", path.display());
                                 self.with_window(window_id, |ui| {
                                     if let Overlay::Settings(panel) = &mut ui.overlay {
                                         panel.set_themes(themes);
                                         panel.on_saved(&config, issues);
-                                        panel.set_message(message);
                                     }
                                 });
+                                self.announce_feedback(
+                                    Some(window_id),
+                                    "AstraTerm",
+                                    save_feedback("theme", Ok(())),
+                                );
                             }
                             Err(error) => {
                                 let message = format!("theme saved but not selected: {error}");
-                                self.with_window(window_id, |ui| {
-                                    if let Overlay::Settings(panel) = &mut ui.overlay {
-                                        panel.set_message(message);
-                                    }
-                                });
+                                self.panel_feedback(window_id, message);
                             }
                         }
                     }
                     Err(error) => {
-                        let message = error.to_string();
-                        self.with_window(window_id, |ui| {
-                            if let Overlay::Settings(panel) = &mut ui.overlay {
-                                panel.set_message(message);
-                            }
-                        });
+                        let message = save_feedback("theme", Err(error.to_string()));
+                        self.panel_feedback(window_id, message);
                     }
                 }
             }
@@ -1951,34 +2059,34 @@ impl Application {
                         }
                     });
                     self.apply_config();
+                    self.announce_feedback(
+                        Some(window_id),
+                        "AstraTerm",
+                        save_feedback("settings", Ok(())),
+                    );
                 }
                 Err(SaveError::Invalid(issues)) => {
-                    let message = issues
+                    let detail = issues
                         .first()
                         .map(|issue| issue.describe())
                         .unwrap_or_default();
+                    let message = save_feedback("settings", Err(detail));
                     self.with_window(window_id, |ui| {
                         if let Overlay::Settings(panel) = &mut ui.overlay {
-                            panel.set_message(format!("invalid setting: {message}"));
+                            panel.set_message(message.clone());
                             panel.set_issues(issues);
                         }
                     });
+                    self.announce_feedback(Some(window_id), "AstraTerm", message);
                 }
                 Err(SaveError::ExternalChange) => {
-                    self.with_window(window_id, |ui| {
-                        if let Overlay::Settings(panel) = &mut ui.overlay {
-                            panel.set_message(
-                                "the config file changed on disk; reload before saving",
-                            );
-                        }
-                    });
+                    let message =
+                        save_feedback("settings", Err(SaveError::ExternalChange.to_string()));
+                    self.panel_feedback(window_id, message);
                 }
                 Err(SaveError::Write(error)) => {
-                    self.with_window(window_id, |ui| {
-                        if let Overlay::Settings(panel) = &mut ui.overlay {
-                            panel.set_message(format!("could not save: {error}"));
-                        }
-                    });
+                    let message = save_feedback("settings", Err(error.to_string()));
+                    self.panel_feedback(window_id, message);
                 }
             },
         }
@@ -2986,6 +3094,81 @@ mod notification_gate_tests {
         assert!(notification_due(
             Some(&(now - NOTIFICATION_MIN_INTERVAL)),
             now
+        ));
+    }
+}
+
+#[cfg(test)]
+mod feedback_tests {
+    use std::time::Instant;
+
+    use astraterm_config::ConfigIssue;
+    use astraterm_config::service::ReloadOutcome;
+
+    use super::{FEEDBACK_MIN_INTERVAL, feedback_due, reload_feedback, save_feedback};
+
+    #[test]
+    fn a_successful_save_names_what_was_written() {
+        assert_eq!(save_feedback("settings", Ok(())), "settings saved");
+        assert_eq!(save_feedback("theme", Ok(())), "theme saved");
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_real_error() {
+        assert_eq!(
+            save_feedback("settings", Err("permission denied".to_owned())),
+            "could not save settings: permission denied"
+        );
+    }
+
+    #[test]
+    fn a_valid_reload_says_so_and_an_unchanged_file_stays_silent() {
+        assert_eq!(
+            reload_feedback(&ReloadOutcome::Reloaded(Box::default())),
+            Some("config reloaded".to_owned())
+        );
+        assert_eq!(
+            reload_feedback(&ReloadOutcome::Reset(Box::default())),
+            Some("config reloaded".to_owned())
+        );
+        assert_eq!(reload_feedback(&ReloadOutcome::Unchanged), None);
+    }
+
+    #[test]
+    fn an_invalid_reload_keeps_the_parse_error() {
+        let issue = ConfigIssue::error("terminal.font_size", "must be between 6 and 72");
+        assert_eq!(
+            reload_feedback(&ReloadOutcome::Invalid(vec![issue])),
+            Some("config error: error: terminal.font_size: must be between 6 and 72".to_owned())
+        );
+        assert_eq!(
+            reload_feedback(&ReloadOutcome::Invalid(Vec::new())),
+            Some("config error".to_owned()),
+            "an invalid file without issues still reports the failure"
+        );
+    }
+
+    #[test]
+    fn an_identical_notice_in_a_burst_is_shown_once() {
+        let now = Instant::now();
+        assert!(feedback_due(None, "config reloaded", now));
+        assert!(!feedback_due(
+            Some(&("config reloaded".to_owned(), now)),
+            "config reloaded",
+            now
+        ));
+        assert!(
+            feedback_due(
+                Some(&("settings saved".to_owned(), now)),
+                "config reloaded",
+                now
+            ),
+            "a different notice is never coalesced"
+        );
+        assert!(feedback_due(
+            Some(&("config reloaded".to_owned(), now)),
+            "config reloaded",
+            now + FEEDBACK_MIN_INTERVAL
         ));
     }
 }
