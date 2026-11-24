@@ -260,15 +260,23 @@ check_requested_version() {
         fi
     fi
 
-    # Being at the tag is not the whole promise: uncommitted edits would be built
-    # and installed while the script called the result that release.
+    # Being at the tag is not the whole promise: uncommitted or untracked files would
+    # still be compiled, and an untracked Cargo configuration or build script changes
+    # the binary as effectively as an edit does. A status that cannot be read is not
+    # evidence of a clean tree either.
     local dirty
-    dirty=$(git -C "$root_dir" status --porcelain --untracked-files=no 2>/dev/null || true)
+    if ! dirty=$(git -C "$root_dir" status --porcelain 2>&1); then
+        fail "$EXIT_VERSION" \
+            "git status failed, so the working tree cannot be shown to be clean." \
+            "$dirty" \
+            "Repair the repository (a corrupt index, for example) and re-run."
+    fi
     if [ -n "$dirty" ]; then
         fail "$EXIT_VERSION" \
-            "$requested_version is checked out, but tracked files are modified." \
+            "$requested_version is checked out, but the working tree has changes:" \
+            "$dirty" \
             "Building now would install code that is not that release. Commit, stash or" \
-            "discard the changes and re-run:" \
+            "remove them and re-run:" \
             "  git -C $root_dir status --short"
     fi
 
