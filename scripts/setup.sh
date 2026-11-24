@@ -19,23 +19,29 @@
 # running it again on a prepared machine changes nothing.
 #
 # Usage:
-#   ./scripts/setup.sh [--dry-run] [--yes] [--install] [--no-build]
+#   ./scripts/setup.sh [--dry-run] [--yes] [--install] [--no-build] [--version <tag>]
 #
-#   --dry-run    print every command that would change the system or the tree
-#                and execute none of them. Read-only probes (`command -v`,
-#                `cargo --version`, `fc-list`) still run so that the plan
-#                matches this machine; they change nothing.
-#   --yes        do not ask for confirmation before installing packages
-#                (intended for scripted setups; still asks sudo for the password)
-#   --install    after a successful build, install the binary for the current
-#                user with packaging/linux/install.sh
-#   --no-build   skip `cargo build --release --locked`
+#   --dry-run        print every command that would change the system or the
+#                    tree and execute none of them. Read-only probes (`command
+#                    -v`, `cargo --version`, `fc-list`) still run so that the
+#                    plan matches this machine; they change nothing.
+#   --yes            do not ask for confirmation before installing packages
+#                    (intended for scripted setups; still asks sudo for the
+#                    password)
+#   --install        after a successful build, install the binary for the
+#                    current user with packaging/linux/install.sh
+#   --no-build       skip `cargo build --release --locked`
+#   --version <tag>  build a specific release (`v1.0.0` or `1.0.0`). The script
+#                    verifies that HEAD is exactly that tag and refuses
+#                    otherwise; it never runs `git checkout`/`git switch` or
+#                    fetches tags in --dry-run.
 #
 # Exit codes:
 #   0  success, nothing left to do (declining the package installation is not
 #      an error: the step is skipped and the build still runs)
 #   2  usage error or wrong user (root)
 #   3  Rust toolchain missing or older than 1.85
+#   4  the requested `--version` tag is missing, or HEAD is not at that tag
 #   other  the exit status of the command that failed (cargo, pacman, ...)
 #
 # See docs/INSTALL.md for the requirements per distribution.
@@ -48,11 +54,14 @@ readonly DEFAULT_FONT_FAMILY="JetBrainsMono Nerd Font"
 readonly EXIT_OK=0
 readonly EXIT_USAGE=2
 readonly EXIT_TOOLCHAIN=3
+readonly EXIT_VERSION=4
 
 dry_run=0
 assume_yes=0
 install_binary=0
 do_build=1
+# Canonical `vX.Y.Z` tag requested with --version; empty means "build the tree".
+requested_version=""
 
 root_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
@@ -63,21 +72,25 @@ usage() {
 setup.sh - build AstraTerm from a fresh clone and install its dependencies
 
 Usage:
-  ./scripts/setup.sh [--dry-run] [--yes] [--install] [--no-build]
+  ./scripts/setup.sh [--dry-run] [--yes] [--install] [--no-build] [--version <tag>]
 
 Options:
-  --dry-run    print every command that would change the system or the tree and
-               execute none of them. Read-only probes (command -v, cargo --version,
-               fc-list) still run so the plan matches this machine.
-  --yes, -y    do not ask for confirmation before installing packages
-  --install    after a successful build, install the binary for the current user
-               with packaging/linux/install.sh
-  --no-build   skip the release build
-  -h, --help   show this help
+  --dry-run        print every command that would change the system or the tree and
+                   execute none of them. Read-only probes (command -v, cargo
+                   --version, fc-list) still run so the plan matches this machine.
+  --yes, -y        do not ask for confirmation before installing packages
+  --install        after a successful build, install the binary for the current user
+                   with packaging/linux/install.sh
+  --no-build       skip the release build
+  --version <tag>  build a specific release (v1.0.0, or 1.0.0). The tag must exist
+                   and HEAD must be exactly at it; the script stops otherwise and
+                   never runs git checkout/git switch itself.
+  -h, --help       show this help
 
 Exit codes: 0 success, 2 usage error or root, 3 Rust toolchain missing or
-            older than 1.85; a failing command exits with its own status.
-            Declining the package installation is not a failure.
+            older than 1.85, 4 the --version tag is missing or HEAD is not at
+            it; a failing command exits with its own status. Declining the
+            package installation is not a failure.
 
 Documentation: docs/INSTALL.md
 EOF
@@ -148,6 +161,28 @@ confirm() {
     esac
 }
 
+set_requested_version() {
+    local raw=${1-} tag
+    if [ -z "$raw" ]; then
+        fail "$EXIT_USAGE" \
+            "--version needs a tag: --version v1.0.0" \
+            "Run ./scripts/setup.sh --help for the accepted forms."
+    fi
+    case $raw in
+    v*) tag=$raw ;;
+    *) tag="v$raw" ;;
+    esac
+    # Releases are tagged vX.Y.Z, so everything downstream compares the
+    # canonical form and `--version 1.0.0` means the same as `--version v1.0.0`.
+    if [[ ! $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        fail "$EXIT_USAGE" \
+            "invalid tag for --version: '$raw'" \
+            "Releases are tagged vX.Y.Z (for example v1.0.0). The leading 'v' is" \
+            "optional on the command line, but the tag itself is compared as vX.Y.Z."
+    fi
+    requested_version=$tag
+}
+
 parse_args() {
     while [ "$#" -gt 0 ]; do
         case $1 in
@@ -155,11 +190,99 @@ parse_args() {
         --yes | -y) assume_yes=1 ;;
         --install) install_binary=1 ;;
         --no-build) do_build=0 ;;
+        --version)
+            shift
+            set_requested_version "${1-}"
+            ;;
+        --version=*) set_requested_version "${1#--version=}" ;;
         -h | --help) usage; exit "$EXIT_OK" ;;
         *) fail "$EXIT_USAGE" "unknown argument: $1 (try --help)" ;;
         esac
         shift
     done
+}
+
+check_requested_version() {
+    if [ -z "$requested_version" ]; then
+        return 0
+    fi
+
+    step "Requested version: $requested_version"
+
+    if ! command -v git >/dev/null 2>&1; then
+        fail "$EXIT_VERSION" \
+            "--version needs git to verify the tag, and git was not found." \
+            "Install git (it is in the package list above) and re-run this script."
+    fi
+
+    if ! git -C "$root_dir" rev-parse --git-dir >/dev/null 2>&1; then
+        fail "$EXIT_VERSION" \
+            "$root_dir is not a git checkout." \
+            "--version $requested_version installs a tagged release, and without a git" \
+            "checkout there is no tag to verify. Clone the repository instead of" \
+            "unpacking a tarball:" \
+            "  git clone <repository> astraterm"
+    fi
+
+    if ! git -C "$root_dir" rev-parse -q --verify "refs/tags/$requested_version" >/dev/null 2>&1; then
+        info "the tag $requested_version is not in this clone"
+        if [ "$dry_run" -eq 1 ]; then
+            info "would run: git fetch --tags"
+            info "a real run asks before that (it uses the network) and verifies again afterwards"
+            fail "$EXIT_VERSION" \
+                "cannot verify $requested_version: the tag is missing locally and" \
+                "--dry-run never touches the network." \
+                "Fetch the tags yourself, or re-run without --dry-run to be offered" \
+                "\`git fetch --tags\`:" \
+                "  git fetch --tags"
+        fi
+        if confirm "fetch tags from the remote? (uses the network)"; then
+            if ! run git -C "$root_dir" fetch --tags; then
+                fail "$EXIT_VERSION" \
+                    "\`git fetch --tags\` failed, so $requested_version cannot be verified." \
+                    "Fix access to the remote (or fetch the tags yourself) and re-run."
+            fi
+        else
+            info "skipped \`git fetch --tags\`"
+        fi
+        if ! git -C "$root_dir" rev-parse -q --verify "refs/tags/$requested_version" >/dev/null 2>&1; then
+            fail "$EXIT_VERSION" \
+                "tag $requested_version does not exist." \
+                "It is not in this clone, and fetching the tags did not bring it either." \
+                "Check the version you asked for against the available tags:" \
+                "  git tag -l 'v*'"
+        fi
+    fi
+
+    local head_tag head_commit tag_commit
+    head_tag=$(git -C "$root_dir" describe --tags --exact-match HEAD 2>/dev/null || true)
+    if [ "$head_tag" = "$requested_version" ]; then
+        ok "the working tree is exactly $requested_version"
+        return 0
+    fi
+    # `git describe` returns one tag arbitrarily when a commit carries several,
+    # so a tag that points at HEAD still satisfies the request.
+    head_commit=$(git -C "$root_dir" rev-parse --verify HEAD)
+    tag_commit=$(git -C "$root_dir" rev-parse --verify "refs/tags/$requested_version^{commit}")
+    if [ "$tag_commit" = "$head_commit" ]; then
+        ok "$requested_version points at HEAD (git describe reported ${head_tag:-no exact tag})"
+        return 0
+    fi
+
+    local head_short description
+    head_short=$(git -C "$root_dir" rev-parse --short HEAD)
+    if [ -n "$head_tag" ]; then
+        description="HEAD is $head_short, tagged $head_tag"
+    else
+        description="HEAD is $head_short, which is not an exact tag"
+    fi
+    fail "$EXIT_VERSION" \
+        "this checkout is not at $requested_version: $description." \
+        "Building here would install a binary that is not $requested_version, so the" \
+        "script stops. It never changes your checkout; moving the tree is your call." \
+        "Run these two commands yourself:" \
+        "  git checkout $requested_version" \
+        "  ./scripts/setup.sh --version $requested_version --install"
 }
 
 require_normal_user() {
@@ -455,6 +578,10 @@ main() {
         info "dry run: nothing that changes the system or the tree is executed"
     fi
 
+    # Before any package or build step: a wrong version must not install
+    # anything, and this is also where a `--version` request is verified.
+    check_requested_version
+
     manager=$(detect_manager || true)
     if [ -n "$manager" ]; then
         install_system_packages "$manager" "$distro_id"
@@ -486,7 +613,11 @@ main() {
     if [ "$dry_run" -eq 1 ]; then
         info "dry run finished: no package was installed, nothing was built or copied"
     elif [ "$do_build" -eq 1 ] && [ "$install_binary" -eq 1 ]; then
-        info "astraterm is installed; run \`astraterm\` or pick it from the application menu"
+        if [ -n "$requested_version" ]; then
+            info "astraterm $requested_version is installed; run \`astraterm\` or pick it from the application menu"
+        else
+            info "astraterm is installed; run \`astraterm\` or pick it from the application menu"
+        fi
     elif [ "$do_build" -eq 1 ]; then
         info "run ./target/release/astraterm, or re-run this script with --install"
     else

@@ -38,6 +38,10 @@ In order, on every run:
 6. **Install (optional).** With `--install`, runs
    [packaging/linux/install.sh](#installing-for-the-current-user).
 
+With `--version <tag>` a version check runs before step 1 and stops the script
+if the checkout is not at that release; see
+[Installing a specific release](#installing-a-specific-release---version).
+
 ### Flags
 
 | Flag | Effect |
@@ -47,6 +51,7 @@ In order, on every run:
 | `--yes`, `-y` | Do not ask for confirmation before installing packages (`sudo` still asks for your password) |
 | `--install` | After a successful build, install the binary, desktop entry and icons for the current user |
 | `--no-build` | Skip `cargo build --release --locked` |
+| `--version <tag>` | Build a specific release (`v1.0.0`, or `1.0.0`). The tag must exist and `HEAD` must be exactly at it; the script stops otherwise and never changes your checkout |
 | `--help` | Show the help text |
 
 ### `--dry-run` semantics
@@ -57,13 +62,55 @@ nothing: no packages, no build, no files copied. Read-only probes still run —
 the printed plan matches the machine you are on. Use it to review the exact
 `pacman`/`apt-get`/`dnf` command before letting the script touch the system.
 
+With `--version`, `--dry-run` never uses the network: if the tag is missing it
+prints `would run: git fetch --tags` and exits with code `4`, because a real run
+would first ask for confirmation and then fetch. It also reports when the tag
+exists but `HEAD` is somewhere else, without moving anything.
+
+### Installing a specific release (`--version`)
+
+Releases are tagged `vX.Y.Z`. `--version` accepts the tag with or without the
+leading `v` (`--version v1.0.0` and `--version 1.0.0` are the same request) and
+compares against the canonical `vX.Y.Z` form. Anything else — `--version`
+without a value, or a value that is not `X.Y.Z` — is a usage error with code
+`2`.
+
+The script **verifies, it does not mutate your checkout**. It never runs
+`git checkout`, `git switch` or anything else that moves the working tree,
+because moving the tree (and the branch you are on) is the user's decision, not
+a side effect of an installer. What it does instead:
+
+1. Confirms it runs inside a git checkout (`git rev-parse --git-dir`); a tarball
+   without `.git` is rejected.
+2. Checks that the tag exists locally. If it does not, a real run offers
+   `git fetch --tags` (that is network, and it is asked for explicitly);
+   `--dry-run` only prints it. If the tag still does not exist, the script
+   exits with code `4`.
+3. Requires `git describe --tags --exact-match HEAD` to report exactly that tag
+   (or, equivalently, that the tag points at `HEAD`). This is what guarantees
+   that the binary built and installed here is the release you asked for. If it
+   does not match, the script exits with code `4`, names the version that *is*
+   in the tree, and prints the command you have to run yourself.
+4. Only then continues with the normal flow (checks, build, `--install`).
+
+The intended flow, with the checkout step owned by you:
+
+```sh
+cd astraterm
+git checkout v1.0.0
+./scripts/setup.sh --version v1.0.0 --install
+```
+
+Preview it first with `--dry-run --version v1.0.0`, which uses no network.
+
 ### Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | Success; nothing left to do. Declining the package installation is not a failure: the step is skipped and the build still runs |
-| `2` | Usage error, unknown flag, or the script was started as root |
+| `2` | Usage error, unknown flag, `--version` without a value, or the script was started as root |
 | `3` | Rust toolchain missing, or older than 1.85 |
+| `4` | The `--version` tag does not exist, the checkout is not a git checkout, or `HEAD` is not at that tag |
 | other | The exit status of the command that failed (`cargo`, `pacman`, `apt-get`, `dnf`) |
 
 The script refuses to run as root: compile as your own user, and let it ask
@@ -188,5 +235,8 @@ in the real checksums before publishing a package.
 | `failed to create surface` / no adapter | No Vulkan ICD or OpenGL driver for this GPU; install `mesa` (or the vendor driver) and check `vulkaninfo` |
 | Clipboard does nothing on Wayland | `wl-clipboard` is missing, or the app is not running under Wayland |
 | No save/reload notification | `libnotify` / `notify-send` is missing |
+| `error: the tag vX.Y.Z is not in this clone` | The clone predates the tag: `git fetch --tags`, or run without `--version` to build the tree as it is |
+| `error: this checkout is not at vX.Y.Z` | `HEAD` is elsewhere: `git checkout vX.Y.Z` yourself — the script deliberately does not do it for you |
+| `error: … is not a git checkout` | You are in an unpacked tarball, so no tag can be verified; clone the repository |
 
 Diagnostics live behind `--debug` (`RUST_LOG=astraterm=debug`).
