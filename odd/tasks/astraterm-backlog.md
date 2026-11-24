@@ -9,8 +9,14 @@ con specs `S#` y slices, como se hizo con `astraterm-terminal-capabilities.md`.
 
 ## Estado actual
 
-Rama `feat/terminal-capabilities`. 465 tests, `cargo clippy --workspace --all-targets` sin
-advertencias, `cargo fmt --check` limpio.
+Rama `main`. **489 tests**, `cargo clippy --workspace --all-targets` sin advertencias,
+`cargo fmt --check` limpio.
+
+Versión publicada: **1.0.0** — tag `v1.0.0` (que apunta al commit `3806289`) y release
+en https://github.com/TzzJokerzzT/astraterm/releases/tag/v1.0.0 con las notas del
+`CHANGELOG.md`. La instalación por versión está verificada:
+`./scripts/setup.sh --version v1.0.0` desde un checkout del tag devuelve
+`ok: the working tree is exactly v1.0.0 and clean`.
 
 Ya implementado y cerrado:
 
@@ -27,9 +33,16 @@ Ya implementado y cerrado:
 | AltGr como composición + IME commit                  | `c6848fa`                       |
 | Teclas funcionales con forma legacy bajo flags Kitty | `7c3c56b`                       |
 | Notificaciones OSC 9 / 777 + urgency hint            | `3ecf4b6`, `1a3db6d`, `63c2d7e` |
+| Terminal flotante con ocultar/mostrar                | `894520b`                       |
+| Flotante en su propia capa de render                 | `793f9dc`                       |
+| Retroalimentación al guardar y recargar config       | `e015b3c`                       |
+| Versión 1.0.0, `scripts/setup.sh` y `docs/INSTALL.md` | `f0c3502`                      |
+| `--version <tag>` en el script de instalación        | `272b3d6`                       |
+| Política de tags y releases                          | `215bbf2`                       |
+| Guardas de `--version`: árbol sucio y repo contenedor | `2c18d32`, `3806289`            |
 
-De la lista de mejoras propuesta, **solo las notificaciones OSC 9/777 están hechas**.
-Todo lo de abajo sigue pendiente.
+De la lista de mejoras B1–B18 de este documento, **solo las notificaciones OSC 9/777
+están hechas**. Todo lo demás sigue pendiente.
 
 ---
 
@@ -40,8 +53,9 @@ La versión vive en `[workspace.package] version` (`Cargo.toml`) y la reporta
 `CARGO_PKG_VERSION` y contra la salida exacta del CLI, así que un bump a medias falla la
 suite en lugar de publicar un número que no coincide con el binario.
 
-**Estado**: `1.0.0` está en el código, pero **no tiene tag ni release publicada**. La
-primera tarea de este bloque es justamente esa.
+**Estado**: **publicada**. Tag anotado `v1.0.0` sobre el commit `3806289`, release
+`AstraTerm 1.0.0` con el cuerpo extraído de la entrada `[1.0.0]` del `CHANGELOG.md`.
+Nada de este bloque queda pendiente salvo endurecer los mensajes (ver B19).
 
 ### Regla, a partir de 1.0.0
 
@@ -89,10 +103,10 @@ En este orden, siempre:
 8. Publicar la release con el tag `vX.Y.Z` y con las notas copiadas de la entrada del
    `CHANGELOG.md` para esa versión: esas notas son el cuerpo de la release, no un
    resumen nuevo.
-9. Probar el camino del usuario en una copia limpia:
-   `git checkout vX.Y.Z && ./scripts/setup.sh --version vX.Y.Z --install`. Desde otra
-   rama, `--version vX.Y.Z` debe negarse con código `4` y decir qué versión sí está en
-   el árbol, porque el script verifica y no mueve el checkout.
+9. Probar el camino del usuario **desde el tag**, no desde `main`. Con la rama por
+delante del tag, `--version vX.Y.Z` se niega con código `4` y eso es correcto: el script
+verifica y no mueve el checkout. El camino limpio es un worktree temporal:
+   `git worktree add /tmp/astraterm-vX vX.Y.Z && cd /tmp/astraterm-vX && ./scripts/setup.sh --version vX.Y.Z --install`, y luego `git worktree remove /tmp/astraterm-vX`.
 
 ---
 
@@ -281,19 +295,50 @@ En este orden, siempre:
 - **Coste**: S/M. Toca seguridad: requiere decisión explícita de UX y entrada en
   `docs/SECURITY.md`.
 
+### B19. Endurecer `--version` en `scripts/setup.sh`
+
+- **Por qué**: la review aprobada de 1.0.0 dejó siete avisos no bloqueantes, y el uso real
+del script expuso uno más. Ninguno rompe la garantía, pero todos afectan a la experiencia
+o al diagnóstico.
+- **Qué**, por orden de valor:
+  1. **El mensaje de HEAD fuera del tag no enseña**: con `main` un commit por delante del
+tag dice `HEAD is f7e9f54, which is not an exact tag`. Debería decir cuántos commits hay
+de distancia, que el tag sigue siendo válido, y ofrecer el worktree o el `git checkout`.
+     Este es el que apareció en uso real.
+  2. **El orden de las comprobaciones confunde**: la guarda de árbol sucio corre antes de
+     comparar HEAD con el tag, así que con HEAD en otro commit y archivos modificados el
+     mensaje afirma que el tag pedido está en el árbol, y manda a hacer `stash` en vez de
+     `checkout`.
+  3. **`docs/INSTALL.md` no menciona el requisito de árbol limpio**, así que siguiendo los
+     pasos documentados se puede chocar con el código 4 sin entender por qué.
+  4. **El mensaje del fetch declinado miente**: dice que traer los tags no funcionó cuando
+     en realidad el usuario dijo que no.
+  5. **Sin tests automatizados** para la ruta `--version`: ni el tag ausente, ni el fetch
+     declinado o fallido, ni el árbol sucio, ni el HEAD que no coincide. Todo verificado a
+     mano con tags temporales.
+- **Dónde**: `scripts/setup.sh` (`check_requested_version`), `docs/INSTALL.md`.
+- **Versión**: PATCH (`1.0.1`) — corrige mensajes y orden, no cambia contratos.
+- **Verificación**: matriz manual con tag temporal (HEAD en el tag, HEAD después del tag,
+  archivo modificado, archivo sin trackear, tag inexistente) más, si se añade el arnés, un
+  test de shell que compruebe códigos de salida.
+
 ---
 
 ## Deuda de proceso (no es código)
 
-### P1. La review de notificaciones quedó sin veredicto
+### P1. Las reviews que se atascaban: causa encontrada, no era el provider
 
-Lineage `review-6f78076f7c7b8da5`. Encontró dos CRITICAL reales (sin límite de tasa), que
-se corrigieron en `1a3db6d`. Después, la captura de validación rechazó el binding como
-obsoleto dos veces seguidas, en sus dos formas admitidas (objeto y cadena serializada),
-pese a venir de un STATUS fresco. `mutation_performed: none`, `automatic_retry: false`.
+En la primera mitad del día, tres linajes quedaron sin veredicto porque la captura del
+validador dirigido rechazaba el binding como obsoleto con `mutation_performed: none`.
+Acusé al provider y **me equivoqué**: el problema era mi forma de invocar la secuencia
+manual (pedir STATUS y luego reenviar un binding que en esa secuencia ya había cambiado).
+Al usar la ruta de una sola llamada, `gentle_review_run`, el ciclo completo cerró limpio:
+lineage `review-ecf2af1b425d3e2b` **aprobado** con la autoridad quemada, y antes el de
+documentación (`review-1232d4ceb4439f5d`), también aprobado.
 
-**Decisión pendiente**: reportar el defecto del provider, o dejar el candidato sin
-veredicto y seguir.
+**Decisión tomada**: no hay defecto que reportar. La regla operativa queda en las notas de
+entorno: para una review completa, `gentle_review_run` y no la secuencia manual de
+capturas.
 
 ### P2. Hallazgos no bloqueantes sin arreglar
 
@@ -314,9 +359,19 @@ flag. Coste S, riesgo de romper atajos si se hace mal.
 
 ## Notas de entorno para quien siga
 
-- **Actualizar el binario**: `cargo build --release --locked && ./packaging/linux/install.sh`
-  (instala binario, entrada de menú e iconos; nunca pide root ni toca la configuración).
-  Cerrar las ventanas antes: los procesos vivos mantienen el binario viejo.
+- **Actualizar el binario**: `cargo build --release --locked && ./scripts/setup.sh --install`
+  (o `./packaging/linux/install.sh` a secas). El script comprueba dependencias, toolchain y
+  fuentes antes de construir; nunca pide root ni toca la configuración. Cerrar las
+  ventanas antes: los procesos vivos mantienen el binario viejo.
+- **Instalar una release concreta**: `--version vX.Y.Z` **verifica y no mueve el
+  checkout**. Con `main` por delante del tag se niega con código 4, y eso es correcto. El
+  camino limpio es un worktree:
+  `git worktree add /tmp/astraterm-vX vX.Y.Z && cd /tmp/astraterm-vX && ./scripts/setup.sh --version vX.Y.Z --install`,
+  y luego `git worktree remove /tmp/astraterm-vX`.
+- **Reviews nativas**: usar `gentle_review_run`, que ejecuta STATUS, captura, validación y
+  reconocimiento en una llamada. La secuencia manual de capturas con bindings reenviados a
+  mano acaba en `collectBinding ... stale` aunque el binding venga de un STATUS recién
+  pedido: fue un error de invocación propio, no del provider.
 - **Verificar una GUI sin tocar la config del usuario**: `--config /tmp/x/config.toml` y
   `--command <argv>`, luego `grim /tmp/x/shot.png` y mirar el PNG con la herramienta de
   lectura de imágenes.
