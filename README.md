@@ -11,7 +11,7 @@ Visual identity: dark, minimal, productivity-first. The default theme is
 ## Status
 
 **Usable MVP: a real terminal with native tabs and splits.** The whole stack is
-implemented and covered by 285 automated tests plus manual verification on
+implemented and covered by 489 automated tests plus manual verification on
 Wayland/Hyprland with Neovim, zsh and the Omarchy prompt:
 
 | Crate | Contents | State |
@@ -32,6 +32,7 @@ Measured on the development machine (Intel UHD 630, Wayland, 2494×1396 window):
 about 1 % idle CPU with one pane and roughly 129 MB RSS in a debug build. See
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the measurement method and
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together.
+Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## What AstraTerm is (and is not)
 
@@ -55,6 +56,12 @@ Rendering and desktop niceties that ship today:
   with a configurable width.
 - **Theme editor** in the settings panel: adjust the palette with live preview, name
   the result and save it to `~/.config/astraterm/themes/`.
+- **Floating terminal**: `ctrl+shift+grave` opens one that floats over the layout with
+  its own shell; hiding it keeps the session alive and shows a `float hidden` marker in
+  the status bar.
+- **Kitty keyboard protocol** (on by default), opt-in ligatures (`font.ligatures`),
+  opt-in images (kitty graphics, iTerm2 `OSC 1337`, sixel) and **desktop notifications**
+  from `OSC 9`/`OSC 777` with a window attention hint.
 
 Every option is documented with what it does and when to change it in
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md#option-reference).
@@ -72,11 +79,24 @@ System packages:
 
 ```sh
 # Arch Linux
-sudo pacman -S --needed base-devel wayland libxkbcommon fontconfig freetype2 mesa
+sudo pacman -S --needed base-devel wayland libxkbcommon fontconfig freetype2 mesa \
+    vulkan-icd-loader libx11 wl-clipboard libnotify git ttf-jetbrains-mono-nerd
 # Debian / Ubuntu
-sudo apt install build-essential libwayland-client0 libxkbcommon0 libfontconfig1 \
-    libfreetype6 mesa-vulkan-drivers libgl1-mesa-dri
+sudo apt install build-essential pkg-config libwayland-dev libxkbcommon-dev \
+    libfontconfig1-dev libfreetype6-dev mesa-vulkan-drivers libgl1-mesa-dri libvulkan1 \
+    libx11-dev wl-clipboard libnotify-bin
 ```
+
+The bootstrap script installs the same set for the detected distribution, checks
+the toolchain and the font without downloading anything, and builds the binary:
+
+```sh
+./scripts/setup.sh            # asks before installing packages, then builds
+./scripts/setup.sh --install  # … and installs it for the current user
+```
+
+[docs/INSTALL.md](docs/INSTALL.md) documents the requirements per distribution,
+every flag of the script, and what it deliberately does not do.
 
 ## Build
 
@@ -199,6 +219,7 @@ Files in this repository:
 | `packaging/desktop/astraterm.desktop` | freedesktop desktop entry (`Exec=astraterm %U`, `Icon=astraterm`, `StartupWMClass=astraterm`) |
 | `packaging/linux/PKGBUILD` | Arch Linux package: builds with `cargo build --release --locked`, installs the binary, desktop entry, icon and `/etc/astraterm/config.toml` |
 | `packaging/linux/install.sh` | POSIX `sh` installer for a portable build into the user's XDG directories (no root) |
+| `scripts/setup.sh` | idempotent bootstrap: system dependencies, toolchain and font checks, release build, optional install — see [docs/INSTALL.md](docs/INSTALL.md) |
 | `packaging/linux/uninstall.sh` | removes exactly the files `install.sh` created |
 | `packaging/linux/config.toml` | the system-wide default configuration installed to `/etc/astraterm/config.toml` |
 | `assets/icons/logo.png` | the AstraTerm logo; every icon size is generated from it |
@@ -265,10 +286,16 @@ checksums before publishing** (see the comment at the top of the file).
 
 ## Known limitations
 
-- No IME preedit support: CJK input through an input method does not work yet;
-  typing is handled through key events.
-- No Kitty keyboard protocol (the encoder is xterm-compatible), no ligatures, no
-  Sixel/Kitty image protocols.
+- IME preedit is not drawn: composed text arrives through the input method and is
+  written to the pane, but the composition in progress is only traced, and the
+  candidate window is not positioned at the cursor.
+- Ligatures are opt-in (`font.ligatures`, off by default) and images are opt-in
+  (`terminal.images`, off by default because the payload is untrusted input).
+- Image protocols cover kitty single-chunk PNG and raw frames, iTerm2
+  `OSC 1337;File=` and sixel. Kitty chunked transfers (`m=1`), HLS sixel palettes and
+  iTerm2 `inline=0` are refused rather than approximated.
+- Desktop notifications use `notify-send`; without libnotify the terminal still shows
+  them in the status bar.
 - Search is plain substring matching (no regular expressions) and searches the
   buffer, not just the screen.
 - Wide glyphs are rendered followed by one filler space so later columns stay
