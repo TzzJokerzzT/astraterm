@@ -107,25 +107,28 @@ impl KeyPress {
 /// Returns an empty vector when the combination has no representation (for
 /// example a bare modifier), in which case nothing must be sent.
 pub fn encode_key(press: KeyPress, modes: ModeFlags) -> Vec<u8> {
-    if press.event != KeyEventType::Press {
-        // Only the Kitty protocol reports anything other than a press. Falling back
-        // to the xterm path would send the key twice, once on press and once on
-        // release.
-        if !modes.kitty.enabled() {
-            return Vec::new();
-        }
-        return encode_kitty_key(press, modes.kitty).unwrap_or_default();
-    }
     if modes.kitty.enabled()
         && let Some(bytes) = encode_kitty_key(press, modes.kitty)
     {
         return bytes;
     }
-    encode_xterm_key(press, modes)
+    if press.event != KeyEventType::Press {
+        // Only the Kitty protocol reports anything other than a press. A functional
+        // key keeps its legacy sequence, so its repeat or release is that sequence
+        // with the event type in the parameter block; every other key has no way to
+        // say "release", and writing its press bytes again would deliver it twice.
+        if !modes.kitty.report_event_types || !has_legacy_functional_form(press.key) {
+            return Vec::new();
+        }
+    }
+    encode_xterm_key(press, modes, modes.kitty)
 }
 
 /// The classic xterm encoding, unchanged since before the Kitty protocol existed.
-fn encode_xterm_key(press: KeyPress, modes: ModeFlags) -> Vec<u8> {
+///
+/// `kitty` only adds the event type to a functional key's parameter block; with no
+/// flags active it never changes a byte and every key here is a press.
+fn encode_xterm_key(press: KeyPress, modes: ModeFlags, kitty: KittyFlags) -> Vec<u8> {
     match press.key {
         TermKey::Char(ch) => encode_char(ch, press),
         TermKey::Enter => {
@@ -150,19 +153,19 @@ fn encode_xterm_key(press: KeyPress, modes: ModeFlags) -> Vec<u8> {
                 Direction::Right => b'C',
                 Direction::Left => b'D',
             };
-            if modes.app_cursor && !press.has_modifiers() {
-                vec![0x1b, b'O', final_byte]
-            } else {
-                csi_with_modifier(final_byte, press.modifier_param())
+            match functional_params(1, press, kitty) {
+                Some(params) => csi_with_params(final_byte, &params),
+                None if modes.app_cursor => vec![0x1b, b'O', final_byte],
+                None => vec![0x1b, b'[', final_byte],
             }
         }
-        TermKey::Home => csi_with_modifier(b'H', press.modifier_param()),
-        TermKey::End => csi_with_modifier(b'F', press.modifier_param()),
-        TermKey::Insert => tilde_sequence(2, press.modifier_param()),
-        TermKey::Delete => tilde_sequence(3, press.modifier_param()),
-        TermKey::PageUp => tilde_sequence(5, press.modifier_param()),
-        TermKey::PageDown => tilde_sequence(6, press.modifier_param()),
-        TermKey::Function(number) => encode_function(number, press),
+        TermKey::Home => csi_functional(b'H', press, kitty),
+        TermKey::End => csi_functional(b'F', press, kitty),
+        TermKey::Insert => tilde_sequence(2, press, kitty),
+        TermKey::Delete => tilde_sequence(3, press, kitty),
+        TermKey::PageUp => tilde_sequence(5, press, kitty),
+        TermKey::PageDown => tilde_sequence(6, press, kitty),
+        TermKey::Function(number) => encode_function(number, press, kitty),
     }
 }
 
@@ -211,8 +214,18 @@ fn encode_kitty_key(press: KeyPress, kitty: KittyFlags) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Whether the protocol reports this key as `CSI u` instead of its xterm form.
+/// Whether the protocol reports this key as `CSI u` instead of its legacy form.
 fn kitty_escape_form(press: KeyPress, kitty: KittyFlags) -> bool {
+    // A functional key already has an unambiguous sequence, and the protocol's
+    // fixed numbers for them (57348-57357, 57364+) are read as Private Use
+    // codepoints by parsers that only know `CSI u` for text: crossterm has no
+    // entry for that range, so `CSI 57352u` (Up) becomes `Char('\u{e008}')` and
+    // `atuin search --interactive` types a Nerd Font glyph into its filter. foot
+    // and Ghostty keep the legacy sequence for these keys under the same
+    // `report_all_keys_as_esc` flag, so this encoder does too.
+    if has_legacy_functional_form(press.key) {
+        return false;
+    }
     if kitty.report_all_keys_as_esc {
         return true;
     }
@@ -225,9 +238,24 @@ fn kitty_escape_form(press: KeyPress, kitty: KittyFlags) -> bool {
         // Unmodified Enter/Tab/Backspace stay as their control bytes.
         TermKey::Enter | TermKey::Tab | TermKey::Backspace => press.has_modifiers(),
         TermKey::Char(_) => press.ctrl || press.alt || (kitty.report_alternate_keys && press.shift),
-        // Arrows and the other functional keys already have unambiguous forms.
         _ => false,
     }
+}
+
+/// Keys whose legacy sequence is their only form: arrows, Home/End,
+/// Insert/Delete, PageUp/PageDown and the function keys.
+fn has_legacy_functional_form(key: TermKey) -> bool {
+    matches!(
+        key,
+        TermKey::Arrow(_)
+            | TermKey::Home
+            | TermKey::End
+            | TermKey::Insert
+            | TermKey::Delete
+            | TermKey::PageUp
+            | TermKey::PageDown
+            | TermKey::Function(_)
+    )
 }
 
 /// The key number, with the alternate codepoints when the application asked for them.
@@ -242,7 +270,8 @@ fn kitty_key_number(press: KeyPress, kitty: KittyFlags, code: u32) -> String {
     code.to_string()
 }
 
-/// Kitty key numbers: Unicode codepoints for text, fixed numbers for functional keys.
+/// Kitty key numbers, for the keys the protocol reports as `CSI u`: text and the
+/// control keys. Functional keys keep their legacy sequence and have no number.
 fn kitty_key_code(key: TermKey) -> Option<u32> {
     Some(match key {
         TermKey::Char(ch) => ch as u32,
@@ -250,18 +279,7 @@ fn kitty_key_code(key: TermKey) -> Option<u32> {
         TermKey::Tab => 9,
         TermKey::Backspace => 127,
         TermKey::Escape => 27,
-        TermKey::Insert => 57_348,
-        TermKey::Delete => 57_349,
-        TermKey::Arrow(Direction::Left) => 57_350,
-        TermKey::Arrow(Direction::Right) => 57_351,
-        TermKey::Arrow(Direction::Up) => 57_352,
-        TermKey::Arrow(Direction::Down) => 57_353,
-        TermKey::PageUp => 57_354,
-        TermKey::PageDown => 57_355,
-        TermKey::Home => 57_356,
-        TermKey::End => 57_357,
-        TermKey::Function(number) if (1..=35).contains(&number) => 57_363 + number as u32,
-        TermKey::Function(_) => return None,
+        _ => return None,
     })
 }
 
@@ -364,57 +382,54 @@ fn with_alt(mut bytes: Vec<u8>, alt: bool) -> Vec<u8> {
     bytes
 }
 
-/// `CSI 1 ; <modifier> <final>` when modified, plain `CSI <final>` otherwise.
-fn csi_with_modifier(final_byte: u8, modifier: u8) -> Vec<u8> {
-    if modifier <= 1 {
-        vec![0x1b, b'[', final_byte]
-    } else {
-        let mut out = b"\x1b[1;".to_vec();
-        out.extend_from_slice(modifier.to_string().as_bytes());
-        out.push(final_byte);
-        out
+/// `CSI 1 ; <modifier>[:<event>] <final>` when that carries information, plain
+/// `CSI <final>` otherwise.
+fn csi_functional(final_byte: u8, press: KeyPress, kitty: KittyFlags) -> Vec<u8> {
+    match functional_params(1, press, kitty) {
+        Some(params) => csi_with_params(final_byte, &params),
+        None => vec![0x1b, b'[', final_byte],
     }
 }
 
-/// `CSI <code> ~` or `CSI <code> ; <modifier> ~`.
-fn tilde_sequence(code: u8, modifier: u8) -> Vec<u8> {
+/// `CSI <code> ; <modifier>[:<event>] ~`, or `CSI <code> ~`.
+fn tilde_sequence(code: u8, press: KeyPress, kitty: KittyFlags) -> Vec<u8> {
+    let params = functional_params(code, press, kitty).unwrap_or_else(|| code.to_string());
     let mut out = b"\x1b[".to_vec();
-    out.extend_from_slice(code.to_string().as_bytes());
-    if modifier > 1 {
-        out.push(b';');
-        out.extend_from_slice(modifier.to_string().as_bytes());
-    }
+    out.extend_from_slice(params.as_bytes());
     out.push(b'~');
     out
 }
 
-fn encode_function(number: u8, press: KeyPress) -> Vec<u8> {
-    let modifier = press.modifier_param();
+/// The parameter block of a functional key: `<code> ; <modifier>[:<event>]`.
+///
+/// `None` when the legacy form already says everything, which keeps an unmodified
+/// press byte-identical to the sequence xterm always used.
+fn functional_params(code: u8, press: KeyPress, kitty: KittyFlags) -> Option<String> {
+    let report_event = press.event != KeyEventType::Press && kitty.report_event_types;
+    if !press.has_modifiers() && !report_event {
+        return None;
+    }
+    let mut params = format!("{code};{}", press.modifier_param());
+    if report_event {
+        params.push(':');
+        params.push_str(&press.event.code().to_string());
+    }
+    Some(params)
+}
+
+fn csi_with_params(final_byte: u8, params: &str) -> Vec<u8> {
+    let mut out = b"\x1b[".to_vec();
+    out.extend_from_slice(params.as_bytes());
+    out.push(final_byte);
+    out
+}
+
+fn encode_function(number: u8, press: KeyPress, kitty: KittyFlags) -> Vec<u8> {
     let code: u8 = match number {
-        1 => {
-            if modifier > 1 {
-                return csi_with_modifier(b'P', modifier);
-            }
-            return b"\x1bOP".to_vec();
-        }
-        2 => {
-            if modifier > 1 {
-                return csi_with_modifier(b'Q', modifier);
-            }
-            return b"\x1bOQ".to_vec();
-        }
-        3 => {
-            if modifier > 1 {
-                return csi_with_modifier(b'R', modifier);
-            }
-            return b"\x1bOR".to_vec();
-        }
-        4 => {
-            if modifier > 1 {
-                return csi_with_modifier(b'S', modifier);
-            }
-            return b"\x1bOS".to_vec();
-        }
+        1 => return ss3_sequence(b'P', press, kitty),
+        2 => return ss3_sequence(b'Q', press, kitty),
+        3 => return ss3_sequence(b'R', press, kitty),
+        4 => return ss3_sequence(b'S', press, kitty),
         5 => 15,
         6 => 17,
         7 => 18,
@@ -433,7 +448,15 @@ fn encode_function(number: u8, press: KeyPress) -> Vec<u8> {
         20 => 34,
         _ => return Vec::new(),
     };
-    tilde_sequence(code, modifier)
+    tilde_sequence(code, press, kitty)
+}
+
+/// `SS3 <final>` for an unmodified F1-F4, `CSI 1 ; <params> <final>` otherwise.
+fn ss3_sequence(final_byte: u8, press: KeyPress, kitty: KittyFlags) -> Vec<u8> {
+    match functional_params(1, press, kitty) {
+        Some(params) => csi_with_params(final_byte, &params),
+        None => vec![0x1b, b'O', final_byte],
+    }
 }
 
 /// Encodes pasted text, wrapping it in bracketed-paste markers when the running
@@ -624,10 +647,88 @@ mod tests {
             encode_key(KeyPress::new(TermKey::Char('a')), modes),
             b"\x1b[97u"
         );
+        // Functional keys keep their legacy form: see
+        // `functional_keys_keep_their_legacy_form_under_all_keys_as_esc`.
         assert_eq!(
             encode_key(KeyPress::new(TermKey::Insert), modes),
-            b"\x1b[57348u"
+            b"\x1b[2~"
         );
+    }
+
+    /// The flags `atuin search --interactive` pushes (`CSI > 13 u`, that is
+    /// disambiguate | report_alternate_keys | report_all_keys_as_esc). Its parser
+    /// has no entry for the protocol's fixed numbers 57348-57357, so it read
+    /// `CSI 57352u` as `Char('\u{e008}')` and typed a Private Use glyph into the
+    /// search filter. foot and Ghostty both keep the legacy sequence for these
+    /// keys under the same flags, so the encoder must not use the numeric form.
+    #[test]
+    fn functional_keys_keep_their_legacy_form_under_all_keys_as_esc() {
+        let modes = kitty(KittyFlags {
+            disambiguate: true,
+            report_alternate_keys: true,
+            report_all_keys_as_esc: true,
+            ..KittyFlags::default()
+        });
+        let cases: [(TermKey, &[u8]); 12] = [
+            (TermKey::Arrow(Direction::Up), b"\x1b[A"),
+            (TermKey::Arrow(Direction::Down), b"\x1b[B"),
+            (TermKey::Arrow(Direction::Right), b"\x1b[C"),
+            (TermKey::Arrow(Direction::Left), b"\x1b[D"),
+            (TermKey::Home, b"\x1b[H"),
+            (TermKey::End, b"\x1b[F"),
+            (TermKey::Insert, b"\x1b[2~"),
+            (TermKey::Delete, b"\x1b[3~"),
+            (TermKey::PageUp, b"\x1b[5~"),
+            (TermKey::PageDown, b"\x1b[6~"),
+            (TermKey::Function(1), b"\x1bOP"),
+            (TermKey::Function(5), b"\x1b[15~"),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(encode_key(KeyPress::new(key), modes), expected, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn functional_keys_report_events_in_their_legacy_form() {
+        let modes = kitty(KittyFlags {
+            report_all_keys_as_esc: true,
+            report_event_types: true,
+            ..KittyFlags::default()
+        });
+        let release =
+            KeyPress::new(TermKey::Arrow(Direction::Up)).with_event(KeyEventType::Release);
+        assert_eq!(encode_key(release, modes), b"\x1b[1;1:3A");
+
+        let repeat = KeyPress::new(TermKey::PageUp).with_event(KeyEventType::Repeat);
+        assert_eq!(encode_key(repeat, modes), b"\x1b[5;1:2~");
+
+        let alt_left = KeyPress::with_mods(TermKey::Arrow(Direction::Left), false, true, false)
+            .with_event(KeyEventType::Release);
+        assert_eq!(encode_key(alt_left, modes), b"\x1b[1;3:3D");
+
+        let insert_release = KeyPress::new(TermKey::Insert).with_event(KeyEventType::Release);
+        assert_eq!(encode_key(insert_release, modes), b"\x1b[2;1:3~");
+    }
+
+    #[test]
+    fn a_text_release_never_repeats_the_text_bytes() {
+        let modes = kitty(KittyFlags {
+            report_event_types: true,
+            ..KittyFlags::default()
+        });
+        let release = KeyPress::new(TermKey::Char('a')).with_event(KeyEventType::Release);
+        assert!(encode_key(release, modes).is_empty());
+    }
+
+    #[test]
+    fn functional_release_needs_report_event_types() {
+        let modes = kitty(KittyFlags {
+            report_all_keys_as_esc: true,
+            ..KittyFlags::default()
+        });
+        let release =
+            KeyPress::new(TermKey::Arrow(Direction::Up)).with_event(KeyEventType::Release);
+        assert!(encode_key(release, modes).is_empty());
     }
 
     #[test]

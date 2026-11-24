@@ -160,18 +160,34 @@ Under the flags, the encoding is `CSI code[:shifted:base][;m[:event]][;text] u`:
 | disambiguate | 1 | `Ctrl`/`Alt` combinations, `Escape`, and modified `Enter`/`Tab`/`Backspace` switch to `CSI code u`, with a `;m` parameter when modifiers differ from none. Plain text and unmodified `Enter`/`Tab`/`Backspace` keep their bytes. |
 | report_event_types | 2 | Appends `:1` (press), `:2` (repeat) or `:3` (release) to the modifier parameter. |
 | report_alternate_keys | 4 | Emits `code:shifted:base` for a shifted character. |
-| report_all_keys_as_esc | 8 | Every key, plain text included, uses `CSI code u`. |
+| report_all_keys_as_esc | 8 | Text and the control keys (`Escape`, `Enter`, `Tab`, `Backspace`) use `CSI code u`; arrows, `Home`/`End`, `Insert`/`Delete`, `PageUp`/`PageDown` and the function keys keep their legacy sequences. |
 | report_associated_text | 16 | Appends the text the key produced, as codepoints: `CSI code;m;text u`. |
 
-Under `report_all_keys_as_esc`, functional keys use the protocol's fixed numbers
-(`57_348` for `Insert` through `57_357` for `End`; `F1`…`F20` from `57_364`)
-instead of their tilde sequences.
+Functional keys never use the protocol's fixed numbers (`57_348` for `Insert`
+through `57_357` for `End`, `57_364` for `F1`), even under
+`report_all_keys_as_esc`. Parsers that only know `CSI u` for text read that range
+as codepoints in the Unicode Private Use Area: crossterm has no entry for
+`57_348`–`57_357`, so `CSI 57352u` (Up) arrives as `Char('\u{e008}')` and the
+application types a Nerd Font glyph instead of moving the cursor. This is what
+broke `atuin search --interactive`, which pushes `CSI > 13 u` (disambiguate |
+report_alternate_keys | report_all_keys_as_esc) and then painted that glyph in
+its filter. foot and Ghostty keep the legacy sequence for these keys under the
+same flags, so the encoder matches them;
+`functional_keys_keep_their_legacy_form_under_all_keys_as_esc` pins the bytes.
 
 Release and repeat are reported only under flag 2. The application forwards a
 release to the PTY only while the focused session has `REPORT_EVENT_TYPES` on and
 marks a repeated press as `Repeat` under the same condition; otherwise the
 release is dropped and a repeat stays a press, so an xterm session still sees one
-event per key (`releases_are_forwarded_only_with_report_event_types`).
+event per key (`releases_are_forwarded_only_with_report_event_types`). A
+functional key carries the event type in its own parameter block —
+`CSI 1;m:event A` for arrows and `Home`/`End`, `CSI n;m:event ~` for
+`Insert`/`Delete`/`PageUp`/`PageDown`/`F5`+, `CSI 1;m:event P` for `F1`–`F4` —
+and an unmodified press keeps the bare sequence (`CSI A`, `CSI 5~`), so
+nothing changes for an application that only reads presses
+(`functional_keys_report_events_in_their_legacy_form`). Text keys have no such
+form: their release sends nothing rather than repeating the press bytes
+(`a_text_release_never_repeats_the_text_bytes`).
 
 One upstream detail: `CSI ? u` reports the top of the *push* stack, so an
 application that only uses `CSI = u` (set, never push) queries `0` while its
