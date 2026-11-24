@@ -14,19 +14,19 @@ advertencias, `cargo fmt --check` limpio.
 
 Ya implementado y cerrado:
 
-| Qué | Commit |
-|---|---|
-| Zoom persistente entre reinicios | `b9ec742` |
-| Pegado asíncrono con límite de 8 MiB | `2a716b3` |
-| Ligaduras opt-in (`font.ligatures`) | `7410eb6` |
-| Kitty keyboard protocol completo | `a37ee4b` |
-| Captura de imágenes antes del parser VT | `662c512` |
-| Decoders kitty / iTerm2 / sixel con límites | `06e1f53` |
-| Renderer texturizado con caché acotada | `d9ab57d` |
-| Cableado de imágenes + `terminal.images` | `0cfe9c0` |
-| AltGr como composición + IME commit | `c6848fa` |
-| Teclas funcionales con forma legacy bajo flags Kitty | `7c3c56b` |
-| Notificaciones OSC 9 / 777 + urgency hint | `3ecf4b6`, `1a3db6d`, `63c2d7e` |
+| Qué                                                  | Commit                          |
+| ---------------------------------------------------- | ------------------------------- |
+| Zoom persistente entre reinicios                     | `b9ec742`                       |
+| Pegado asíncrono con límite de 8 MiB                 | `2a716b3`                       |
+| Ligaduras opt-in (`font.ligatures`)                  | `7410eb6`                       |
+| Kitty keyboard protocol completo                     | `a37ee4b`                       |
+| Captura de imágenes antes del parser VT              | `662c512`                       |
+| Decoders kitty / iTerm2 / sixel con límites          | `06e1f53`                       |
+| Renderer texturizado con caché acotada               | `d9ab57d`                       |
+| Cableado de imágenes + `terminal.images`             | `0cfe9c0`                       |
+| AltGr como composición + IME commit                  | `c6848fa`                       |
+| Teclas funcionales con forma legacy bajo flags Kitty | `7c3c56b`                       |
+| Notificaciones OSC 9 / 777 + urgency hint            | `3ecf4b6`, `1a3db6d`, `63c2d7e` |
 
 De la lista de mejoras propuesta, **solo las notificaciones OSC 9/777 están hechas**.
 Todo lo de abajo sigue pendiente.
@@ -45,13 +45,13 @@ primera tarea de este bloque es justamente esa.
 
 ### Regla, a partir de 1.0.0
 
-| Tipo de cambio | Versión | Ejemplos |
-|---|---|---|
-| Feature nueva | MINOR (`1.1.0`) | terminal flotante, soporte de imágenes |
-| Cambio visible en una feature existente, compatible | MINOR | nuevas opciones, nuevos valores de config, mensajes distintos |
-| Cambio que rompe un contrato ya consumido | MAJOR (`2.0.0`) | quitar o renombrar una opción, cambiar el formato de configuración |
-| Corrección que no cambia contratos | PATCH (`1.0.1`) | crash, una tecla mal codificada |
-| Solo documentación, tests o refactor interno | sin bump hasta el próximo release | README, este backlog |
+| Tipo de cambio                                      | Versión                           | Ejemplos                                                           |
+| --------------------------------------------------- | --------------------------------- | ------------------------------------------------------------------ |
+| Feature nueva                                       | MINOR (`1.1.0`)                   | terminal flotante, soporte de imágenes                             |
+| Cambio visible en una feature existente, compatible | MINOR                             | nuevas opciones, nuevos valores de config, mensajes distintos      |
+| Cambio que rompe un contrato ya consumido           | MAJOR (`2.0.0`)                   | quitar o renombrar una opción, cambiar el formato de configuración |
+| Corrección que no cambia contratos                  | PATCH (`1.0.1`)                   | crash, una tecla mal codificada                                    |
+| Solo documentación, tests o refactor interno        | sin bump hasta el próximo release | README, este backlog                                               |
 
 La regla corta, que es la que hay que recordar: **si toca una feature de cara al
 usuario, sube la versión**. Y si la rompe, sube el número mayor.
@@ -218,7 +218,7 @@ En este orden, siempre:
 - **Coste**: S/M. La decisión de diseño es dónde se pinta (celda del cursor vs overlay).
 - **Verificación**: manual con fcitx5 y una dead key, y con japonés/Chino si hay IME.
 
-### B12. Desincronización del scanner con OSC malformado *(hallazgo de review R3-004)*
+### B12. Desincronización del scanner con OSC malformado _(hallazgo de review R3-004)_
 
 - **Por qué**: un OSC 9 sin el `;` que termina en BEL deja bytes en passthrough y el estado
   en `Foreign`, así que deja de reconocer imágenes/notificaciones hasta el terminador
@@ -321,7 +321,7 @@ flag. Coste S, riesgo de romper atajos si se hace mal.
   `--command <argv>`, luego `grim /tmp/x/shot.png` y mirar el PNG con la herramienta de
   lectura de imágenes.
 - **Ver los bytes que emite el terminal**: `--command sh -c 'stty raw -echo; printf
-  "\033[>13u"; cat -v'` con las teclas inyectadas por `/dev/uinput`.
+"\033[>13u"; cat -v'` con las teclas inyectadas por `/dev/uinput`.
 - **Nunca** `pkill -f <patrón>` si el patrón aparece en tu propia línea de comandos: mata
   el shell que lo ejecuta. Matar por PID.
 - **`rm -rf` en `/tmp` puede estar bloqueado por política**: usar `rm -f` por archivo y
