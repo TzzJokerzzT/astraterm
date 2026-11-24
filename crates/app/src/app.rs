@@ -2850,12 +2850,12 @@ impl ApplicationHandler<UserEvent> for Application {
             WindowEvent::CursorLeft { .. } => self.cursor = None,
             WindowEvent::RedrawRequested => {
                 let system = self.system.snapshot();
-                let scene = match self.windows.get_mut(&window_id) {
+                let frame = match self.windows.get_mut(&window_id) {
                     Some(ui) => ui.compose(&mut self.sessions, &system, &self.images),
                     None => return,
                 };
                 if let Some(ui) = self.windows.get_mut(&window_id)
-                    && let Err(error) = ui.renderer.render(&scene)
+                    && let Err(error) = ui.renderer.render(&frame.scene, frame.overlay.as_ref())
                 {
                     // A redraw requested from inside the redraw handler would spin the
                     // event loop on a persistent failure; the next real event retries.

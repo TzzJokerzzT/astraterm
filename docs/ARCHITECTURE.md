@@ -207,16 +207,24 @@ tabs or sessions.
 
 Entry points: `Renderer` (`lib.rs`: `new`, `render`, `resize`, `set_font`,
 `set_scale`, `cell_metrics`, `invalidate_text_cache`), `RendererOptions`,
-`RendererError`, `pick_format`, `target_expects_linear`; `paint.rs` (`Scene`,
-`Quad`, `TextItem`, `Span`, `paint_pane`, `paint_cell_backgrounds`,
-`resolve`, `srgb_to_linear`, `rgba`); `quad.rs` (`QuadPipeline`); `text.rs`
-(`TextStyle`, `RowCache`, `measure_cell`).
+`RendererError`, `pick_format`, `target_expects_linear`, `scissor_rect`;
+`paint.rs` (`Scene`, `Quad`, `TextItem`, `Span`, `paint_pane`,
+`paint_cell_backgrounds`, `resolve`, `srgb_to_linear`, `rgba`); `quad.rs`
+(`QuadPipeline`); `text.rs` (`TextStyle`, `RowCache`, `measure_cell`).
 
 Notes:
 
 - `quad.rs` is a single instanced pipeline: six vertices per rectangle, one
   instance per quad, one draw call per frame. Instances start at 2048 and the
   buffer grows to the next power of two when needed.
+- A frame carries up to two layers. `Renderer::render` takes the mosaic and an
+  optional overlay; the mosaic clears the target, the overlay is recorded with
+  `LoadOp::Load` and scissored to `Scene::clip`. Each pipeline keeps one instance
+  buffer and draws all of it, and glyphon's `prepare` concatenates every area
+  into one vertex buffer that `render` draws whole, so the overlay layer owns a
+  second quad pipeline, a second image pipeline and a second `TextRenderer`. The
+  image cache, atlas, font system, swash cache, shaped-row cache and viewport stay
+  shared.
 - `text.rs` shapes rows with cosmic-text and caches the shaped `Buffer` per
   `TextItem::id`. A cached row is reused while its content hash and the font
   style key are unchanged.
@@ -284,7 +292,8 @@ Notes:
   for one window. It never owns sessions.
 - `WindowUi` also owns at most one optional floating terminal (`Floating`), which
   lives outside the split tree: the mosaic layout and the reflow never see it, it
-  keeps its own session, and it is drawn above the panes and below the overlays.
+  keeps its own session, and it is composed into the overlay layer, above the
+  panes and below the modal overlays.
 - `window.set_ime_allowed(true)` with `ImePurpose::Terminal`: composed text arrives as
   `WindowEvent::Ime` and is written to the focused pane. Preedit is traced, not drawn.
 - Only one window is created in `resumed`; further windows come from the
@@ -358,26 +367,33 @@ if the 1,024-message input queue is full.
 
 ## Rendering pipeline
 
-1. **Compose (pure).** `WindowUi::compose` builds a `Scene`: clear colour, quads
-   and text items. `paint::paint_pane` paints one pane: border, background,
-   selection, cell backgrounds/underlines, one text item per visible row, and
-   the cursor. The tab strip, status bar, search bar, confirmation dialog and
-   settings panel are composed the same way. Text item ids are stable
+1. **Compose (pure).** `WindowUi::compose` builds a `Frame`: the mosaic `Scene`
+   (clear colour, quads and text items) and, when the floating terminal or a modal
+   overlay is on screen, the overlay `Scene` that is drawn after it.
+   `paint::paint_pane` paints one pane: border, background, selection, cell
+   backgrounds/underlines, one text item per visible row, and the cursor. The tab
+   strip, status bar, search bar, confirmation dialog and settings panel are
+   composed the same way. Text item ids are stable
    (`(pane_index + 1) * 0x1000 + row` for terminal rows, fixed ranges for
    chrome), which is what makes the shaped-row cache effective.
 2. **Colour-space normalisation.** If the surface format expects linear light,
    `Scene::linearize` converts clear, quad and span colours with
-   `srgb_to_linear`; alpha is untouched.
+   `srgb_to_linear`; alpha is untouched. Both layers are converted.
 3. **Quads.** `Scene::quads` becomes `quad::Instance`s and is uploaded to the
-   instance buffer; `QuadPipeline::draw` issues one instanced draw call.
+   layer's instance buffer; `QuadPipeline::draw` issues one instanced draw call.
 4. **Text.** `RowCache::update` re-shapes only items whose content hash or font
    style key changed, then `areas` produces one `glyphon::TextArea` per text
    item. `TextRenderer::prepare` uploads glyphs into the atlas and
    `TextRenderer::render` draws them.
-5. **Present.** Both are recorded in one render pass: clear, quad draw, glyph
-   draw. The frame is submitted and presented with `PresentMode::Fifo`; the
-   atlas is trimmed after each frame. A lost/outdated surface is reconfigured;
-   `Timeout`/`Occluded` frames are skipped without an error.
+5. **Present.** The mosaic is recorded in one render pass: clear, quad draw,
+   image draws, glyph draw. A present overlay is recorded in a second pass over
+   the same target with `LoadOp::Load` and `set_scissor_rect` on its `Scene::clip`,
+   in the same order. Because the mosaic's glyph draw finished before the overlay
+   pass begins, the overlay's background covers the mosaic's text instead of the
+   text painting over it. The frame is submitted and presented with
+   `PresentMode::Fifo`; the atlas is trimmed after each frame. A lost/outdated
+   surface is reconfigured; `Timeout`/`Occluded` frames are skipped without an
+   error.
 
 Damage handling today: `TerminalEngine::snapshot` reports `damaged_rows`, but the
 renderer has no consumer for it yet. Every redraw composes the whole frame; the

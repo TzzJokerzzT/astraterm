@@ -251,6 +251,32 @@ pub struct ClickInfo {
     pub count: u8,
 }
 
+/// One composed frame, ready for the renderer.
+///
+/// The mosaic always owns the whole window and clears it. `overlay` is the layer
+/// drawn afterwards on top of the mosaic's glyphs: the floating terminal, with the
+/// modal overlays above it. It is `None` when neither is on screen, so a window
+/// with nothing above the panes records a single render pass.
+pub struct Frame {
+    pub scene: Scene,
+    pub overlay: Option<Scene>,
+}
+
+/// Rectangle the layer above the mosaic is confined to, or `None` when there is
+/// nothing to draw above it.
+///
+/// A visible floating terminal covers only its own box, and the renderer scissors
+/// the layer to it. A modal overlay dims and paints the whole window, so while one
+/// is open the layer keeps the window and the dialog is not cut off at the float's
+/// edge.
+pub fn upper_layer_clip(float: Option<Rect>, modal: bool, size: Size) -> Option<Rect> {
+    match (float, modal) {
+        (None, false) => None,
+        (Some(rect), false) => Some(rect),
+        _ => Some(Rect::new(0, 0, size.width, size.height)),
+    }
+}
+
 /// One window and everything it draws.
 pub struct WindowUi {
     pub id: WindowId,
@@ -582,12 +608,18 @@ impl WindowUi {
     }
 
     /// Composes the frame.
+    ///
+    /// The mosaic is composed first: tab strip, panes, status bar. Everything that
+    /// must cover the terminal — the floating terminal and the modal overlays — is
+    /// composed into the second layer, which the renderer draws after the mosaic's
+    /// glyphs; that is what stops the mosaic's text from painting over the floating
+    /// terminal.
     pub fn compose(
         &mut self,
         sessions: &mut SessionManager,
         system: &SystemSnapshot,
         images: &BTreeMap<SessionId, SessionImages>,
-    ) -> Scene {
+    ) -> Frame {
         let opacity = self.config.window.opacity.clamp(0.1, 1.0);
         let mut scene = Scene::with_clear(self.theme.palette.background, opacity);
 
@@ -636,17 +668,41 @@ impl WindowUi {
             }
         }
 
-        self.compose_floating(&mut scene, sessions, images);
         self.compose_status_bar(&mut scene, sessions, system);
-        self.compose_overlay(&mut scene, sessions);
-        scene
+        let overlay = self.compose_upper_layer(sessions, images);
+        Frame { scene, overlay }
     }
 
-    /// Paints the floating terminal over the mosaic, below the modal overlays.
+    /// Composes the layer drawn after the mosaic: the floating terminal, and the
+    /// modal overlays above it.
     ///
-    /// Composition order is the whole z-order: the mosaic is painted first, the
-    /// floating terminal covers its centre with an opaque background, and the
-    /// status bar and overlays are composed afterwards, so a dialog still wins.
+    /// Both share one layer because a layer is drawn quads-then-glyphs: the modal
+    /// chrome is pushed after the floating terminal's, so a dialog still covers it
+    /// exactly as it did while both lived in the mosaic scene, and its own labels
+    /// still come last. Nothing covers the floating terminal. The layer is scissored
+    /// to its own rectangle (see [`upper_layer_clip`]), so no row of the floating
+    /// terminal can paint outside its box.
+    fn compose_upper_layer(
+        &self,
+        sessions: &mut SessionManager,
+        images: &BTreeMap<SessionId, SessionImages>,
+    ) -> Option<Scene> {
+        let modal = !matches!(self.overlay, Overlay::None);
+        let clip = upper_layer_clip(self.floating_rect(), modal, self.size)?;
+        let mut scene = Scene {
+            clip: Some(clip),
+            ..Scene::default()
+        };
+        self.compose_floating(&mut scene, sessions, images);
+        self.compose_overlay(&mut scene, sessions);
+        Some(scene)
+    }
+
+    /// Paints the floating terminal into the layer above the mosaic.
+    ///
+    /// The floating terminal covers its box with an opaque background, so the pane
+    /// behind it never shows through, and its rows are clipped to that box by
+    /// `paint_pane`'s per-row text bounds.
     fn compose_floating(
         &self,
         scene: &mut Scene,
@@ -2167,5 +2223,47 @@ mod floating_tests {
             keyboard_pane(None, Some(PaneId::from_raw(3))),
             Some(PaneId::from_raw(3))
         );
+    }
+}
+
+#[cfg(test)]
+mod upper_layer_tests {
+    use super::*;
+
+    #[test]
+    fn nothing_is_drawn_above_the_mosaic_without_a_float_or_a_modal() {
+        assert_eq!(upper_layer_clip(None, false, Size::new(800, 600)), None);
+    }
+
+    #[test]
+    fn a_visible_float_confines_the_layer_to_its_own_rect() {
+        let float = Rect::new(120, 90, 640, 420);
+        assert_eq!(
+            upper_layer_clip(Some(float), false, Size::new(800, 600)),
+            Some(float)
+        );
+    }
+
+    #[test]
+    fn the_float_layer_stays_inside_the_window_content() {
+        let size = Size::new(1280, 800);
+        let content = Rect::new(0, 30, 1280, 740);
+        let float = chrome::float_rect(content);
+        let clip = upper_layer_clip(Some(float), false, size).expect("a visible float has a layer");
+        assert!(clip.x >= 0 && clip.y >= 0, "{clip:?}");
+        assert!(clip.right() <= size.width as i32, "{clip:?}");
+        assert!(clip.bottom() <= size.height as i32, "{clip:?}");
+    }
+
+    #[test]
+    fn a_modal_overlay_keeps_the_whole_window() {
+        let size = Size::new(800, 600);
+        let window = Rect::new(0, 0, 800, 600);
+        assert_eq!(
+            upper_layer_clip(Some(Rect::new(10, 10, 100, 100)), true, size),
+            Some(window),
+            "a dialog dims the whole window, so it must not be scissored to the float"
+        );
+        assert_eq!(upper_layer_clip(None, true, size), Some(window));
     }
 }

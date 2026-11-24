@@ -90,6 +90,13 @@ impl TextItem {
 pub struct Scene {
     /// Window clear colour (the terminal background of the active pane).
     pub clear: [f32; 4],
+    /// Rectangle this scene may paint into when it is drawn as an overlay layer.
+    ///
+    /// The mosaic scene ignores it: it owns the whole target. A layer composed for
+    /// something that only covers part of the window (the floating terminal) names
+    /// its own box here, so the renderer can scissor it and nothing it draws leaks
+    /// outside — see [`crate::Renderer::render`].
+    pub clip: Option<Rect>,
     pub quads: Vec<Quad>,
     pub images: Vec<ImageItem>,
     pub texts: Vec<TextItem>,
@@ -1073,6 +1080,19 @@ mod tests {
         let mut scene = Scene::default();
         paint_cell_backgrounds(&mut scene, (0, 0), &snapshot, &theme(), metrics(), 1);
         assert!(!scene.quads.is_empty());
+    }
+
+    #[test]
+    fn a_scene_that_names_no_clip_covers_the_whole_target() {
+        // The mosaic scene is drawn without a scissor: only a layer composed for
+        // part of the window (the floating terminal) names a clip.
+        let mosaic = Scene::with_clear(Rgb::new(0x1c, 0x1f, 0x26), 1.0);
+        assert_eq!(mosaic.clip, None);
+        let layer = Scene {
+            clip: Some(Rect::new(4, 5, 60, 40)),
+            ..Scene::default()
+        };
+        assert_eq!(layer.clip, Some(Rect::new(4, 5, 60, 40)));
     }
 
     #[test]
