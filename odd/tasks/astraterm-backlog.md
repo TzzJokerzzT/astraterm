@@ -33,6 +33,53 @@ Todo lo de abajo sigue pendiente.
 
 ---
 
+## Versionado y releases
+
+La versión vive en `[workspace.package] version` (`Cargo.toml`) y la reporta
+`astraterm --version`. Un test en `crates/app/src/cli.rs` la fija contra
+`CARGO_PKG_VERSION` y contra la salida exacta del CLI, así que un bump a medias falla la
+suite en lugar de publicar un número que no coincide con el binario.
+
+**Estado**: `1.0.0` está en el código, pero **no tiene tag ni release publicada**. La
+primera tarea de este bloque es justamente esa.
+
+### Regla, a partir de 1.0.0
+
+| Tipo de cambio | Versión | Ejemplos |
+|---|---|---|
+| Feature nueva | MINOR (`1.1.0`) | terminal flotante, soporte de imágenes |
+| Cambio visible en una feature existente, compatible | MINOR | nuevas opciones, nuevos valores de config, mensajes distintos |
+| Cambio que rompe un contrato ya consumido | MAJOR (`2.0.0`) | quitar o renombrar una opción, cambiar el formato de configuración |
+| Corrección que no cambia contratos | PATCH (`1.0.1`) | crash, una tecla mal codificada |
+| Solo documentación, tests o refactor interno | sin bump hasta el próximo release | README, este backlog |
+
+La regla corta, que es la que hay que recordar: **si toca una feature de cara al
+usuario, sube la versión**. Y si la rompe, sube el número mayor.
+
+### Checklist de release
+
+En este orden, siempre:
+
+1. `Cargo.toml`: `version`.
+2. `Cargo.lock`: se actualiza solo con `cargo build --release --locked`.
+3. `packaging/linux/PKGBUILD`: `pkgver`.
+4. `CHANGELOG.md`: entrada con secciones (`Added`, `Changed`, `Fixed`) y fecha real
+   tomada de `date -I`, nunca inventada.
+5. Verificación: `cargo test --workspace`, `cargo clippy --workspace --all-targets`,
+   `cargo fmt --check`.
+6. Commit `chore(release): x.y.z` y tag anotado `git tag -a vX.Y.Z -m "..."`.
+7. `cargo build --release --locked` y `./scripts/setup.sh --dry-run`, para confirmar que
+   las dependencias declaradas siguen siendo las reales.
+
+### Pendiente de decidir
+
+- Si los tags llevan `v` (`v1.0.0`) o no.
+- Si la release se publica en GitHub con las notas del `CHANGELOG.md` o solo con el tag.
+- Si `scripts/setup.sh` debe aceptar `--version <tag>` para instalar una release concreta
+  en vez de compilar el árbol actual.
+
+---
+
 ## Bloque A — Deuda con más valor por línea
 
 ### B1. Kitty graphics por chunks (`m=1`)
