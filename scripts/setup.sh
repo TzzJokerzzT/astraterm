@@ -233,6 +233,11 @@ install_system_packages() {
             ttf-jetbrains-mono-nerd
         )
         install_cmd=(pacman -S --needed)
+        # `--yes` has to mean non-interactive end to end: pacman asks for its own
+        # transaction confirmation, which would block a scripted or CI run.
+        if [ "$assume_yes" -eq 1 ]; then
+            install_cmd+=(--noconfirm)
+        fi
         ;;
     apt)
         # Debian and Ubuntu. The Nerd Font is not packaged here; the font check
