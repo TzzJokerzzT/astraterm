@@ -89,6 +89,19 @@ mod tests {
     }
 
     #[test]
+    fn reported_version_is_the_package_version() {
+        // One version for the whole project: the workspace version in the root
+        // Cargo.toml, which the binary inherits, so `astraterm --version` cannot
+        // drift from the packaged release.
+        assert_eq!(env!("CARGO_PKG_VERSION"), "1.0.0");
+
+        let error = Cli::try_parse_from(["astraterm", "--version"])
+            .expect_err("--version prints the version instead of parsing arguments");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(error.to_string(), "astraterm 1.0.0\n");
+    }
+
+    #[test]
     fn defaults_are_empty() {
         let cli = Cli::parse_from(["astraterm"]);
         assert!(cli.working_directory.is_none());
