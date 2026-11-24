@@ -215,7 +215,13 @@ check_requested_version() {
             "Install git (it is in the package list above) and re-run this script."
     fi
 
-    if ! git -C "$root_dir" rev-parse --git-dir >/dev/null 2>&1; then
+    # `rev-parse --git-dir` walks up to an enclosing repository, so a tarball
+    # unpacked inside another checkout would pass this guard and then be verified
+    # against that other repository. The top level has to be this directory.
+    local top_level
+    top_level=$(git -C "$root_dir" rev-parse --show-toplevel 2>/dev/null || true)
+    if [ -z "$top_level" ] \
+        || [ "$(cd "$top_level" && pwd -P)" != "$(cd "$root_dir" && pwd -P)" ]; then
         fail "$EXIT_VERSION" \
             "$root_dir is not a git checkout." \
             "--version $requested_version installs a tagged release, and without a git" \
@@ -254,10 +260,22 @@ check_requested_version() {
         fi
     fi
 
+    # Being at the tag is not the whole promise: uncommitted edits would be built
+    # and installed while the script called the result that release.
+    local dirty
+    dirty=$(git -C "$root_dir" status --porcelain --untracked-files=no 2>/dev/null || true)
+    if [ -n "$dirty" ]; then
+        fail "$EXIT_VERSION" \
+            "$requested_version is checked out, but tracked files are modified." \
+            "Building now would install code that is not that release. Commit, stash or" \
+            "discard the changes and re-run:" \
+            "  git -C $root_dir status --short"
+    fi
+
     local head_tag head_commit tag_commit
     head_tag=$(git -C "$root_dir" describe --tags --exact-match HEAD 2>/dev/null || true)
     if [ "$head_tag" = "$requested_version" ]; then
-        ok "the working tree is exactly $requested_version"
+        ok "the working tree is exactly $requested_version and clean"
         return 0
     fi
     # `git describe` returns one tag arbitrarily when a commit carries several,
@@ -265,7 +283,7 @@ check_requested_version() {
     head_commit=$(git -C "$root_dir" rev-parse --verify HEAD)
     tag_commit=$(git -C "$root_dir" rev-parse --verify "refs/tags/$requested_version^{commit}")
     if [ "$tag_commit" = "$head_commit" ]; then
-        ok "$requested_version points at HEAD (git describe reported ${head_tag:-no exact tag})"
+        ok "$requested_version points at HEAD and the tree is clean (git describe reported ${head_tag:-no exact tag})"
         return 0
     fi
 
