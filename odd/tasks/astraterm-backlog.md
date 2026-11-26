@@ -44,6 +44,8 @@ Ya implementado y cerrado:
 | Escáner resincroniza tras un OSC malformado           | `dd3b534` (1.1.1)               |
 | Mensajes y orden de `--version` + arnés               | `fix(scripts)` (1.1.2)          |
 | Las imágenes sobreviven a un resize                   | `fix(app)` (1.1.4)              |
+| El escáner resincroniza tras un OSC malformado        | `dd3b534` (1.1.1)               |
+| Kitty: `m=0` en un chunk y no desalojar al añadir     | `fe4eceb` (1.1.5)               |
 
 De la lista de mejoras B1–B18 de este documento, **solo las notificaciones OSC 9/777
 y el kitty por chunks están hechas**. Todo lo demás sigue pendiente.
@@ -214,15 +216,6 @@ verifica y no mueve el checkout. El camino limpio es un worktree temporal:
 - **Coste**: S/M. La decisión de diseño es dónde se pinta (celda del cursor vs overlay).
 - **Verificación**: manual con fcitx5 y una dead key, y con japonés/Chino si hay IME.
 
-### B12. Desincronización del scanner con OSC malformado _(hallazgo de review R3-004)_
-
-- **Por qué**: un OSC 9 sin el `;` que termina en BEL deja bytes en passthrough y el estado
-  en `Foreign`, así que deja de reconocer imágenes/notificaciones hasta el terminador
-  siguiente. Fue introducido por la captura de notificaciones.
-- **Dónde**: `crates/terminal/src/image.rs` (`step_osc`, `step_foreign`).
-- **Coste**: S.
-- **Verificación**: test con `ESC ] 9 BEL` seguido de una imagen válida.
-
 ### B13. Paletas sixel HLS
 
 - **Por qué**: `#n;1;…` devuelve `Unsupported`; completitud del decoder.
@@ -301,6 +294,9 @@ capturas.
   mismo chunk no se cumple.
 - **R4-003**: un cuerpo de 8 MiB se convierte a `String` antes del recorte a 1024
   caracteres; el presupuesto real de memoria es mayor de lo que sugiere el límite.
+- **R4-CLIP-STDERR**: si el helper del portapapeles cierra su stdin antes de tiempo,
+  `set()` devuelve "could not send the text" sin leer el stderr, así que ese caso no
+  cita la causa real.
 
 ### P3. `handle_key_release` no consulta el keymap
 
