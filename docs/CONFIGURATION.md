@@ -211,7 +211,7 @@ The shell, emulation and session behaviour.
 
 ### `[font]`
 
-Typography. Every key here applies live.
+Typography. Every key here applies live except `fallbacks`, which is accepted but never read — see its row.
 
 | Key | Type | Default | Accepted values | Effect |
 |---|---|---|---|---|
@@ -521,6 +521,7 @@ grids and refreshes titles.
 Live without a restart: theme and palette, cursor shape/blink, padding, pane gap,
 divider thickness, tab bar position, strip width, compact tabs, status bar and its
 segments, clock format, font family/size/weight/line height/letter spacing,
+ligatures, `integer_cell_width`, `hinting`, `solid_shades`,
 opacity, `terminal.images`, all keybindings, `confirm_on_close`, `copy_on_select`,
 `open_urls_on_click`, `close_pane_when_shell_exits`, `notifications.on`.
 
