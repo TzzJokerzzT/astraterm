@@ -41,8 +41,9 @@ use crate::paste;
 use crate::prefs::{FONT_SIZE_STEP, Preferences, next_font_size};
 use crate::ui::{
     ClickInfo, ConfirmDialog, DragState, ExitCleanup, Floating, FloatingPress, Overlay,
-    PendingAction, RenameOverlay, SearchOverlay, SessionImages, SplitIdRef, WindowUi,
-    closes_floating, plan_exit_cleanup, plan_floating_press, url_at,
+    PendingAction, RenameOverlay, SearchOverlay, SessionImages, WindowUi,
+    closes_floating, divider_drag_at, plan_exit_cleanup, plan_floating_press,
+    split_lands_in_floating, url_at,
 };
 
 /// Characters of notification body repeated in the status bar.
@@ -551,7 +552,10 @@ impl Application {
                 .values()
                 .find(|ui| {
                     ui.panes.contains_key(&pane)
-                        || ui.floating.is_some_and(|floating| floating.session == id)
+                        || ui
+                            .floating
+                            .as_ref()
+                            .is_some_and(|floating| floating.owns_session(id))
                 })
                 .map(|ui| ui.metrics)
                 .unwrap_or_default();
@@ -761,18 +765,20 @@ impl Application {
         let description = reason.describe();
 
         // The floating terminal is outside the split tree, so its exit cannot be
-        // planned as a pane close: the floating goes away and the next toggle opens
-        // a fresh shell.
+        // planned as a mosaic pane close: the exited pane leaves the float's own
+        // layout, and the last one destroys the float so the next toggle opens a
+        // fresh shell.
         let floating_window = self
             .windows
             .iter()
             .find(|(_, ui)| {
                 ui.floating
-                    .is_some_and(|floating| floating.session == session_id)
+                    .as_ref()
+                    .is_some_and(|floating| floating.owns_session(session_id))
             })
             .map(|(window_id, _)| *window_id);
         if let Some(window_id) = floating_window {
-            self.close_floating(window_id);
+            self.close_floating_pane(window_id, pane);
             self.with_window(window_id, |ui| {
                 ui.set_status(format!("floating session {description}"));
             });
@@ -889,25 +895,23 @@ impl Application {
 
     /// Pushes the grid size of every visible pane to its PTY.
     ///
-    /// The floating terminal sees its own size: the cells that fit in `float_rect`,
-    /// never the size of the window. A hidden floating terminal is not resized at
-    /// all, so hiding it never reflows its buffer.
+    /// The floating terminal's panes see their own sizes: the rectangles its own split
+    /// tree lays out inside `float_rect`, never the size of the window (S7). A hidden
+    /// floating terminal is not resized at all, so hiding it never reflows its
+    /// buffers.
     fn sync_sizes(&mut self, window_id: WinitWindowId) {
-        let Some((sizes, cell, floating_size)) = self.windows.get(&window_id).map(|ui| {
+        let Some((sizes, cell)) = self.windows.get(&window_id).map(|ui| {
             let sizes: Vec<(PaneId, (u16, u16))> = ui
                 .pane_rects()
                 .into_iter()
+                .chain(ui.floating_pane_rects())
                 .map(|(pane, rect)| (pane, ui.grid_size(rect)))
                 .collect();
             let cell = (
                 ui.metrics.width.round().max(1.0) as u16,
                 ui.metrics.height.max(1) as u16,
             );
-            let floating_size = ui.floating.as_ref().and_then(|floating| {
-                ui.floating_rect()
-                    .map(|rect| (floating.session, ui.grid_size(rect)))
-            });
-            (sizes, cell, floating_size)
+            (sizes, cell)
         }) else {
             return;
         };
@@ -923,14 +927,6 @@ impl Application {
                 resized_grids.push((session.id, session.engine.line_range()));
                 resized = true;
             }
-        }
-        if let Some((session_id, (cols, rows))) = floating_size
-            && let Some(session) = self.sessions.get_mut(session_id)
-            && (session.engine.size() != (cols, rows) || !session.pty_matches(cols, rows))
-        {
-            session.resize(cols, rows, cell.0, cell.1);
-            resized_grids.push((session.id, session.engine.line_range()));
-            resized = true;
         }
         // A resize reflows the buffer and an image anchor is a bare line number, so
         // the anchors the new grid kept are kept with it, off screen or not: the
@@ -1002,14 +998,15 @@ impl Application {
             AppCommand::CloseTab { .. } => self.request_close_tab(window_id, active_tab),
             AppCommand::ClosePane { .. } => {
                 if let Some(pane) = focused_pane {
-                    // The floating terminal is not in the split tree, so closing it
-                    // destroys it instead of closing a pane of the mosaic.
-                    if self
+                    // The floating terminal is not in the split tree, so closing one of
+                    // its panes closes it inside the float, and closing the last one
+                    // destroys the float and its sessions (S7).
+                    let floats = self
                         .windows
                         .get(&window_id)
-                        .is_some_and(|ui| closes_floating(ui.floating.as_ref(), pane))
-                    {
-                        self.close_floating(window_id);
+                        .is_some_and(|ui| closes_floating(ui.floating.as_ref(), pane));
+                    if floats {
+                        self.close_floating_pane(window_id, pane);
                     } else {
                         self.request_close_pane(window_id, pane);
                     }
@@ -1017,20 +1014,31 @@ impl Application {
             }
             AppCommand::SplitPane { axis, .. } => {
                 tracing::debug!(?axis, ?focused_pane, "split requested");
-                // A new pane joins the mosaic, so the split always targets a pane of
-                // the split tree even while the floating terminal has the focus.
-                let target = self
+                // A visible floating terminal owns the keys, so the split lands inside
+                // it and the mosaic keeps its panes; otherwise a new pane joins the
+                // mosaic (S7).
+                let floats = self
                     .windows
                     .get(&window_id)
-                    .and_then(WindowUi::mosaic_pane)
-                    .or(focused_pane);
-                match target {
-                    Some(pane) => {
-                        if let Err(error) = self.split_pane(window_id, pane, axis) {
-                            tracing::error!(error = %error, "could not split the pane");
+                    .is_some_and(|ui| split_lands_in_floating(ui.floating.as_ref()));
+                let result = if floats {
+                    self.split_floating(window_id, axis)
+                } else {
+                    match self
+                        .windows
+                        .get(&window_id)
+                        .and_then(WindowUi::mosaic_pane)
+                        .or(focused_pane)
+                    {
+                        Some(pane) => self.split_pane(window_id, pane, axis),
+                        None => {
+                            tracing::debug!("no focused pane to split");
+                            Ok(())
                         }
                     }
-                    None => tracing::debug!("no focused pane to split"),
+                };
+                if let Err(error) = result {
+                    tracing::error!(error = %error, "could not split the pane");
                 }
             }
             AppCommand::FocusPane { pane } => {
@@ -1115,7 +1123,7 @@ impl Application {
                 let split = self.focused_split(window_id, axis);
                 if let Some(split) = split {
                     self.with_window(window_id, |ui| {
-                        if let Some(tab) = ui.workspace.active_tab_mut() {
+                        if let Some(tab) = ui.driven_tab_mut() {
                             tab.root.adjust_ratio(split, delta_percent as f32 / 100.0);
                         }
                     });
@@ -1125,7 +1133,7 @@ impl Application {
             }
             AppCommand::EqualizeSplits => {
                 self.with_window(window_id, |ui| {
-                    if let Some(tab) = ui.workspace.active_tab_mut() {
+                    if let Some(tab) = ui.driven_tab_mut() {
                         tab.root.equalize();
                     }
                 });
@@ -1134,7 +1142,7 @@ impl Application {
             }
             AppCommand::ToggleZoom => {
                 self.with_window(window_id, |ui| {
-                    if let Some(tab) = ui.workspace.active_tab_mut() {
+                    if let Some(tab) = ui.driven_tab_mut() {
                         tab.toggle_zoom();
                     }
                 });
@@ -1213,14 +1221,21 @@ impl Application {
         }
     }
 
+    /// Divider the resize shortcuts act on, in the layout the keyboard drives.
     fn focused_split(
         &self,
         window_id: WinitWindowId,
         axis: SplitAxis,
     ) -> Option<astraterm_workspace::tree::SplitId> {
         let ui = self.windows.get(&window_id)?;
-        let tab = ui.workspace.active_tab()?;
-        let rect = ui.terminal_rect();
+        let tab = ui.driven_tab()?;
+        // The dividers live in the rectangle their layout was computed in: the
+        // floating box for the float, the terminal area otherwise.
+        let rect = if split_lands_in_floating(ui.floating.as_ref()) {
+            ui.floating_rect()?
+        } else {
+            ui.terminal_rect()
+        };
         let dividers = tab.dividers(rect, ui.layout);
         let pane = ui.focused_pane();
         let matching: Vec<_> = dividers
@@ -1315,7 +1330,10 @@ impl Application {
         let Some((cols, rows, cell, parent, recorded_cwd)) =
             self.windows.get(&window_id).map(|ui| {
                 let (cols, rows) = ui.grid_size(ui.terminal_rect());
-                let parent = ui.focused_pane();
+                // The parent is the active tab's pane, not the pane that owns the
+                // keyboard: while the floating terminal is visible the keyboard is the
+                // float's and its directory must not leak into a mosaic tab (S6).
+                let parent = ui.mosaic_pane();
                 let recorded_cwd = parent
                     .and_then(|pane| ui.panes.get(&pane))
                     .and_then(|meta| meta.cwd.clone());
@@ -1334,8 +1352,8 @@ impl Application {
             return Ok(());
         };
 
-        // A new tab starts where the pane it is opened from is now, not where that
-        // pane was created (S3, S4).
+        // A new tab starts where the active tab's focused pane is now, not where that
+        // pane was created (S3, S4, S6).
         let live_cwd = self.parent_live_cwd(parent, recorded_cwd);
         let profile_ref =
             profile.and_then(|id| config.profiles.get(id.raw().saturating_sub(1) as usize));
@@ -1557,26 +1575,152 @@ impl Application {
         Ok(())
     }
 
-    /// Destroys the floating terminal and its session.
+    /// Splits the focused pane of the floating terminal (S7).
     ///
-    /// Used by `ClosePane` while the floating terminal has the focus and by the exit
-    /// of its shell. Focus needs no bookkeeping: with no floating terminal left the
-    /// keyboard resolves to the mosaic, exactly as before it was opened.
+    /// The new pane joins the float's own layout, so the mosaic's pane count, ratios
+    /// and sizes stay exactly as they were, and nothing about the float is persisted
+    /// (S5).
+    fn split_floating(&mut self, window_id: WinitWindowId, axis: SplitAxis) -> anyhow::Result<()> {
+        let config = self.config.config().clone();
+        let Some((cols, rows, cell, parent, recorded_cwd, profile_id)) = self
+            .windows
+            .get(&window_id)
+            .and_then(|ui| {
+                let rect = ui.floating_rect()?;
+                let (cols, rows) = ui.grid_size(rect);
+                let parent = ui.floating.as_ref()?.active_pane();
+                let meta = ui.panes.get(&parent);
+                Some((
+                    cols,
+                    rows,
+                    (
+                        ui.metrics.width.round().max(1.0) as u16,
+                        ui.metrics.height.max(1) as u16,
+                    ),
+                    parent,
+                    meta.and_then(|meta| meta.cwd.clone()),
+                    meta.and_then(|meta| meta.profile),
+                ))
+            })
+        else {
+            return Ok(());
+        };
+
+        // The new floating pane starts where the split pane is now, the same rule as
+        // the mosaic's splits (S4).
+        let cwd = self.parent_live_cwd(Some(parent), recorded_cwd);
+        let profile_ref =
+            profile_id.and_then(|id| config.profiles.get(id.raw().saturating_sub(1) as usize));
+        let new_pane = PaneId::next();
+        // The first guess is the half a split of this axis leaves behind; the exact
+        // grid follows in `sync_sizes` once the layout exists.
+        let (start_cols, start_rows) = match axis {
+            SplitAxis::Vertical => ((cols / 2).max(1), rows),
+            SplitAxis::Horizontal => (cols, (rows / 2).max(1)),
+        };
+        let spec = astraterm_session::session_spec(
+            &config,
+            profile_ref,
+            profile_id,
+            cwd.clone(),
+            start_cols,
+            start_rows,
+            cell,
+        );
+        let session = self.sessions.create(new_pane, &spec, start_cols, start_rows)?;
+
+        let split = self
+            .with_window(window_id, |ui| {
+                ui.floating
+                    .as_mut()
+                    .is_some_and(|floating| floating.split_active(axis, new_pane, session))
+            })
+            .unwrap_or(false);
+        if !split {
+            tracing::warn!(?axis, "the floating terminal refused the new pane");
+            self.sessions.close(session);
+            return Ok(());
+        }
+
+        let mut meta = Pane::new(new_pane);
+        meta.cwd = cwd;
+        meta.profile = profile_id;
+        self.with_window(window_id, |ui| {
+            ui.panes.insert(new_pane, meta);
+            ui.session_bindings.insert(new_pane, session);
+            ui.window.request_redraw();
+        });
+        self.sync_sizes(window_id);
+        Ok(())
+    }
+
+    /// Closes one pane of the floating terminal.
+    ///
+    /// Closing a pane that is not the last one leaves the float with its remaining
+    /// panes; closing the last one destroys the float and its sessions, exactly as the
+    /// single-pane float did (S7).
+    fn close_floating_pane(&mut self, window_id: WinitWindowId, pane: PaneId) {
+        let Some(session) = self.windows.get(&window_id).and_then(|ui| {
+            let floating = ui.floating.as_ref()?;
+            // A pane the float does not hold is not closed here: failing to close it
+            // must not be mistaken for "this was the last pane".
+            if !floating.contains(pane) {
+                return None;
+            }
+            floating.session_of(pane)
+        }) else {
+            return;
+        };
+        let closed = self
+            .with_window(window_id, |ui| {
+                let closed = ui
+                    .floating
+                    .as_mut()
+                    .is_some_and(|floating| floating.close_pane(pane));
+                if closed {
+                    ui.panes.remove(&pane);
+                    ui.session_bindings.remove(&pane);
+                    ui.window.request_redraw();
+                }
+                closed
+            })
+            .unwrap_or(false);
+        if !closed {
+            self.close_floating(window_id);
+            return;
+        }
+        self.sessions.close(session);
+        self.last_notification.remove(&session);
+        self.sync_sizes(window_id);
+    }
+
+    /// Destroys the floating terminal and every session it holds.
+    ///
+    /// Used when its last pane closes and by the exit of a single-pane float's shell.
+    /// Focus needs no bookkeeping: with no floating terminal left the keyboard resolves
+    /// to the mosaic, exactly as before it was opened.
     fn close_floating(&mut self, window_id: WinitWindowId) {
-        let Some((pane, session)) = self.windows.get(&window_id).and_then(|ui| {
-            ui.floating
-                .map(|floating| (floating.pane, floating.session))
+        let Some((panes, sessions)) = self.windows.get(&window_id).and_then(|ui| {
+            let floating = ui.floating.as_ref()?;
+            Some((
+                floating.panes(),
+                floating.session_ids().collect::<Vec<_>>(),
+            ))
         }) else {
             return;
         };
         self.with_window(window_id, |ui| {
             ui.floating = None;
-            ui.panes.remove(&pane);
-            ui.session_bindings.remove(&pane);
+            for pane in panes {
+                ui.panes.remove(&pane);
+                ui.session_bindings.remove(&pane);
+            }
             ui.window.request_redraw();
         });
-        self.sessions.close(session);
-        self.last_notification.remove(&session);
+        for session in sessions {
+            self.sessions.close(session);
+            self.last_notification.remove(&session);
+        }
         self.sync_sizes(window_id);
     }
 
@@ -2556,11 +2700,6 @@ impl Application {
         }
 
         let Some(pane) = ui.pane_at(x, y) else { return };
-        // A click inside the floating terminal never grabs the divider that lies
-        // behind it.
-        let floating_hit = ui
-            .floating
-            .is_some_and(|floating| floating.visible && floating.pane == pane);
         let Some((column, row, modes)) = ui.cell_at(pane, x, y).and_then(|(column, row)| {
             self.sessions
                 .for_pane(pane)
@@ -2604,7 +2743,7 @@ impl Application {
             if button != MouseButton::Left {
                 return;
             }
-            if !floating_hit && let Some(drag) = self.divider_at(window_id, x, y) {
+            if let Some(drag) = self.divider_at(window_id, x, y) {
                 self.with_window(window_id, |ui| ui.drag = drag);
                 return;
             }
@@ -2625,39 +2764,22 @@ impl Application {
         }
     }
 
+    /// Divider drag under the pointer, if any.
+    ///
+    /// The floating terminal is drawn over the mosaic, so a point inside its box
+    /// resolves against its own dividers and never against one that lies behind it
+    /// (S7).
     fn divider_at(&self, window_id: WinitWindowId, x: f64, y: f64) -> Option<DragState> {
         let ui = self.windows.get(&window_id)?;
+        let tolerance = (ui.layout.divider.max(2) as f64) + 2.0;
+        if let Some(rect) = ui.floating_rect()
+            && rect.contains(x, y)
+        {
+            return divider_drag_at(&ui.floating_dividers(), rect, tolerance, x, y);
+        }
         let tab = ui.workspace.active_tab()?;
         let rect = ui.terminal_rect();
-        let tolerance = (ui.layout.divider.max(2) as f64) + 2.0;
-        for (split, axis, divider) in tab.dividers(rect, ui.layout) {
-            let (hit, start, extent) = match axis {
-                SplitAxis::Vertical => (
-                    (x - divider.x as f64).abs() <= tolerance
-                        && y >= divider.y as f64
-                        && y <= divider.bottom() as f64,
-                    x,
-                    rect.width as f64,
-                ),
-                SplitAxis::Horizontal => (
-                    (y - divider.y as f64).abs() <= tolerance
-                        && x >= divider.x as f64
-                        && x <= divider.right() as f64,
-                    y,
-                    rect.height as f64,
-                ),
-            };
-            if hit {
-                return Some(DragState::Divider {
-                    split: SplitIdRef(split.raw()),
-                    axis,
-                    start,
-                    extent: extent.max(1.0),
-                    applied: 0.0,
-                });
-            }
-        }
-        None
+        divider_drag_at(&tab.dividers(rect, ui.layout), rect, tolerance, x, y)
     }
 
     fn begin_selection(&mut self, window_id: WinitWindowId, pane: PaneId, column: u16, row: u16) {
@@ -2764,19 +2886,10 @@ impl Application {
                 let delta = total - applied;
                 if delta.abs() > 0.002 {
                     self.with_window(window_id, |ui| {
-                        let rect = ui.terminal_rect();
-                        let layout = ui.layout;
-                        let target = ui.workspace.active_tab().and_then(|tab| {
-                            tab.dividers(rect, layout)
-                                .into_iter()
-                                .find(|(split_id, _, _)| split_id.raw() == split.0)
-                                .map(|(split_id, _, _)| split_id)
-                        });
-                        if let Some(split_id) = target
-                            && let Some(tab) = ui.workspace.active_tab_mut()
-                        {
-                            tab.root.adjust_ratio(split_id, delta);
-                        }
+                        // A split identifier is unique in the process, so the tree that
+                        // owns the divider is unambiguous: a float drag resizes only the
+                        // float's panes, a mosaic drag only the mosaic's (S7).
+                        ui.adjust_split_ratio(split.0, delta);
                         ui.drag = DragState::Divider {
                             split,
                             axis,
@@ -3281,6 +3394,70 @@ mod parent_directory_tests {
     #[test]
     fn a_window_with_no_parent_pane_leaves_the_choice_to_the_policy() {
         assert_eq!(parent_directory(None, None), None);
+    }
+}
+
+#[cfg(test)]
+mod new_tab_parent_tests {
+    use std::path::PathBuf;
+
+    use astraterm_core::{PaneId, SessionId, WindowId};
+    use astraterm_workspace::{Tab, WindowState};
+
+    use super::parent_directory;
+    use crate::ui::{Floating, keyboard_pane, tab_parent};
+
+    #[test]
+    fn a_new_tab_opens_where_the_active_tab_is_while_the_float_has_the_focus() {
+        let mosaic = PaneId::from_raw(3);
+        let mut workspace = WindowState::new(WindowId::from_raw(1), Tab::new("mosaic", mosaic));
+        // A second tab exists, so "the active tab" is a real choice and not just the
+        // only tab there is.
+        workspace.add_tab(Tab::new("other", PaneId::from_raw(5)));
+        assert!(workspace.select_index(0));
+
+        let mut floating = Floating::new(PaneId::from_raw(7), SessionId::from_raw(21));
+        floating.set_visible(true);
+
+        // Premise of the bug: the visible float owns the keyboard, so a parent taken
+        // from the focus would name the floating pane.
+        assert_eq!(
+            keyboard_pane(Some(&floating), tab_parent(&workspace)),
+            Some(PaneId::from_raw(7))
+        );
+
+        // A new tab is opened from the active tab instead (T4, S6).
+        let parent = tab_parent(&workspace);
+        assert_eq!(parent, Some(mosaic));
+
+        let live = |pane: PaneId| -> Option<PathBuf> {
+            match pane {
+                pane if pane == mosaic => Some(PathBuf::from("/work/mosaic")),
+                pane if pane == floating.active_pane() => Some(PathBuf::from("/work/float")),
+                _ => None,
+            }
+        };
+        let inherited = parent_directory(None, parent.and_then(live));
+        assert_eq!(
+            inherited,
+            Some(PathBuf::from("/work/mosaic")),
+            "the tab starts in the active tab's directory"
+        );
+        assert_ne!(
+            inherited,
+            live(floating.active_pane()),
+            "the floating pane's directory must not leak into a mosaic tab"
+        );
+        // The regression this pins: taking the parent from the pane that owns the keys
+        // — what the tab path did before — resolves to the floating pane and inherits
+        // the wrong directory.
+        assert_eq!(
+            parent_directory(
+                None,
+                keyboard_pane(Some(&floating), parent).and_then(live)
+            ),
+            Some(PathBuf::from("/work/float"))
+        );
     }
 }
 

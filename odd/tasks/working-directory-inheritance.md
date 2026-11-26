@@ -26,11 +26,22 @@ S5. Nothing about the mosaic layout changes: the floating terminal stays outside
 never participates in reflow, and its panes are not persisted as part of the mosaic workspace until
 S2 requires it.
 
+S6. A new tab inherits the directory of the tab that is **active** when it is opened, including while
+the floating terminal has the focus and owns the keys. The floating pane's directory must not leak
+into a mosaic tab.
+
+S7. Splits created while the floating terminal has the focus land inside the floating terminal, not
+in the mosaic, and the floating terminal can hold more than one pane with its own dividers and sizes.
+The floating terminal keeps a single tab; several tabs inside it remain a separate task.
+
 ## Tasks
 
 T1 — S1, S4 — floating terminal resolves the focused pane's live cwd — commit 9
 T2 — S3, S4 — a new tab resolves the focused pane's live cwd instead of `None` — commit 9
 T3 — S2 — the floating terminal owns its own tab set with splits — commit 10
+T4 — S6 — a new tab inherits the active tab's directory, not the floating pane's — commit 10
+T5 — S7 — splits while the floating terminal has focus land in the floating terminal — commit 11
+T6 — S2 remainder — several tabs inside the floating terminal — unscheduled
 
 ## Log
 
@@ -62,3 +73,14 @@ profile setting `working_directory = "home"` no longer forces home for these two
 under the default `home` policy still starts in `$HOME` while a new tab inherits, because S4 scoped
 the change to the floating terminal and to tabs and asked to keep splits as they are. Making that
 uniform is a one-line change if the asymmetry ever bothers anyone.
+
+L4. User corrections after T1/T2, verbatim: «me equivoque al redactarte la funcionalidad de las
+pestañas, quiero que cuando se abra una pestaña quiero que herede la ruta de la pestaña activa» and
+«Y tambien se te olvido implementar el crear splits en la terminal flotante». S6 therefore pins the
+tab case to the active tab instead of whatever pane holds the keys — the implemented path used
+`ui.focused_pane()`, which is the floating pane while the float is visible — and S7/T5 bring splits
+into the floating terminal, which T3 had scoped out.
+
+L5. «El degradado se sigue viendo separado y la parte mas clara en puntos activando o desactivando
+el interger_cell_width». The fractional-cell seam measured earlier was therefore not the whole
+story; to be re-measured on the real prompt before touching the renderer again.
