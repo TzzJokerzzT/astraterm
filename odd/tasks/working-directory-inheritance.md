@@ -9,8 +9,9 @@ S1. Floating terminal inherits the directory it is opened from, verbatim: «cuan
 flotante herede la ruta desde la cual se esta abriendo, decir que si estoy
 /home/alex_buelvas/project la terminal flotante tambien abra desde esa ruta».
 
-S2. The floating terminal can hold more than one pane and more than one tab, verbatim: «que pueda en
-la terminal flotante abrir otros paneles o pestañas».
+S2. The floating terminal can hold more than one pane, verbatim: «que pueda en la terminal flotante
+abrir otros paneles o pestañas». Several tabs inside it are **not** implemented: the floating
+terminal stores a single `Tab` (`crates/app/src/ui.rs`), and T6 carries that remainder.
 
 S3. A new tab inherits the directory of the pane it is opened from, verbatim: «cuando habra otra
 pestaña en la terminal herede la ruta del padre».
@@ -38,7 +39,7 @@ The floating terminal keeps a single tab; several tabs inside it remain a separa
 
 T1 — S1, S4 — floating terminal resolves the focused pane's live cwd — commit 9
 T2 — S3, S4 — a new tab resolves the focused pane's live cwd instead of `None` — commit 9
-T3 — S2 — the floating terminal owns its own tab set with splits — commit 10
+T3 — S2 — the floating terminal owns its own layout (a single tab) with splits — commit 10
 T4 — S6 — a new tab inherits the active tab's directory, not the floating pane's — commit 10
 T5 — S7 — splits while the floating terminal has focus land in the floating terminal — commit 11
 T6 — S2 remainder — several tabs inside the floating terminal — unscheduled

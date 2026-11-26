@@ -1042,20 +1042,22 @@ impl Application {
                 }
             }
             AppCommand::FocusPane { pane } => {
-                self.with_window(window_id, |ui| {
-                    if let Some(tab) = ui.workspace.active_tab_mut() {
-                        tab.focus(pane);
-                    }
-                    ui.window.request_redraw();
-                });
+                // The focus follows the layout that holds the pane: a floating pane
+                // focuses inside the float and a mosaic pane inside its tab, so the
+                // keyboard keeps reaching the pane that was asked for (S7).
+                let focused = self
+                    .with_window(window_id, |ui| ui.focus_pane(pane))
+                    .unwrap_or(false);
+                if focused {
+                    self.with_window(window_id, |ui| ui.window.request_redraw());
+                }
             }
             AppCommand::FocusDirection { direction } => {
+                // While the float is visible it owns the keys, so the focus moves
+                // between its panes and stops at its edge instead of reaching the
+                // mosaic behind it (S7).
                 self.with_window(window_id, |ui| {
-                    let rect = ui.terminal_rect();
-                    let layout = ui.layout;
-                    if let Some(tab) = ui.workspace.active_tab_mut() {
-                        tab.focus_direction(direction, rect, layout);
-                    }
+                    ui.focus_direction(direction);
                     ui.window.request_redraw();
                 });
             }
@@ -1606,8 +1608,11 @@ impl Application {
             return Ok(());
         };
 
-        // The new floating pane starts where the split pane is now, the same rule as
-        // the mosaic's splits (S4).
+        // The policy decides first, exactly as it does for a mosaic split: a profile
+        // or `[terminal] working_directory` directory wins, and the split pane's live
+        // directory only resolves a `current`/`inherit` policy (S4). Under the default
+        // `home` policy the new floating pane therefore starts in `$HOME`, like a
+        // mosaic split and unlike a new tab or the float itself, which inherit.
         let cwd = self.parent_live_cwd(Some(parent), recorded_cwd);
         let profile_ref =
             profile_id.and_then(|id| config.profiles.get(id.raw().saturating_sub(1) as usize));
@@ -2699,12 +2704,22 @@ impl Application {
             return;
         }
 
-        let Some(pane) = ui.pane_at(x, y) else { return };
-        let Some((column, row, modes)) = ui.cell_at(pane, x, y).and_then(|(column, row)| {
-            self.sessions
-                .for_pane(pane)
-                .map(|session| (column, row, session.engine.modes()))
+        // The pointer resolves the pane under the cursor through `click_pane`, so a
+        // click inside the floating terminal also makes that pane the float's active
+        // pane: the keys and the next split then follow the pane the user picked
+        // instead of whichever pane a split or a close left focused (S7).
+        let Some((pane, column, row)) = self.windows.get_mut(&window_id).and_then(|ui| {
+            let pane = ui.click_pane(x, y)?;
+            let (column, row) = ui.cell_at(pane, x, y)?;
+            Some((pane, column, row))
         }) else {
+            return;
+        };
+        let Some(modes) = self
+            .sessions
+            .for_pane(pane)
+            .map(|session| session.engine.modes())
+        else {
             return;
         };
 

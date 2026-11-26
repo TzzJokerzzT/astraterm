@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 use astraterm_config::schema::{Config, CursorStyle, TabBarPosition};
 use astraterm_config::themes::Theme;
-use astraterm_core::{CellMetrics, PaneId, Rect, SessionId, Size, SplitAxis, TabId, WindowId};
+use astraterm_core::{
+    CellMetrics, FocusDirection, PaneId, Rect, SessionId, Size, SplitAxis, TabId, WindowId,
+};
 use astraterm_platform::system::SystemSnapshot;
 use astraterm_renderer::Renderer;
 use astraterm_renderer::paint::{self, ImageItem, ImagePixels, PaintOptions, Scene, TextItem};
@@ -215,6 +217,40 @@ impl Floating {
         self.tab.zoomed.unwrap_or(self.tab.active_pane)
     }
 
+    /// Makes `pane` the floating terminal's focused pane.
+    ///
+    /// Returns `false` for a pane the float does not hold, so no caller can hand the
+    /// float's focus to a mosaic pane. Focus survives a hide/show cycle because it
+    /// lives in the float's tab, which hiding never touches.
+    pub fn focus(&mut self, pane: PaneId) -> bool {
+        self.tab.focus(pane)
+    }
+
+    /// Focuses the floating pane under a pointer position.
+    ///
+    /// Hit testing and focusing are one step so the pointer path can never report a
+    /// floating pane without making it the float's active pane. `None` means the
+    /// point hit no floating pane, in which case the focus is left alone.
+    pub fn focus_at(&mut self, rects: &[(PaneId, Rect)], x: f64, y: f64) -> Option<PaneId> {
+        let pane = pane_at_point(rects, x, y)?;
+        self.focus(pane).then_some(pane)
+    }
+
+    /// Moves the float's focus one pane in `direction`.
+    ///
+    /// `rect` is the float's box and `layout` the layout config, exactly as a mosaic
+    /// tab does it, so the traversal is geometric. Returns `false` when nothing lies
+    /// that way: the focus stays inside the float and never jumps to the mosaic
+    /// behind it.
+    pub fn focus_direction(
+        &mut self,
+        direction: FocusDirection,
+        rect: Rect,
+        layout: LayoutConfig,
+    ) -> bool {
+        self.tab.focus_direction(direction, rect, layout)
+    }
+
     /// Panes of the floating terminal, in layout order.
     pub fn panes(&self) -> Vec<PaneId> {
         self.tab.panes()
@@ -325,6 +361,23 @@ pub fn tab_parent(workspace: &WindowState) -> Option<PaneId> {
     workspace
         .active_tab()
         .map(|tab| tab.zoomed.unwrap_or(tab.active_pane))
+}
+
+/// Whether one pane of a layout draws its border, which is also whether its images
+/// are inset by that border's pixel.
+///
+/// `paint_pane` and `compose_images` must agree on this value or an image lands a
+/// pixel off the cells it was anchored to. A mosaic pane shows a border only when
+/// its tab holds more than one pane, so a lone mosaic pane fills its area. The
+/// floating terminal always shows one — even when it holds a single pane — because
+/// the float is a box drawn over the mosaic and the border is what separates it
+/// from the text behind it. That is what the single-pane float painted before the
+/// float could be split, and a split must not move its images or its glyphs.
+///
+/// `floating` is `true` for a floating pane and `panes` is the pane count of the
+/// layout the pane belongs to.
+pub fn pane_shows_border(floating: bool, panes: usize) -> bool {
+    floating || panes > 1
 }
 
 /// Pointer drag in progress.
@@ -716,6 +769,59 @@ impl WindowUi {
         pane_at_point(&self.pane_rects(), x, y)
     }
 
+    /// Pane under a pointer position, focusing it when it is a floating pane.
+    ///
+    /// This is what a click resolves through, so a point inside the floating
+    /// terminal makes the pane under the pointer the float's active pane instead of
+    /// only reporting the hit: without it the float's focus would stay on whichever
+    /// pane a split or a close last touched, and the original pane of a split could
+    /// never be reached again (S7). A mosaic pane is only resolved — a click there
+    /// selects text and never moves the mosaic's focus, which is how it behaved
+    /// before the float could hold more than one pane.
+    pub fn click_pane(&mut self, x: f64, y: f64) -> Option<PaneId> {
+        if !self.floating_rect().is_some_and(|rect| rect.contains(x, y)) {
+            return self.pane_at(x, y);
+        }
+        let rects = self.floating_pane_rects();
+        self.floating
+            .as_mut()
+            .and_then(|floating| floating.focus_at(&rects, x, y))
+    }
+
+    /// Makes `pane` the focused pane of the layout that holds it.
+    ///
+    /// A floating pane focuses inside the float, so this can never hand the float's
+    /// focus to a mosaic pane or the mosaic's focus to a float; the keyboard keeps
+    /// reaching the pane that was asked for.
+    pub fn focus_pane(&mut self, pane: PaneId) -> bool {
+        if let Some(floating) = self.floating.as_mut()
+            && floating.contains(pane)
+        {
+            return floating.focus(pane);
+        }
+        self.workspace
+            .active_tab_mut()
+            .is_some_and(|tab| tab.focus(pane))
+    }
+
+    /// Moves the focus one pane in `direction` inside the layout the keys drive.
+    ///
+    /// The floating terminal drives the keys while it is visible, so the focus moves
+    /// between its panes and stops at the float's edge instead of jumping into the
+    /// mosaic behind it.
+    pub fn focus_direction(&mut self, direction: FocusDirection) -> bool {
+        let layout = self.layout;
+        if let Some(rect) = self.floating_rect()
+            && let Some(floating) = self.floating.as_mut()
+        {
+            return floating.focus_direction(direction, rect, layout);
+        }
+        let rect = self.terminal_rect();
+        self.workspace
+            .active_tab_mut()
+            .is_some_and(|tab| tab.focus_direction(direction, rect, layout))
+    }
+
     /// Rectangle of a pane on screen, mosaic or floating.
     pub fn pane_rect(&self, pane: PaneId) -> Option<Rect> {
         if self
@@ -910,6 +1016,9 @@ impl WindowUi {
 
         let focused = self.focused_pane();
         let rects = self.pane_rects();
+        // A mosaic tab frames its panes only once it is split; the images follow the
+        // same decision as the glyphs so an image stays on its cells.
+        let show_border = pane_shows_border(false, rects.len());
         for (index, (pane, rect)) in rects.iter().enumerate() {
             let live = sessions.for_pane_mut(*pane);
             let Some(session) = live else {
@@ -928,7 +1037,7 @@ impl WindowUi {
                 // make the window look opaque.
                 background_alpha: 0.0,
                 focused: focused == Some(*pane),
-                show_border: rects.len() > 1,
+                show_border,
             };
             paint::paint_pane(
                 &mut scene,
@@ -944,7 +1053,7 @@ impl WindowUi {
             // Images are anchored to buffer lines, so they are drawn from the
             // pane's session and placed on the same grid the glyphs use.
             if let Some(anchored) = images.get(&session_id) {
-                self.compose_images(&mut scene, *rect, rects.len() > 1, &snapshot, anchored);
+                self.compose_images(&mut scene, *rect, show_border, &snapshot, anchored);
             }
 
             if let Overlay::Search(search) = &self.overlay {
@@ -999,8 +1108,12 @@ impl WindowUi {
             return;
         };
         let focused = floating.active_pane();
-        // More than one floating pane shows borders, exactly like a split mosaic.
-        let split = floating.pane_count() > 1;
+        // A floating pane is always framed, split or not: the float is a box drawn
+        // over the mosaic, so its border is what separates it from the text behind
+        // it. The single-pane float painted one before the float could be split, and
+        // its images were inset by it, so the same decision feeds both `paint_pane`
+        // and `compose_images` (R3-001).
+        let show_border = pane_shows_border(true, floating.pane_count());
         let panes: Vec<(PaneId, SessionId, Rect)> = self
             .floating_pane_rects()
             .into_iter()
@@ -1025,7 +1138,7 @@ impl WindowUi {
                 // not show through its cells.
                 background_alpha: 1.0,
                 focused: focused == pane,
-                show_border: true,
+                show_border,
             };
             paint::paint_pane(
                 scene,
@@ -1038,7 +1151,7 @@ impl WindowUi {
                 &mut self.renderer.measure(),
             );
             if let Some(anchored) = images.get(&session_id) {
-                self.compose_images(scene, rect, split, &snapshot, anchored);
+                self.compose_images(scene, rect, show_border, &snapshot, anchored);
             }
             if let Overlay::Search(search) = &self.overlay {
                 self.paint_search_highlights(scene, rect, &snapshot, search);
@@ -2809,6 +2922,164 @@ mod floating_tests {
         assert!(!float.close_pane(PaneId::from_raw(99)));
         assert_eq!(float.pane_count(), 2);
         assert_eq!(float.session_of(second), Some(SessionId::from_raw(22)));
+    }
+
+    /// The rectangles the floating panes are drawn at, inside the float box.
+    fn float_rects(float: &Floating) -> Vec<(PaneId, Rect)> {
+        let rect = chrome::float_rect(content());
+        float
+            .tab
+            .layout(rect, config())
+            .into_iter()
+            .map(|placement| (placement.pane, placement.rect))
+            .collect()
+    }
+
+    /// Centre of one floating pane, which is where a click lands on it.
+    fn float_centre(rects: &[(PaneId, Rect)], pane: PaneId) -> (f64, f64) {
+        let (_, rect) = rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .expect("the pane has a rectangle inside the float");
+        (
+            (rect.x + rect.width as i32 / 2) as f64,
+            (rect.y + rect.height as i32 / 2) as f64,
+        )
+    }
+
+    /// T5/S7 + R3-002: clicking a floating pane makes it the float's active pane —
+    /// the pointer resolves the pane *and* focuses it — so `keyboard_pane` reports
+    /// the pane that was clicked instead of the one the split left focused.
+    #[test]
+    fn a_click_inside_a_floating_pane_makes_it_the_active_floating_pane() {
+        let (mut float, first, second) = split_floating();
+        let mosaic = Some(PaneId::from_raw(3));
+        assert_eq!(
+            float.active_pane(),
+            second,
+            "the split focused the new pane"
+        );
+
+        for pane in [first, second] {
+            let rects = float_rects(&float);
+            let (x, y) = float_centre(&rects, pane);
+            assert_eq!(float.focus_at(&rects, x, y), Some(pane));
+            assert_eq!(float.active_pane(), pane, "{pane:?} is the click target");
+            assert_eq!(
+                keyboard_pane(Some(&float), mosaic),
+                Some(pane),
+                "the keys follow the pane the user clicked"
+            );
+        }
+
+        // A point that hits no floating pane must not move the focus: a miss is not
+        // a silent focus change.
+        let rects = float_rects(&float);
+        assert_eq!(float.focus_at(&rects, -5.0, -5.0), None);
+        assert_eq!(float.active_pane(), second);
+    }
+
+    /// T5/S7 + R3-002: the focus commands move between floating panes while the
+    /// float owns the keys, and they stop at its edges instead of reaching a mosaic
+    /// pane behind it.
+    #[test]
+    fn the_focus_commands_move_between_floating_panes_and_stop_at_the_edges() {
+        let (mut float, first, second) = split_floating();
+        let rect = chrome::float_rect(content());
+        let mosaic = Some(PaneId::from_raw(3));
+        assert_eq!(float.active_pane(), second);
+
+        assert!(
+            float.focus_direction(FocusDirection::Left, rect, config()),
+            "there is a floating pane to the left"
+        );
+        assert_eq!(float.active_pane(), first);
+        assert_eq!(keyboard_pane(Some(&float), mosaic), Some(first));
+
+        assert!(
+            !float.focus_direction(FocusDirection::Left, rect, config()),
+            "nothing lies left of the first floating pane"
+        );
+        assert_eq!(
+            float.active_pane(),
+            first,
+            "the focus stays put at the edge"
+        );
+
+        assert!(float.focus_direction(FocusDirection::Right, rect, config()));
+        assert_eq!(float.active_pane(), second);
+        assert!(!float.focus_direction(FocusDirection::Right, rect, config()));
+        assert_eq!(float.active_pane(), second);
+
+        // A vertical split has nothing above or below, so up and down stop at the
+        // float's edge instead of resolving a mosaic pane.
+        assert!(!float.focus_direction(FocusDirection::Up, rect, config()));
+        assert!(!float.focus_direction(FocusDirection::Down, rect, config()));
+        assert_eq!(float.active_pane(), second);
+        assert_eq!(keyboard_pane(Some(&float), mosaic), Some(second));
+    }
+
+    /// T5/S7 + R3-002: a freshly split float has a well-defined active pane, the
+    /// pane that was active before the split can be clicked back, and hiding and
+    /// showing the float keeps that focus.
+    #[test]
+    fn a_freshly_split_float_has_an_active_pane_and_the_old_one_can_be_clicked_back() {
+        let mosaic = Some(PaneId::from_raw(3));
+        for axis in [SplitAxis::Vertical, SplitAxis::Horizontal] {
+            let mut float = floating(true);
+            let first = float.active_pane();
+            let second = PaneId::from_raw(8);
+            assert!(float.split_active(axis, second, SessionId::from_raw(22)));
+            assert_eq!(
+                float.active_pane(),
+                second,
+                "{axis:?}: the new pane of a split is the one the keys reach"
+            );
+            assert_eq!(float.panes(), vec![first, second]);
+
+            let rects = float_rects(&float);
+            let (x, y) = float_centre(&rects, first);
+            assert_eq!(float.focus_at(&rects, x, y), Some(first));
+            assert_eq!(
+                float.active_pane(),
+                first,
+                "{axis:?}: clicking the pane the split pushed out of focus works"
+            );
+            assert_eq!(keyboard_pane(Some(&float), mosaic), Some(first));
+
+            float.set_visible(false);
+            assert_eq!(keyboard_pane(Some(&float), mosaic), mosaic);
+            float.set_visible(true);
+            assert_eq!(
+                keyboard_pane(Some(&float), mosaic),
+                Some(first),
+                "{axis:?}: showing the float restores the pane that was active"
+            );
+        }
+    }
+
+    /// R3-001: a one-pane float paints a border and insets its images by it, exactly
+    /// as the single-pane float always did, so splitting the float never moves the
+    /// images of the pane that was already there.
+    #[test]
+    fn a_single_pane_float_still_insets_its_images_by_its_border() {
+        let one = floating(true);
+        let (two, _, _) = split_floating();
+        assert_eq!(one.pane_count(), 1);
+        assert_eq!(two.pane_count(), 2);
+
+        assert!(
+            pane_shows_border(true, one.pane_count()),
+            "the float keeps its border with a single pane, so its images are inset"
+        );
+        assert_eq!(
+            pane_shows_border(true, one.pane_count()),
+            pane_shows_border(true, two.pane_count()),
+            "the image origin must not move when a split appears"
+        );
+        // The mosaic keeps its own rule: a lone pane fills its area, a split is framed.
+        assert!(!pane_shows_border(false, 1));
+        assert!(pane_shows_border(false, 2));
     }
 
     /// T5/S7: the floating panes tile the float box, and each one is resolved on its
