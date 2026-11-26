@@ -41,6 +41,8 @@ Ya implementado y cerrado:
 | Política de tags y releases                          | `215bbf2`                       |
 | Guardas de `--version`: árbol sucio y repo contenedor | `2c18d32`, `3806289`            |
 | Kitty graphics por chunks (`m=1`)                     | `e649cc5` (1.1.0)               |
+| Escáner resincroniza tras un OSC malformado           | `dd3b534` (1.1.1)               |
+| Mensajes y orden de `--version` + arnés               | `fix(scripts)` (1.1.2)          |
 
 De la lista de mejoras B1–B18 de este documento, **solo las notificaciones OSC 9/777
 y el kitty por chunks están hechas**. Todo lo demás sigue pendiente.
@@ -284,35 +286,6 @@ verifica y no mueve el checkout. El camino limpio es un worktree temporal:
   `crates/session/src/manager.rs`; falta el diálogo por sesión y la política.
 - **Coste**: S/M. Toca seguridad: requiere decisión explícita de UX y entrada en
   `docs/SECURITY.md`.
-
-### B19. Endurecer `--version` en `scripts/setup.sh`
-
-- **Por qué**: la review aprobada de 1.0.0 dejó siete avisos no bloqueantes, y el uso real
-del script expuso uno más. Ninguno rompe la garantía, pero todos afectan a la experiencia
-o al diagnóstico.
-- **Qué**, por orden de valor:
-  1. **El mensaje de HEAD fuera del tag no enseña**: con `main` un commit por delante del
-tag dice `HEAD is f7e9f54, which is not an exact tag`. Debería decir cuántos commits hay
-de distancia, que el tag sigue siendo válido, y ofrecer el worktree o el `git checkout`.
-     Este es el que apareció en uso real.
-  2. **El orden de las comprobaciones confunde**: la guarda de árbol sucio corre antes de
-     comparar HEAD con el tag, así que con HEAD en otro commit y archivos modificados el
-     mensaje afirma que el tag pedido está en el árbol, y manda a hacer `stash` en vez de
-     `checkout`.
-  3. **`docs/INSTALL.md` no menciona el requisito de árbol limpio**, así que siguiendo los
-     pasos documentados se puede chocar con el código 4 sin entender por qué.
-  4. **El mensaje del fetch declinado miente**: dice que traer los tags no funcionó cuando
-     en realidad el usuario dijo que no.
-  5. **Sin tests automatizados** para la ruta `--version`: ni el tag ausente, ni el fetch
-     declinado o fallido, ni el árbol sucio, ni el HEAD que no coincide. Todo verificado a
-     mano con tags temporales.
-- **Dónde**: `scripts/setup.sh` (`check_requested_version`), `docs/INSTALL.md`.
-- **Versión**: PATCH (`1.0.1`) — corrige mensajes y orden, no cambia contratos.
-- **Verificación**: matriz manual con tag temporal (HEAD en el tag, HEAD después del tag,
-  archivo modificado, archivo sin trackear, tag inexistente) más, si se añade el arnés, un
-  test de shell que compruebe códigos de salida.
-
----
 
 ## Deuda de proceso (no es código)
 

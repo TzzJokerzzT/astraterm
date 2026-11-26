@@ -47,10 +47,10 @@ S4.3 Cada bump actualiza `Cargo.toml`, `PKGBUILD`, el test de `cli.rs` y `CHANGE
 
 | ID | Spec | Qué se hace | Route | Commit |
 |---|---|---|---|---|
-| T1 | S1 | Decoder con estado de transferencias, cableado en la app y topes | worker | — |
-| T2 | S2 | Corrección del estado del scanner al cerrar un OSC ajeno | worker | — |
-| T3 | S3 | Mensajes, orden de comprobaciones y doc de `--version` | inline | — |
-| T4 | S4 | Bumps 1.1.0, 1.1.1 y 1.1.2 con CHANGELOG | inline | — |
+| T1 | S1 | Decoder con estado de transferencias, cableado en la app y topes | worker | `e649cc5` (1.1.0) |
+| T2 | S2 | Corrección del estado del scanner al cerrar un OSC ajeno | worker | `dd3b534` (1.1.1) |
+| T3 | S3 | Mensajes, orden de comprobaciones y doc de `--version` | worker | `0bdefec` (1.1.2) |
+| T4 | S4 | Bumps 1.1.0, 1.1.1 y 1.1.2 con CHANGELOG | inline | `78a690d`, `a8fb211`, `5808930` |
 
 ## Log
 
@@ -63,3 +63,19 @@ L2 (contexto de partida):
   `DecodeError::Unsupported` al ver `m=1`.
 - B12 está en `crates/terminal/src/image.rs`: `step_osc`/`step_foreign`.
 - B19 está en `scripts/setup.sh` (`check_requested_version`) y `docs/INSTALL.md`.
+
+L3 (cierre, evidencia):
+- **T1** `e649cc5` + release `78a690d` → `1.1.0`. Decoder con estado: chunks por `i=`,
+  decodificación con la cabecera del primero, topes 8 MiB/transferencia, 16 MiB agregados,
+  4 ids vivos. `decode` devuelve `Option<DecodedImage>` porque un chunk en vuelo no es ni
+  imagen ni error.
+- **T2** `dd3b534` + release `a8fb211` → `1.1.1`. El bug se reprodujo en rojo antes de
+  tocar código: no era solo el BEL, también el `ESC \`. El terminador entraba en el prefijo
+  candidato y se volcaba, dejando el escáner en `Foreign` esperando otro terminador.
+- **T3** `0bdefec` + release `5808930` → `1.1.2`. Arnés `scripts/tests/version-check.sh`:
+  11 casos, **5 pasan y 6 fallan sobre la base** y 11/11 sobre el árbol corregido.
+- Verificación final: **501 tests**, `cargo clippy --workspace --all-targets` sin
+  advertencias, `cargo fmt --check` limpio, `astraterm --version` → `1.1.2`, y
+  `cargo build --release --locked` sin tocar el lockfile.
+- Los tres releases están **sin taggear**: `v1.1.0`, `v1.1.1` y `v1.1.2` los decide y
+  publica el usuario.
