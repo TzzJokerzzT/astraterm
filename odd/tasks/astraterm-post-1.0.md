@@ -51,6 +51,8 @@ S5.3 La documentación dice la verdad sobre el límite: recolocar el ancla con e
 S4. **Versionado por slice.**
 S4.1 B1 es feature: `1.1.0` (MINOR).
 S4.2 B12 y B19 son correcciones sin cambio de contrato: `1.1.1` y `1.1.2` (PATCH).
+S4.3 B2 y el portapapeles son correcciones posteriores: `1.1.4` y `1.1.3` (PATCH), y
+    `1.1.5` cierra los hallazgos de la review del bloque entero.
 S4.3 Cada bump actualiza `Cargo.toml`, `PKGBUILD`, el test de `cli.rs` y `CHANGELOG.md`, en
     ese orden, y la suite debe pasar antes de commitear.
 
@@ -62,7 +64,7 @@ S4.3 Cada bump actualiza `Cargo.toml`, `PKGBUILD`, el test de `cli.rs` y `CHANGE
 | T2 | S2 | Corrección del estado del scanner al cerrar un OSC ajeno | worker | `dd3b534` (1.1.1) |
 | T3 | S3 | Mensajes, orden de comprobaciones y doc de `--version` | worker | `0bdefec` (1.1.2) |
 | T4 | S4 | Bumps 1.1.0, 1.1.1 y 1.1.2 con CHANGELOG | inline | `78a690d`, `a8fb211`, `5808930` |
-| T5 | S5 | Un resize conserva las anclas que siguen en el búfer, cuenta las que pierden su línea y documenta el límite | worker | pendiente |
+| T5 | S5 | Un resize conserva las anclas que siguen en el búfer, cuenta las que pierden su línea y documenta el límite | worker | `3f5cec4` (1.1.4) |
 
 ## Log
 
