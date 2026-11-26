@@ -388,8 +388,9 @@ pub fn paint_pane(
     for (row, line) in snapshot.lines.iter().enumerate().take(lines) {
         let y = origin_y + row as i32 * metrics.height as i32;
         let clip = Rect::new(inner.x, y, inner.width, metrics.height);
-        let item = row_text_item(id_base + row as u64, origin_x, y, line, theme, clip);
-        scene.push_text(item);
+        for item in row_text_item(id_base + row as u64, origin_x, y, line, theme, clip, cell_w) {
+            scene.push_text(item);
+        }
     }
 
     if options.draw_cursor
@@ -435,24 +436,86 @@ pub fn push_border(scene: &mut Scene, rect: Rect, color: Rgb) {
     );
 }
 
-/// Builds the text item for one row, merging adjacent cells with identical style
-/// into a single span so shaping stays cheap.
+/// Whether a codepoint's glyph may come from a fallback face with an advance the
+/// grid did not reserve.
+///
+/// Emoji, emoji presentation selectors and the symbol/dingbat blocks are shaped
+/// by a different font than the terminal family, and that font's advance is not
+/// the cell width the model reserved. Such a cell is painted as its own
+/// grid-anchored segment, so its odd advance cannot push the cells after it.
+fn grid_anchor_required(c: char) -> bool {
+    matches!(c,
+        '\u{FE0F}'
+            | '\u{1F000}'..='\u{1FAFF}'
+            | '\u{2600}'..='\u{27BF}'
+            | '\u{23E9}'..='\u{23FA}'
+            | '\u{2B00}'..='\u{2BFF}'
+    )
+}
+
+/// Stable identifier of the text segment that starts at `column` of `row_id`.
+///
+/// [`TextItem::id`] keys the shaped-buffer cache in [`crate::text`], so every
+/// segment needs an identifier that is deterministic for a given pair and
+/// distinct from every other row and column. A segment starting at column zero
+/// keeps the whole-row identifier the cache used before rows were split, so the
+/// common single-segment row is unchanged; the remaining columns set the high
+/// bit, which no practical row identifier uses, and pack the column below the
+/// row.
+fn segment_id(row_id: u64, column: usize) -> u64 {
+    if column == 0 {
+        return row_id;
+    }
+    (1u64 << 63) | ((row_id & 0x7fff_ffff) << 32) | (column as u64 & 0xffff_ffff)
+}
+
+/// Builds the text items for one row, splitting it into grid-anchored segments.
+///
+/// Adjacent one-column cells whose glyph is guaranteed to advance exactly one
+/// cell are merged into a single item (spans split only by style) so shaping
+/// stays cheap. A wide cell or a cell that may fall back to another face becomes
+/// its own item, positioned at `origin_x + column * cell_width` and clipped to
+/// the columns it owns, so its painted advance never shifts the rest of the row.
 fn row_text_item(
-    id: u64,
+    row_id: u64,
     origin_x: i32,
     y: i32,
     row: &RowSnapshot,
     theme: &Palette,
     clip: Rect,
-) -> TextItem {
+    cell_width: f32,
+) -> Vec<TextItem> {
+    let mut items: Vec<TextItem> = Vec::new();
     let mut spans: Vec<Span> = Vec::new();
     let mut current = String::new();
     let mut current_style: Option<(Rgb, bool, bool)> = None;
+    let mut run_start: Option<usize> = None;
 
-    for cell in &row.cells {
+    for (column, cell) in row.cells.iter().enumerate() {
+        // The spacer belongs to the preceding wide cell: it is painted as part of
+        // that cell's anchored segment and owns no segment of its own.
         if cell.wide_spacer {
             continue;
         }
+        if cell.wide || grid_anchor_required(cell.ch) {
+            flush_clean_run(
+                &mut items,
+                &mut spans,
+                &mut current,
+                &mut current_style,
+                &mut run_start,
+                row_id,
+                origin_x,
+                y,
+                clip,
+                cell_width,
+            );
+            items.push(anchored_item(
+                row_id, origin_x, y, column, cell, theme, clip, cell_width,
+            ));
+            continue;
+        }
+        run_start.get_or_insert(column);
         let (foreground, bold, italic) = cell_style(cell, theme);
         let style = (foreground, bold, italic);
         if current_style != Some(style) {
@@ -472,30 +535,121 @@ fn row_text_item(
             current.push(' ');
         } else {
             current.push(cell.ch);
-            if cell.wide {
-                // Compensate the missing second column so following glyphs keep
-                // their exact grid position.
-                current.push(' ');
-            }
         }
     }
-    if let Some((color, bold, italic)) = current_style
-        && !current.is_empty()
+    flush_clean_run(
+        &mut items,
+        &mut spans,
+        &mut current,
+        &mut current_style,
+        &mut run_start,
+        row_id,
+        origin_x,
+        y,
+        clip,
+        cell_width,
+    );
+    items
+}
+
+/// Closes the clean run being accumulated into one item positioned at its first
+/// column, if the run has any text.
+#[allow(clippy::too_many_arguments)]
+fn flush_clean_run(
+    items: &mut Vec<TextItem>,
+    spans: &mut Vec<Span>,
+    text: &mut String,
+    style: &mut Option<(Rgb, bool, bool)>,
+    start: &mut Option<usize>,
+    row_id: u64,
+    origin_x: i32,
+    y: i32,
+    clip: Rect,
+    cell_width: f32,
+) {
+    if let Some((color, bold, italic)) = style.take()
+        && !text.is_empty()
     {
         spans.push(Span {
-            text: current,
+            text: std::mem::take(text),
             color: rgba(color, 1.0),
             bold,
             italic,
         });
     }
-
-    TextItem {
-        id,
-        position: (origin_x as f32, y as f32),
-        spans,
-        clip,
+    if let Some(column) = start.take()
+        && !spans.is_empty()
+    {
+        items.push(TextItem {
+            id: segment_id(row_id, column),
+            position: (origin_x as f32 + column as f32 * cell_width, y as f32),
+            spans: std::mem::take(spans),
+            clip,
+        });
     }
+}
+
+/// Builds the grid-anchored item for one wide or fallback cell.
+///
+/// The text is the character alone: the item's own columns already reserve the
+/// space a wide glyph needs, so no filler is appended.
+#[allow(clippy::too_many_arguments)]
+fn anchored_item(
+    row_id: u64,
+    origin_x: i32,
+    y: i32,
+    column: usize,
+    cell: &CellSnapshot,
+    theme: &Palette,
+    clip: Rect,
+    cell_width: f32,
+) -> TextItem {
+    let (color, bold, italic) = cell_style(cell, theme);
+    let ch = if cell.flags.hidden { ' ' } else { cell.ch };
+    let columns = if cell.wide { 2 } else { 1 };
+    let background = cell_column_clip(origin_x, y, column, columns, cell_width, clip);
+    TextItem {
+        id: segment_id(row_id, column),
+        position: (origin_x as f32 + column as f32 * cell_width, y as f32),
+        spans: vec![Span {
+            text: ch.to_string(),
+            color: rgba(color, 1.0),
+            bold,
+            italic,
+        }],
+        clip: background,
+    }
+}
+
+/// Rectangle covering `columns` grid columns from `column`, plus one cell of
+/// slack, intersected with the row clip.
+///
+/// The slack keeps a glyph the model under-reserved from being cut in half: a
+/// fallback emoji can advance up to two cells in a slot the grid gave one, and
+/// scissoring it to that slot alone would show half a glyph. One spare cell
+/// bounds the bleed without letting an over-wide glyph reach the next visible
+/// character, whose own segment is positioned independently of this clip.
+fn cell_column_clip(
+    origin_x: i32,
+    y: i32,
+    column: usize,
+    columns: usize,
+    cell_width: f32,
+    clip: Rect,
+) -> Rect {
+    let x = origin_x + (column as f32 * cell_width) as i32;
+    let width = ((columns + 1) as f32 * cell_width).ceil().max(1.0) as u32;
+    let rect = Rect::new(x, y, width, clip.height);
+    let left = rect.x.max(clip.x);
+    let top = rect.y.max(clip.y);
+    let right = rect.right().min(clip.right());
+    let bottom = rect.bottom().min(clip.bottom());
+    Rect::new(
+        left,
+        top,
+        (right - left).max(0) as u32,
+        (bottom - top).max(0) as u32,
+    )
 }
 
 /// Resolves the foreground colour and attributes of a cell.
@@ -877,15 +1031,21 @@ mod tests {
     #[test]
     fn hidden_cells_render_as_spaces() {
         let snapshot = snapshot("\x1b[8msecret\x1b[0m", 10, 1);
-        let item = row_text_item(
+        let items = row_text_item(
             0,
             0,
             0,
             &snapshot.lines[0],
             &theme(),
             Rect::new(0, 0, 100, 20),
+            metrics().width,
         );
-        let text: String = item.spans.iter().map(|span| span.text.clone()).collect();
+        assert_eq!(items.len(), 1, "hidden one-column cells stay one run");
+        let text: String = items[0]
+            .spans
+            .iter()
+            .map(|span| span.text.clone())
+            .collect();
         assert_eq!(text.trim_end(), "");
         assert!(text.starts_with("      "));
     }
@@ -893,29 +1053,33 @@ mod tests {
     #[test]
     fn adjacent_cells_with_the_same_style_share_one_span() {
         let snapshot = snapshot("abcdef", 10, 1);
-        let item = row_text_item(
+        let items = row_text_item(
             0,
             0,
             0,
             &snapshot.lines[0],
             &theme(),
             Rect::new(0, 0, 100, 20),
+            metrics().width,
         );
-        assert_eq!(item.spans.len(), 1);
-        assert_eq!(item.spans[0].text.trim_end(), "abcdef");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].spans.len(), 1);
+        assert_eq!(items[0].spans[0].text.trim_end(), "abcdef");
     }
 
     #[test]
     fn style_changes_split_spans() {
         let snapshot = snapshot("\x1b[31mred\x1b[32mgreen\x1b[0m", 20, 1);
-        let item = row_text_item(
+        let items = row_text_item(
             0,
             0,
             0,
             &snapshot.lines[0],
             &theme(),
             Rect::new(0, 0, 200, 20),
+            metrics().width,
         );
+        let item = &items[0];
         assert!(item.spans.len() >= 2, "each colour becomes its own span");
         assert_eq!(item.spans[0].color, rgba(theme().ansi[1], 1.0));
         assert_eq!(item.spans[1].color, rgba(theme().ansi[2], 1.0));
@@ -923,20 +1087,145 @@ mod tests {
         assert!(item.spans[1].text.starts_with("green"));
     }
 
+    /// Flattens a segment's spans into its complete text.
+    fn segment_text(item: &TextItem) -> String {
+        item.spans.iter().map(|span| span.text.clone()).collect()
+    }
+
     #[test]
-    fn wide_characters_keep_column_alignment() {
-        let snapshot = snapshot("你a", 10, 1);
-        let item = row_text_item(
+    fn grid_anchored_glyph_starts_at_its_own_column() {
+        // `ab` is a clean run at column 0, `⏱` is a grid-anchored segment at
+        // column 2 (it reserves one model column but its emoji fallback paints
+        // wider), and `cd` is the next clean run, starting at column 3, so `d`
+        // lands on column 4 without any filler.
+        let snapshot = snapshot("ab⏱cd", 10, 1);
+        let cell_width = 10.0;
+        let origin_x = 4;
+        let items = row_text_item(
+            3,
+            origin_x,
+            0,
+            &snapshot.lines[0],
+            &theme(),
+            Rect::new(0, 0, 100, 20),
+            cell_width,
+        );
+        let starts: Vec<usize> = items
+            .iter()
+            .map(|item| ((item.position.0 - origin_x as f32) / cell_width) as usize)
+            .collect();
+        assert_eq!(
+            starts,
+            vec![0, 2, 3],
+            "segments start on columns 0, 2 and 3"
+        );
+        assert_eq!(segment_text(&items[0]), "ab");
+        assert_eq!(
+            segment_text(&items[1]),
+            "⏱",
+            "no filler space after the glyph"
+        );
+        assert!(
+            segment_text(&items[2]).starts_with("cd"),
+            "the next clean run resumes at column 3, so `d` is painted on column 4: {:?}",
+            segment_text(&items[2])
+        );
+        for item in &items {
+            assert!(!segment_text(item).contains("⏱ "), "filler spaces are gone");
+        }
+        // The anchored segment is clipped to its own column plus one cell of
+        // slack, so a fallback glyph wider than the reserved column is not cut.
+        let anchored = &items[1];
+        assert_eq!(anchored.clip, Rect::new(24, 0, 20, 20));
+    }
+
+    #[test]
+    fn wide_glyphs_own_their_segments_without_filler_spaces() {
+        let snapshot = snapshot("你好AB", 10, 1);
+        let items = row_text_item(
             0,
             0,
             0,
             &snapshot.lines[0],
             &theme(),
             Rect::new(0, 0, 100, 20),
+            10.0,
         );
-        let text: String = item.spans[0].text.clone();
-        // Wide glyph + filler so the next glyph starts two cells later.
-        assert!(text.starts_with("你 a"), "{text:?}");
+        assert_eq!(items.len(), 3, "two wide segments plus the ASCII run");
+        assert_eq!(items[0].position.0, 0.0);
+        assert_eq!(segment_text(&items[0]), "你");
+        assert_eq!(items[1].position.0, 20.0);
+        assert_eq!(segment_text(&items[1]), "好");
+        assert_eq!(items[2].position.0, 40.0);
+        assert!(segment_text(&items[2]).starts_with("AB"));
+        // Each wide glyph is clipped to the two columns it owns plus the one
+        // spare cell.
+        assert_eq!(items[0].clip, Rect::new(0, 0, 30, 20));
+        assert_eq!(items[1].clip, Rect::new(20, 0, 30, 20));
+        for item in &items {
+            let text = segment_text(item);
+            assert!(
+                !text.contains("你 "),
+                "no filler after a wide glyph: {text:?}"
+            );
+            assert!(
+                !text.contains("好 "),
+                "no filler after a wide glyph: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_ascii_rows_keep_one_item_with_one_span() {
+        // S6: the common row must behave exactly as before the split, including
+        // keeping the whole-row identifier the cache was keyed by.
+        let snapshot = snapshot("plain", 10, 1);
+        let clip = Rect::new(0, 0, 100, 20);
+        let items = row_text_item(7, 4, 0, &snapshot.lines[0], &theme(), clip, 10.0);
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.spans.len(), 1);
+        assert_eq!(item.id, 7);
+        assert_eq!(item.position, (4.0, 0.0));
+        assert_eq!(item.clip, clip);
+        assert_eq!(item.spans[0].text.trim_end(), "plain");
+    }
+
+    #[test]
+    fn segment_ids_are_stable_and_distinct() {
+        assert_eq!(segment_id(3, 4), segment_id(3, 4), "deterministic");
+        assert_ne!(segment_id(3, 4), segment_id(3, 5), "different columns");
+        assert_ne!(segment_id(3, 4), segment_id(4, 4), "different rows");
+        assert_ne!(
+            segment_id(3, 0),
+            segment_id(4, 0),
+            "different rows at column 0"
+        );
+        // A row whose first segment starts at column 0 keeps the identifier the
+        // cache already used for the whole row.
+        assert_eq!(segment_id(0, 0), 0);
+        assert_eq!(segment_id(9, 0), 9);
+    }
+
+    #[test]
+    fn grid_anchor_required_covers_fallback_ranges() {
+        for c in [
+            '\u{FE0F}',  // emoji presentation selector
+            '\u{1F4C1}', // file folder (emoji fallback)
+            '\u{1F680}', // rocket
+            '\u{23F1}',  // stopwatch
+            '\u{2705}',  // white heavy check mark
+            '\u{2B1B}',  // black large square
+        ] {
+            assert!(grid_anchor_required(c), "U+{:04X} must anchor", c as u32);
+        }
+        for c in ['a', ' ', 'Z', '0', '你', 'é', '│', '─'] {
+            assert!(
+                !grid_anchor_required(c),
+                "U+{:04X} must not anchor",
+                c as u32
+            );
+        }
     }
 
     #[test]

@@ -338,14 +338,14 @@ or the application.
   - while an **overlay** (search, settings, rename, confirmation) is open, commits
     are dropped rather than typed into the overlay, because those panels read
     their own text from key events.
-- **Ligatures are opt-in.** Rows are shaped as whole strings and glyph positions come
-  from the shaper; AstraTerm does not implement per-cell glyph placement. Cell metrics
-  come from the shaped advance of `MMMMMMMMMM` (`crates/renderer/src/text.rs`), so grid
-  alignment relies on the font's monospace advances. Because of that, `font.ligatures`
-  defaults to `false` and disables `liga`/`calt` explicitly; turning it on hands the row
-  to the font, which is fine for strictly monospaced ligature fonts (a ligature that
-  occupies exactly two cells) and can drift for fonts whose substitutions change the
-  advance.
+- **Ligatures are opt-in.** A row is shaped as whole strings within each grid-anchored
+  segment (see the wide-character note below); glyph positions inside a segment come
+  from the shaper. Cell metrics come from the shaped advance of `MMMMMMMMMM`
+  (`crates/renderer/src/text.rs`), so grid alignment relies on the font's monospace
+  advances. Because of that, `font.ligatures` defaults to `false` and disables
+  `liga`/`calt` explicitly; turning it on hands the row to the font, which is fine for
+  strictly monospaced ligature fonts (a ligature that occupies exactly two cells) and
+  can drift for fonts whose substitutions change the advance.
 - **Images are supported, with limits and only when enabled.**
   `terminal.images` defaults to `false`; while it is off, image sequences are
   removed from the stream and discarded without being decoded. With it on,
@@ -401,10 +401,15 @@ or the application.
   There is no regular-expression search. The overlay highlights matches on the
   visible screen; the buffer-wide forward/backward API exists in
   `crates/terminal/src/search.rs`.
-- **Wide-character rendering.** `paint::row_text_item` appends a filler space
-  after a wide glyph so following glyphs keep their exact column, which means the
-  wide glyph itself may overflow into that filler/neighbouring cell. Alignment is
-  preserved; pixel-perfect clipping is not.
+- **Wide and fallback glyphs are grid-anchored.** `paint::row_text_item` splits a row
+  into segments: a run of one-column cells in the primary face stays a single shaped
+  string, and every cell that is wide or whose glyph may come from a fallback face
+  (emoji and symbol blocks, `U+FE0F`) becomes its own item positioned at
+  `column * cell_width` and clipped to the columns it owns plus one cell of slack. A
+  fallback glyph whose advance differs from the reserved columns is therefore painted
+  inside its own slot instead of pushing the rest of the row, which is what keeps a
+  powerlevel10k prompt or a neovim status line aligned. The trade-off is that such a
+  glyph can overflow by up to one cell: alignment is exact, clipping is not.
 - **No OSC 8 hyperlink styling.** The embedded core accepts OSC 8, but
   `CellSnapshot` has no hyperlink field, so links are not underlined or clickable
   and only the visible URL text can be opened.

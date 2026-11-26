@@ -69,6 +69,15 @@ pub struct Session {
     /// Set when the bell rang and the pane is not focused.
     pub bell: bool,
     private_pty: Option<PtyHandle>,
+    /// Winsize the PTY last accepted.
+    ///
+    /// `None` means the last attempt did not land, so the next `sync_sizes` has to
+    /// try again even when the emulation grid already matches (S5).
+    pty_size: Option<(u16, u16)>,
+    /// Test seam: makes [`Session::resize`] report a winsize the PTY refused, which
+    /// is otherwise a race with the PTY writer thread.
+    #[cfg(test)]
+    reject_winsize: bool,
     last_cwd_check: Instant,
     /// Bytes dropped by the input queue (should stay zero; reported for honesty).
     pub input_drops: u64,
@@ -114,12 +123,50 @@ impl Session {
     }
 
     /// Tells the PTY about the new grid size.
-    pub fn resize(&mut self, cols: u16, rows: u16, cell_width: u16, cell_height: u16) {
+    ///
+    /// The engine always follows the grid, and the PTY is asked on every call
+    /// because the previous attempt may not have landed: the engine matching the
+    /// grid is no evidence that the child's winsize does (S5).
+    ///
+    /// Returns whether the PTY took the size. A refused winsize is not remembered as
+    /// applied, so the next call with the same target retries it.
+    pub fn resize(&mut self, cols: u16, rows: u16, cell_width: u16, cell_height: u16) -> bool {
         self.engine.resize(cols, rows);
-        if let Some(pty) = self.private_pty.as_ref() {
-            let _ = pty.resize(cols, rows, cell_width, cell_height);
-        }
         self.dirty = true;
+        if self.apply_winsize(cols, rows, cell_width, cell_height) {
+            self.pty_size = Some((cols, rows));
+            true
+        } else {
+            self.pty_size = None;
+            tracing::warn!(
+                session = %self.id,
+                cols,
+                rows,
+                "the PTY did not take the winsize; the child may still see an older size"
+            );
+            false
+        }
+    }
+
+    /// Whether the PTY has been told exactly this grid.
+    ///
+    /// `sync_sizes` asks this before deciding a session is already at the right size,
+    /// so a PTY that fell behind the grid is retried instead of being skipped for the
+    /// rest of the session's life.
+    pub fn pty_matches(&self, cols: u16, rows: u16) -> bool {
+        self.pty_size == Some((cols, rows))
+    }
+
+    /// Hands the winsize to the PTY, reporting whether it was taken.
+    fn apply_winsize(&self, cols: u16, rows: u16, cell_width: u16, cell_height: u16) -> bool {
+        #[cfg(test)]
+        if self.reject_winsize {
+            return false;
+        }
+        match self.private_pty.as_ref() {
+            Some(pty) => pty.resize(cols, rows, cell_width, cell_height),
+            None => false,
+        }
     }
 
     /// Takes a snapshot of the visible screen.
@@ -365,8 +412,15 @@ impl SessionManager {
         if self.sessions.len() >= self.max_sessions {
             return Err(SessionError::TooManySessions);
         }
+        let cols = cols.max(1);
+        let rows = rows.max(1);
         let engine = TerminalEngine::new(spec.engine_options(cols, rows));
-        let pty = spawn_with_waker(&spec.pty, self.waker.clone())?;
+        // The creation grid is the one the app paints, so it also decides the winsize
+        // the child starts with; the spec's own size is not authoritative (S5).
+        let mut pty_spec = spec.pty.clone();
+        pty_spec.cols = cols;
+        pty_spec.rows = rows;
+        let pty = spawn_with_waker(&pty_spec, self.waker.clone())?;
         let id = SessionId::next();
         let child_pid = pty.child_pid();
         let session = Session {
@@ -383,6 +437,9 @@ impl SessionManager {
             dirty: true,
             bell: false,
             private_pty: Some(pty),
+            pty_size: Some((cols, rows)),
+            #[cfg(test)]
+            reject_winsize: false,
             last_cwd_check: Instant::now(),
             input_drops: 0,
             waker: self.waker.clone(),
@@ -690,12 +747,94 @@ mod tests {
     #[test]
     fn resize_updates_the_engine_and_the_pty() {
         let mut manager = SessionManager::new();
+        // The child reads one line and then prints the winsize it has, so the resize
+        // below is ordered before the read returns instead of racing it: the PTY
+        // writer thread applies the resize before it writes the line.
         let id = manager
-            .create(PaneId::next(), &spec("/bin/cat", &[]), 40, 10)
+            .create(
+                PaneId::next(),
+                &spec("/bin/sh", &["-c", "read line; stty size"]),
+                40,
+                10,
+            )
             .unwrap();
-        manager.get_mut(id).unwrap().resize(100, 30, 8, 16);
+        assert_eq!(manager.get(id).unwrap().engine.size(), (40, 10));
+        assert!(
+            manager.get_mut(id).unwrap().resize(100, 30, 8, 16),
+            "the PTY must take the winsize"
+        );
+        manager.write(id, b"go\n");
+        let text = pump_until(&mut manager, "30 100");
+        assert!(
+            text.contains("30 100"),
+            "the child kept another winsize: {text:?}"
+        );
         let session = manager.get(id).unwrap();
         assert_eq!(session.engine.size(), (100, 30));
+    }
+
+    #[test]
+    fn a_session_created_at_a_grid_tells_the_child_that_winsize() {
+        let mut manager = SessionManager::new();
+        // The creation grid is what the app paints, so it must also be the winsize the
+        // child starts with; the spec's own size (40x10 here) is not authoritative.
+        manager
+            .create(
+                PaneId::next(),
+                &spec("/bin/sh", &["-c", "stty size"]),
+                100,
+                30,
+            )
+            .unwrap();
+        let text = pump_until(&mut manager, "30 100");
+        assert!(
+            text.contains("30 100"),
+            "the child started at another winsize: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_winsize_the_pty_rejects_is_retried_by_the_next_resize() {
+        let mut manager = SessionManager::new();
+        let id = manager
+            .create(
+                PaneId::next(),
+                &spec("/bin/sh", &["-c", "read line; stty size"]),
+                40,
+                10,
+            )
+            .unwrap();
+        // The seam stands for a lost queue send or a refused ioctl, which is what a
+        // winsize the PTY never took looks like to the session.
+        let session = manager.get_mut(id).unwrap();
+        session.reject_winsize = true;
+        assert!(
+            !session.resize(100, 30, 8, 16),
+            "a winsize the PTY dropped must be reported as not applied"
+        );
+        assert_eq!(
+            session.engine.size(),
+            (100, 30),
+            "the grid still follows the window"
+        );
+        assert!(
+            !session.pty_matches(100, 30),
+            "a dropped winsize must not be remembered as applied"
+        );
+        session.reject_winsize = false;
+        // The engine already matches the target, so a retry can only come from the
+        // session remembering that the PTY is behind it.
+        assert!(
+            session.resize(100, 30, 8, 16),
+            "the retry with the same target must reach the PTY"
+        );
+        assert!(session.pty_matches(100, 30));
+        manager.write(id, b"go\n");
+        let text = pump_until(&mut manager, "30 100");
+        assert!(
+            text.contains("30 100"),
+            "the retried winsize never reached the child: {text:?}"
+        );
     }
 
     #[test]
