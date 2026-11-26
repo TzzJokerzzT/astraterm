@@ -19,7 +19,7 @@ use astraterm_session::SessionManager;
 use astraterm_settings_ui::panel::{PanelStyle, SettingsPanel};
 use astraterm_terminal::TerminalEngine;
 use astraterm_terminal::image::{ImagePlacement, ImageStore};
-use astraterm_terminal::image_decode::{DecodeLimits, decode};
+use astraterm_terminal::image_decode::{DecodeLimits, ImageDecoder};
 use astraterm_terminal::snapshot::{CursorVisual, Snapshot};
 use astraterm_workspace::{LayoutConfig, Pane, Tab, WindowState};
 
@@ -1451,6 +1451,10 @@ pub struct SessionImages {
     store: ImageStore,
     /// Pixels of `store.placements()`, in the same order and with the same length.
     images: Vec<AnchoredImage>,
+    /// Reassembly state for kitty chunked transfers (`m=1`), which are several
+    /// sequences for one image. It belongs to the session: when the session closes
+    /// the decoder is dropped, so a buffer left in flight cannot outlive it.
+    decoder: ImageDecoder,
     /// Last texture identifier handed out; never reused, so an evicted id cannot
     /// come back with different pixels.
     next_id: u64,
@@ -1471,6 +1475,7 @@ impl SessionImages {
         Self {
             store: ImageStore::new(budget),
             images: Vec::new(),
+            decoder: ImageDecoder::new(),
             // Session ids are unique in the process, so the high half of the
             // identifier keeps texture keys unique across panes without a second
             // allocator.
@@ -1545,10 +1550,11 @@ impl SessionImages {
         let limits = DecodeLimits::default();
         let mut stored = 0;
         for message in messages {
-            // A refused payload is a dropped image: `decode` reports the reason and
-            // nothing else uses it, so a malformed or oversized sequence can never
-            // panic and never draws half an image (S5.2, S5.3).
-            let Ok(decoded) = decode(&message, &limits) else {
+            // A refused payload is a dropped image: the decoder reports the reason
+            // and nothing else uses it, so a malformed or oversized sequence can
+            // never panic and never draws half an image (S5.2, S5.3). `Ok(None)` is
+            // a kitty `m=1` chunk: accepted, still in flight, no image yet (S1.1).
+            let Ok(Some(decoded)) = self.decoder.decode(&message, &limits) else {
                 continue;
             };
             let Some(pixels) = ImagePixels::new(decoded.width, decoded.height, decoded.rgba) else {
@@ -1865,6 +1871,17 @@ mod tests {
     /// body of sixteen zero bytes is a constant, and every pixel is transparent.
     const KITTY_IMAGE: &[u8] = b"\x1b_Ga=T,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\";
 
+    /// The same 2x2 raw RGBA image as [`KITTY_IMAGE`], split over three APCs.
+    ///
+    /// The base64 body of sixteen zero bytes (`AAAAAAAAAAAAAAAAAAAAAA==`) is cut in
+    /// 8, 6 and 8 symbols: the first two chunks carry `m=1` and the last closes the
+    /// transfer with `m=0`. `s=`, `v=` and `f=` appear only in the first one.
+    const KITTY_CHUNKED: [(&[u8], bool); 3] = [
+        (b"\x1b_Ga=T,f=32,s=2,v=2,i=7,m=1;AAAAAAAA\x1b\\", true),
+        (b"\x1b_Gi=7,m=1;AAAAAAAA\x1b\\", true),
+        (b"\x1b_Gi=7,m=0;AAAAAA==\x1b\\", false),
+    ];
+
     fn image_metrics() -> CellMetrics {
         CellMetrics {
             width: 8.0,
@@ -2170,9 +2187,9 @@ mod tests {
         let mut engine = image_engine();
         let mut images = SessionImages::new(SessionId::from_raw(13), engine.line_range().0);
 
-        // A chunked kitty transfer is legal on the wire but not supported here, and
-        // a truncated iTerm2 payload is simply broken: both are dropped silently.
-        engine.process(b"\x1b_Ga=T,f=32,s=2,v=2,m=1;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+        // An unfinished chunked transfer produces no image on its own, and a
+        // truncated iTerm2 payload is simply broken: both are dropped silently.
+        engine.process(b"\x1b_Ga=T,f=32,s=2,v=2,m=1,i=9;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
         engine.process(b"\x1b]1337;File=inline=1:not-base64!\x07");
         assert_eq!(images.intake(&mut engine, image_metrics(), true), 0);
         assert!(images.is_empty());
@@ -2180,6 +2197,28 @@ mod tests {
         engine.process(b"still fine");
         let snapshot = engine.snapshot();
         assert_eq!(snapshot.lines[0].text().trim_end(), "still fine");
+    }
+
+    #[test]
+    fn a_kitty_transfer_split_over_sequences_is_one_image() {
+        let mut engine = image_engine();
+        let mut images = SessionImages::new(SessionId::from_raw(14), engine.line_range().0);
+
+        // One 2x2 RGBA image sent as three APCs: the first two carry `m=1`, the last
+        // closes the transfer. Only the last one can anchor a placement.
+        for (sequence, more) in KITTY_CHUNKED {
+            engine.process(sequence);
+            let anchored = images.intake(&mut engine, image_metrics(), true);
+            if more {
+                assert_eq!(anchored, 0, "an m=1 chunk is not an image yet");
+            } else {
+                assert_eq!(anchored, 1, "the final chunk completes the image");
+            }
+        }
+        let (placement, _, pixels) = images.items().next().expect("one anchored image");
+        assert_eq!(placement.protocol, ImageProtocol::Kitty);
+        assert_eq!((placement.cols, placement.rows), (1, 1));
+        assert_eq!(pixels.byte_len(), 2 * 2 * 4);
     }
 
     #[test]

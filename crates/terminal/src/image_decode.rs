@@ -16,9 +16,14 @@
 //!   [`DecodeLimits::max_dimension`] and [`DecodeLimits::max_pixels`] *before*
 //!   the pixel buffer is allocated, so a lying PNG header cannot reserve an
 //!   enormous buffer;
-//! * a payload that claims a feature this slice does not implement (a chunked
-//!   kitty transfer, iTerm2 download-only) is refused with
-//!   [`DecodeError::Unsupported`] instead of being decoded wrongly.
+//! * a payload that claims a feature this slice does not implement (iTerm2
+//!   download-only, kitty formats other than PNG/RGB/RGBA, sixel HLS colour
+//!   spaces) is refused with [`DecodeError::Unsupported`] instead of being
+//!   decoded wrongly;
+//! * the state a kitty chunked transfer needs is bounded too: [`ImageDecoder`]
+//!   holds at most [`MAX_IN_FLIGHT_TRANSFERS`] transfers, caps each one at
+//!   [`DecodeLimits::max_input_bytes`] and their total at twice that, and evicts
+//!   the oldest transfer when either bound is reached (S1.3).
 //!
 //! Base64 is decoded here rather than through a new dependency: the three
 //! protocols all wrap their payload in the standard alphabet, so the decoder is
@@ -87,9 +92,9 @@ impl DecodedImage {
 /// discarded so it cannot break the grid or the text stream (S5.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeError {
-    /// The protocol, or a feature of it, is outside this slice (kitty chunked
-    /// transfer, iTerm2 download-only, kitty formats other than PNG/RGB/RGBA,
-    /// sixel HLS colour definitions).
+    /// The protocol, or a feature of it, is outside this slice (iTerm2
+    /// download-only, kitty formats other than PNG/RGB/RGBA, sixel HLS colour
+    /// definitions).
     Unsupported,
     /// The payload does not parse as the protocol it claims.
     Malformed(&'static str),
@@ -133,26 +138,257 @@ impl std::error::Error for DecodeError {}
 
 /// Decodes one captured image sequence into RGBA.
 ///
+/// This is the one-message entry point: it keeps no state, so it cannot
+/// reassemble a kitty chunked transfer. Use [`ImageDecoder`] for a stream, which
+/// is what the application does.
+///
 /// The payload length is checked first, then the protocol decides. Nothing is
 /// allocated from a dimension the payload merely declares: every decoder checks
 /// the width and height against `limits` before it sizes a pixel buffer.
 pub fn decode(message: &ImageMessage, limits: &DecodeLimits) -> Result<DecodedImage, DecodeError> {
-    if message.payload.is_empty() {
-        return Err(DecodeError::Empty);
+    match ImageDecoder::new().decode(message, limits)? {
+        Some(image) => Ok(image),
+        None => Err(DecodeError::Malformed("incomplete kitty chunked transfer")),
     }
-    if message.payload.len() > limits.max_input_bytes {
-        return Err(DecodeError::TooLarge {
-            width: 0,
-            height: 0,
-            max_dimension: limits.max_dimension,
-            max_pixels: limits.max_pixels,
-        });
+}
+
+/// Largest number of kitty chunked transfers [`ImageDecoder`] holds at once.
+pub const MAX_IN_FLIGHT_TRANSFERS: usize = 4;
+
+/// The `key=value` fields of one kitty APC header.
+#[derive(Clone, Copy, Debug)]
+struct KittyHeader {
+    /// `f=`: 100 is PNG, 24 raw RGB, 32 raw RGBA.
+    format: u32,
+    /// `s=`: pixels per row, required by the raw formats.
+    width: Option<u32>,
+    /// `v=`: rows, required by the raw formats.
+    height: Option<u32>,
+    /// `i=`: image id, what a chunked transfer is keyed on.
+    id: Option<u32>,
+    /// `m=`: `Some(true)` when more chunks follow. `None` means the sender left
+    /// the field out, which kitty reads as "this is the last chunk".
+    more: Option<bool>,
+}
+
+/// One kitty transfer being reassembled from `m=1` chunks.
+#[derive(Debug)]
+struct KittyTransfer {
+    /// `i=` of the transfer; every chunk of it carries the same value.
+    id: u32,
+    /// `f=` of the first chunk; later chunks do not repeat it.
+    format: u32,
+    /// `s=` of the first chunk, for the raw formats.
+    width: Option<u32>,
+    /// `v=` of the first chunk, for the raw formats.
+    height: Option<u32>,
+    /// Base64 text of every chunk so far, in arrival order.
+    data: Vec<u8>,
+}
+
+/// Decodes a stream of image sequences, keeping the kitty chunked-transfer state.
+///
+/// kitty splits a transfer over several APCs: every chunk but the last carries
+/// `m=1` and an `i=<id>`, and the last carries `m=0` or no `m` at all (S1.1). The
+/// scanner hands each APC over as its own [`ImageMessage`], so the reassembly has
+/// to live here rather than in [`crate::image`].
+///
+/// Transfers of different ids accumulate separately and may interleave; each one
+/// is decoded when its final chunk arrives, with the `f=`, `s=` and `v=` of its
+/// first chunk (S1.2). The state is bounded (S1.3): a transfer may not grow past
+/// [`DecodeLimits::max_input_bytes`], the transfers in flight may not total more
+/// than twice that, and at most [`MAX_IN_FLIGHT_TRANSFERS`] are held. Reaching
+/// either of the last two bounds evicts the oldest transfer — freeing its buffer
+/// and counting it in [`ImageDecoder::dropped`] — so a sender cannot make the
+/// decoder grow without limit. A refused or evicted transfer never yields a
+/// partial image (S1.4).
+///
+/// A decoder belongs to one session and dies with it, so a buffer left in flight
+/// by a closed session is released with it.
+#[derive(Debug, Default)]
+pub struct ImageDecoder {
+    /// Transfers in flight, oldest first; the front is the eviction candidate.
+    transfers: Vec<KittyTransfer>,
+    /// Transfers discarded to stay within the bounds.
+    dropped: usize,
+}
+
+impl ImageDecoder {
+    /// A decoder with nothing in flight.
+    pub fn new() -> Self {
+        Self::default()
     }
-    match message.protocol {
-        ImageProtocol::Kitty => decode_kitty(&message.payload, limits),
-        ImageProtocol::Iterm2 => decode_iterm2(&message.payload, limits),
-        ImageProtocol::Sixel => decode_sixel(&message.payload, limits),
+
+    /// Decodes one captured sequence, reassembling kitty chunks across calls.
+    ///
+    /// `Ok(None)` means "accepted, but the transfer is not complete yet": a
+    /// `m=1` chunk is neither an image nor an error. Every other case returns the
+    /// same image or error the equivalent single-message [`decode`] would.
+    pub fn decode(
+        &mut self,
+        message: &ImageMessage,
+        limits: &DecodeLimits,
+    ) -> Result<Option<DecodedImage>, DecodeError> {
+        if message.payload.is_empty() {
+            return Err(DecodeError::Empty);
+        }
+        if message.payload.len() > limits.max_input_bytes {
+            return Err(too_large(limits));
+        }
+        match message.protocol {
+            ImageProtocol::Kitty => self.decode_kitty(&message.payload, limits),
+            ImageProtocol::Iterm2 => decode_iterm2(&message.payload, limits).map(Some),
+            ImageProtocol::Sixel => decode_sixel(&message.payload, limits).map(Some),
+        }
     }
+
+    /// Number of chunked transfers in flight.
+    pub fn pending_transfers(&self) -> usize {
+        self.transfers.len()
+    }
+
+    /// Base64 bytes held for the transfers in flight.
+    pub fn pending_bytes(&self) -> usize {
+        self.transfers
+            .iter()
+            .map(|transfer| transfer.data.len())
+            .sum()
+    }
+
+    /// Transfers discarded so far to stay within the bounds.
+    ///
+    /// Only evictions count. A transfer refused with an error is reported through
+    /// the returned [`DecodeError`] instead, so the two are never confused.
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    /// Handles one kitty APC, returning an image only when it completes a transfer.
+    fn decode_kitty(
+        &mut self,
+        payload: &[u8],
+        limits: &DecodeLimits,
+    ) -> Result<Option<DecodedImage>, DecodeError> {
+        let (header, data) = match split_once(payload, b';') {
+            Some((header, data)) => (header, data),
+            None => (payload, &[][..]),
+        };
+        let header = parse_kitty_header(header)?;
+
+        if header.more == Some(true) {
+            // A chunk is useless without the id that groups it with the rest.
+            let id = header.id.ok_or(DecodeError::Malformed(
+                "kitty chunked transfer without an image id",
+            ))?;
+            if data.is_empty() {
+                return Err(DecodeError::Empty);
+            }
+            self.push_chunk(id, header, data, limits)?;
+            return Ok(None);
+        }
+
+        // A final chunk (`m=0` or no `m`) either closes a transfer this decoder
+        // holds, or is a complete single-chunk image.
+        if let Some(id) = header.id {
+            if let Some(index) = self.position(id) {
+                let mut transfer = self.transfers.remove(index);
+                if transfer.data.len() + data.len() > limits.max_input_bytes {
+                    return Err(too_large(limits));
+                }
+                transfer.data.extend_from_slice(data);
+                return finish_transfer(&transfer, limits).map(Some);
+            }
+            if header.more == Some(false) {
+                // Only chunked sends say `m=0` explicitly, and by then the state
+                // must exist; without it the chunk cannot be part of an image.
+                return Err(DecodeError::Malformed(
+                    "kitty final chunk without a pending transfer",
+                ));
+            }
+        }
+
+        decode_kitty_data(&header, data, limits).map(Some)
+    }
+
+    /// Appends one `m=1` chunk, keeping the in-flight bounds (S1.3).
+    fn push_chunk(
+        &mut self,
+        id: u32,
+        header: KittyHeader,
+        data: &[u8],
+        limits: &DecodeLimits,
+    ) -> Result<(), DecodeError> {
+        if let Some(index) = self.position(id)
+            && self.transfers[index].data.len() + data.len() > limits.max_input_bytes
+        {
+            // The sender overran the per-transfer bound: refuse and free the buffer
+            // instead of growing it or decoding a partial image.
+            self.transfers.remove(index);
+            return Err(too_large(limits));
+        }
+        self.make_room(id, data.len(), limits.max_input_bytes.saturating_mul(2));
+        match self.position(id) {
+            Some(index) => self.transfers[index].data.extend_from_slice(data),
+            None => self.transfers.push(KittyTransfer {
+                id,
+                format: header.format,
+                width: header.width,
+                height: header.height,
+                data: data.to_vec(),
+            }),
+        }
+        Ok(())
+    }
+
+    fn position(&self, id: u32) -> Option<usize> {
+        self.transfers.iter().position(|transfer| transfer.id == id)
+    }
+
+    /// Evicts the oldest transfers until one more of `incoming` bytes fits.
+    ///
+    /// `keep` is the transfer the caller is about to append to, and is never the
+    /// one evicted: its own size is bounded by the per-transfer limit, which is
+    /// half the aggregate bound, so evicting the others always makes room.
+    fn make_room(&mut self, keep: u32, incoming: usize, aggregate_max: usize) {
+        while self.transfers.len() >= MAX_IN_FLIGHT_TRANSFERS
+            || self.pending_bytes() + incoming > aggregate_max
+        {
+            let Some(index) = self
+                .transfers
+                .iter()
+                .position(|transfer| transfer.id != keep)
+            else {
+                break;
+            };
+            self.transfers.remove(index);
+            self.dropped += 1;
+        }
+    }
+}
+
+/// The `TooLarge` a byte bound produces: no declared dimensions to report.
+fn too_large(limits: &DecodeLimits) -> DecodeError {
+    DecodeError::TooLarge {
+        width: 0,
+        height: 0,
+        max_dimension: limits.max_dimension,
+        max_pixels: limits.max_pixels,
+    }
+}
+
+/// Decodes a completed transfer, using the header of its first chunk.
+fn finish_transfer(
+    transfer: &KittyTransfer,
+    limits: &DecodeLimits,
+) -> Result<DecodedImage, DecodeError> {
+    let header = KittyHeader {
+        format: transfer.format,
+        width: transfer.width,
+        height: transfer.height,
+        id: Some(transfer.id),
+        more: None,
+    };
+    decode_kitty_data(&header, &transfer.data, limits)
 }
 
 /// Refuses a width/height pair that breaks the configured bounds.
@@ -366,20 +602,51 @@ fn decode_iterm2(payload: &[u8], limits: &DecodeLimits) -> Result<DecodedImage, 
 
 // --- kitty graphics ----------------------------------------------------------
 
-/// Decodes a kitty graphics APC payload: `<key=value,...>;<base64 data>`.
+/// Decodes a kitty graphics payload: `<key=value,...>;<base64 data>`.
 ///
-/// Supported in this slice: `f=100` (one PNG chunk) and `f=24`/`f=32` (raw RGB
-/// or RGBA with `s=`/`v=`). A chunked transfer (`m=1`) is refused instead of
-/// decoding an incomplete image, and so is any other format (`f=1`, PNG in
-/// multiple chunks, query actions).
-fn decode_kitty(payload: &[u8], limits: &DecodeLimits) -> Result<DecodedImage, DecodeError> {
-    let (header, data) = match split_once(payload, b';') {
-        Some((header, data)) => (header, data),
-        None => (payload, &[][..]),
+/// Supported in this slice: `f=100` (PNG) and `f=24`/`f=32` (raw RGB or RGBA with
+/// `s=`/`v=`). Whether the payload arrived in one APC or in several is not this
+/// function's business — [`ImageDecoder`] reassembles the latter — so it only sees
+/// the concatenated base64 text and the header of the first chunk.
+fn decode_kitty_data(
+    header: &KittyHeader,
+    data: &[u8],
+    limits: &DecodeLimits,
+) -> Result<DecodedImage, DecodeError> {
+    if data.is_empty() {
+        return Err(DecodeError::Empty);
+    }
+
+    match header.format {
+        100 => {
+            let png = decode_base64(data)?;
+            decode_png(&png, limits)
+        }
+        24 | 32 => {
+            let (Some(width), Some(height)) = (header.width, header.height) else {
+                return Err(DecodeError::Malformed("kitty raw image without size"));
+            };
+            check_dimensions(width, height, limits)?;
+            let bytes = decode_base64(data)?;
+            let channels = if header.format == 24 { 3 } else { 4 };
+            raw_to_rgba(&bytes, width, height, channels)
+        }
+        _ => Err(DecodeError::Unsupported),
+    }
+}
+
+/// Parses the `key=value` fields of a kitty APC header.
+///
+/// `m=` is kept rather than judged here, because whether `m=0` is legal depends on
+/// the state [`ImageDecoder`] holds.
+fn parse_kitty_header(header: &[u8]) -> Result<KittyHeader, DecodeError> {
+    let mut parsed = KittyHeader {
+        format: 32,
+        width: None,
+        height: None,
+        id: None,
+        more: None,
     };
-    let mut format = 32u32;
-    let mut width = None;
-    let mut height = None;
     for field in header.split(|&byte| byte == b',') {
         if field.is_empty() {
             continue;
@@ -387,52 +654,38 @@ fn decode_kitty(payload: &[u8], limits: &DecodeLimits) -> Result<DecodedImage, D
         let (key, value) =
             split_once(field, b'=').ok_or(DecodeError::Malformed("kitty header field"))?;
         match key {
-            b"m" if value == b"1" => return Err(DecodeError::Unsupported),
-            b"m" => {}
-            b"f" => {
-                format = parse_number(value)
-                    .map(|(value, _)| value)
-                    .map_err(|_| DecodeError::Malformed("kitty format"))?;
+            b"m" => {
+                parsed.more = Some(match value {
+                    b"0" => false,
+                    b"1" => true,
+                    _ => return Err(DecodeError::Malformed("kitty chunk flag")),
+                });
             }
-            b"s" => width = Some(parse_kitty_dimension(value)?),
-            b"v" => height = Some(parse_kitty_dimension(value)?),
+            b"i" => parsed.id = Some(parse_kitty_number(value, "kitty image id")?),
+            b"f" => parsed.format = parse_kitty_number(value, "kitty format")?,
+            b"s" => parsed.width = Some(parse_kitty_dimension(value)?),
+            b"v" => parsed.height = Some(parse_kitty_dimension(value)?),
             // `a=T`/`a=t` transfer the image; every other action (query, put,
             // delete) is a no-image message this slice does not implement.
             b"a" if value == b"T" || value == b"t" => {}
             b"a" => return Err(DecodeError::Unsupported),
-            // Display hints (`c`, `r`, `x`, `y`, `X`, `Y`, `z`, `p`, `q`, `C`)
-            // affect placement or are no-ops for a pure decoder.
+            // Display hints (`c`, `r`, `x`, `y`, `X`, `Y`, `z`, `p`, `q`, `C`) and
+            // the placement id (`I`) affect placement or are no-ops for a pure
+            // decoder.
             _ => {}
         }
     }
+    Ok(parsed)
+}
 
-    if data.is_empty() {
-        return Err(DecodeError::Empty);
-    }
-
-    match format {
-        100 => {
-            let png = decode_base64(data)?;
-            decode_png(&png, limits)
-        }
-        24 | 32 => {
-            let (width, height) = match (width, height) {
-                (Some(width), Some(height)) => (width, height),
-                _ => return Err(DecodeError::Malformed("kitty raw image without size")),
-            };
-            check_dimensions(width, height, limits)?;
-            let bytes = decode_base64(data)?;
-            let channels = if format == 24 { 3 } else { 4 };
-            raw_to_rgba(&bytes, width, height, channels)
-        }
-        _ => Err(DecodeError::Unsupported),
-    }
+fn parse_kitty_number(value: &[u8], reason: &'static str) -> Result<u32, DecodeError> {
+    parse_number(value)
+        .map(|(value, _)| value)
+        .map_err(|_| DecodeError::Malformed(reason))
 }
 
 fn parse_kitty_dimension(value: &[u8]) -> Result<u32, DecodeError> {
-    parse_number(value)
-        .map(|(value, _)| value)
-        .map_err(|_| DecodeError::Malformed("kitty dimension"))
+    parse_kitty_number(value, "kitty dimension")
 }
 
 /// Wraps raw RGB or RGBA bytes as an RGBA image.
@@ -937,16 +1190,34 @@ mod tests {
     }
 
     #[test]
-    fn kitty_chunked_transfer_is_unsupported() {
-        let mut payload = b"f=100,m=1;".to_vec();
-        payload.extend_from_slice(&b64_encode(&png_bytes(1, 1, &[1, 2, 3, 255])));
+    fn kitty_wire_chunking_is_accepted_and_reassembled() {
+        // This used to be refused with `Unsupported`; S1.1 makes it the legal way
+        // to send a payload that does not fit in one APC.
+        let limits = DecodeLimits::default();
+        let mut decoder = ImageDecoder::new();
+        // One 1x2 RGBA image (8 bytes, 12 base64 symbols) split in two APCs; the
+        // second one repeats only the id, exactly as kitty sends it.
+        let encoded = b64_encode(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut first = b"i=3,f=32,s=1,v=2,m=1;".to_vec();
+        first.extend_from_slice(&encoded[..6]);
+        let mut last = b"i=3;".to_vec();
+        last.extend_from_slice(&encoded[6..]);
         assert_eq!(
-            decode(
-                &message(ImageProtocol::Kitty, payload),
-                &DecodeLimits::default()
-            ),
-            Err(DecodeError::Unsupported)
+            decoder
+                .decode(&message(ImageProtocol::Kitty, first), &limits)
+                .unwrap(),
+            None,
+            "an m=1 chunk is not an image yet"
         );
+        let image = decoder
+            .decode(&message(ImageProtocol::Kitty, last), &limits)
+            .unwrap()
+            .expect("the final chunk completes the transfer");
+        // `f=`, `s=` and `v=` came from the first chunk, which the last one does
+        // not repeat.
+        assert_eq!((image.width, image.height), (1, 2));
+        assert_eq!(image.pixel(0, 0), Some([1, 2, 3, 4]));
+        assert_eq!(image.pixel(0, 1), Some([5, 6, 7, 8]));
     }
 
     #[test]
@@ -1019,5 +1290,328 @@ mod tests {
             matches!(err, DecodeError::TooLarge { .. }),
             "expected TooLarge, got {err:?}"
         );
+    }
+
+    // --- kitty chunked transfers (S1.1 - S1.4) -------------------------------
+
+    /// One kitty APC: `a=T,<extra>[,i=<id>][,m=<flag>];<base64 data>`.
+    fn kitty_chunk(extra: &str, id: Option<u32>, more: Option<bool>, data: &[u8]) -> ImageMessage {
+        let mut header = String::from("a=T");
+        if !extra.is_empty() {
+            header.push(',');
+            header.push_str(extra);
+        }
+        if let Some(id) = id {
+            header.push_str(&format!(",i={id}"));
+        }
+        match more {
+            Some(true) => header.push_str(",m=1"),
+            Some(false) => header.push_str(",m=0"),
+            None => {}
+        }
+        let mut payload = header.into_bytes();
+        payload.push(b';');
+        payload.extend_from_slice(data);
+        message(ImageProtocol::Kitty, payload)
+    }
+
+    /// Splits `data` into at most `count` even pieces, so one fixture can be sent
+    /// over several chunks.
+    fn split_evenly(data: &[u8], count: usize) -> Vec<Vec<u8>> {
+        let size = data.len().div_ceil(count).max(1);
+        data.chunks(size).map(|piece| piece.to_vec()).collect()
+    }
+
+    /// `count` chunks of one transfer: every one but the last carries `m=1`, the
+    /// last carries `m=0`.
+    fn chunked(extra: &str, id: u32, data: &[u8], count: usize) -> Vec<ImageMessage> {
+        let pieces = split_evenly(data, count);
+        let last = pieces.len() - 1;
+        pieces
+            .iter()
+            .enumerate()
+            .map(|(index, piece)| kitty_chunk(extra, Some(id), Some(index < last), piece))
+            .collect()
+    }
+
+    /// Feeds `messages` in order and collects the images they produced.
+    fn decode_all(
+        decoder: &mut ImageDecoder,
+        messages: &[ImageMessage],
+        limits: &DecodeLimits,
+    ) -> Vec<DecodedImage> {
+        messages
+            .iter()
+            .filter_map(|message| decoder.decode(message, limits).expect("chunk accepted"))
+            .collect()
+    }
+
+    #[test]
+    fn a_kitty_png_split_in_two_chunks_decodes_like_a_single_chunk() {
+        let rgba = [1, 2, 3, 255, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let png = png_bytes(2, 2, &rgba);
+        let limits = DecodeLimits::default();
+        let whole = decode(&kitty_png(&png), &limits).unwrap();
+
+        let mut decoder = ImageDecoder::new();
+        let messages = chunked("f=100", 1, &b64_encode(&png), 2);
+        let images = decode_all(&mut decoder, &messages, &limits);
+        assert_eq!(images.len(), 1, "only the last chunk produces an image");
+        assert_eq!(images[0], whole);
+        assert_eq!(images[0].pixel(0, 0), Some([1, 2, 3, 255]));
+        assert_eq!(images[0].pixel(1, 1), Some([12, 13, 14, 15]));
+        assert_eq!(
+            decoder.pending_transfers(),
+            0,
+            "the finished transfer frees its buffer"
+        );
+        assert_eq!(decoder.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn a_kitty_png_split_in_three_chunks_decodes_like_a_single_chunk() {
+        let rgba = [3, 1, 4, 255, 1, 5, 9, 2, 6, 5, 3, 5, 9, 7, 9, 200];
+        let png = png_bytes(2, 2, &rgba);
+        let limits = DecodeLimits::default();
+        let whole = decode(&kitty_png(&png), &limits).unwrap();
+
+        let mut decoder = ImageDecoder::new();
+        let messages = chunked("f=100", 2, &b64_encode(&png), 3);
+        assert_eq!(messages.len(), 3);
+        let images = decode_all(&mut decoder, &messages, &limits);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0], whole);
+        assert_eq!(images[0].pixel(1, 0), Some([1, 5, 9, 2]));
+        assert_eq!(images[0].pixel(1, 1), Some([9, 7, 9, 200]));
+        assert_eq!(decoder.pending_transfers(), 0);
+    }
+
+    #[test]
+    fn two_interleaved_kitty_transfers_decode_separately() {
+        let a = [1u8, 2, 3, 255, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let b = [
+            90u8, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105,
+        ];
+        let limits = DecodeLimits::default();
+        let chunks_a = chunked("f=100", 1, &b64_encode(&png_bytes(2, 2, &a)), 2);
+        let chunks_b = chunked("f=100", 2, &b64_encode(&png_bytes(2, 2, &b)), 2);
+
+        let mut decoder = ImageDecoder::new();
+        assert_eq!(decoder.decode(&chunks_a[0], &limits).unwrap(), None);
+        assert_eq!(decoder.decode(&chunks_b[0], &limits).unwrap(), None);
+        assert_eq!(decoder.pending_transfers(), 2, "both ids are in flight");
+
+        let first = decoder
+            .decode(&chunks_a[1], &limits)
+            .unwrap()
+            .expect("A finished");
+        let second = decoder
+            .decode(&chunks_b[1], &limits)
+            .unwrap()
+            .expect("B finished");
+        assert_eq!((first.width, first.height), (2, 2));
+        assert_eq!(first.pixel(0, 0), Some([1, 2, 3, 255]));
+        assert_eq!(first.pixel(1, 1), Some([12, 13, 14, 15]));
+        assert_eq!((second.width, second.height), (2, 2));
+        assert_eq!(second.pixel(0, 0), Some([90, 91, 92, 93]));
+        assert_eq!(second.pixel(1, 1), Some([102, 103, 104, 105]));
+        assert_eq!(decoder.pending_transfers(), 0);
+    }
+
+    #[test]
+    fn a_chunk_without_an_image_id_is_malformed() {
+        let mut decoder = ImageDecoder::new();
+        let message = kitty_chunk("f=100", None, Some(true), b"AAAA");
+        assert_eq!(
+            decoder.decode(&message, &DecodeLimits::default()),
+            Err(DecodeError::Malformed(
+                "kitty chunked transfer without an image id"
+            ))
+        );
+        assert_eq!(
+            decoder.pending_transfers(),
+            0,
+            "a refused chunk must not leave state behind"
+        );
+        assert_eq!(decoder.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn a_final_chunk_without_a_pending_transfer_is_malformed() {
+        let mut decoder = ImageDecoder::new();
+        let message = kitty_chunk("f=100", Some(7), Some(false), b"AAAA");
+        assert_eq!(
+            decoder.decode(&message, &DecodeLimits::default()),
+            Err(DecodeError::Malformed(
+                "kitty final chunk without a pending transfer"
+            ))
+        );
+        assert_eq!(decoder.pending_transfers(), 0);
+    }
+
+    #[test]
+    fn a_transfer_over_the_per_transfer_bound_is_too_large() {
+        let limits = DecodeLimits {
+            max_input_bytes: 80,
+            ..DecodeLimits::default()
+        };
+        let mut decoder = ImageDecoder::new();
+        let data = vec![b'A'; 40];
+        for _ in 0..2 {
+            assert_eq!(
+                decoder
+                    .decode(&kitty_chunk("f=100", Some(1), Some(true), &data), &limits)
+                    .unwrap(),
+                None
+            );
+        }
+        let err = decoder
+            .decode(&kitty_chunk("f=100", Some(1), Some(true), &data), &limits)
+            .unwrap_err();
+        assert!(
+            matches!(err, DecodeError::TooLarge { .. }),
+            "expected TooLarge, got {err:?}"
+        );
+        assert_eq!(
+            decoder.pending_transfers(),
+            0,
+            "the overrun transfer is discarded, not grown"
+        );
+        assert_eq!(decoder.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn the_oldest_transfer_is_evicted_so_the_other_ones_still_decode() {
+        let limits = DecodeLimits::default();
+        let mut decoder = ImageDecoder::new();
+        // Each transfer is one 2x1 RGBA image (8 bytes, 12 base64 symbols) sent in
+        // two chunks, so every id can be finished and checked afterwards.
+        let mut finals = Vec::new();
+        for id in 1..=5u32 {
+            let raw = [id as u8, 2, 3, 4, 5, 6, 7, 8];
+            let chunks = chunked("f=32,s=2,v=1", id, &b64_encode(&raw), 2);
+            assert_eq!(
+                decoder.decode(&chunks[0], &limits).unwrap(),
+                None,
+                "id {id}"
+            );
+            finals.push(chunks[1].clone());
+        }
+        assert_eq!(
+            decoder.pending_transfers(),
+            MAX_IN_FLIGHT_TRANSFERS,
+            "only four transfers are held"
+        );
+        assert_eq!(
+            decoder.dropped(),
+            1,
+            "the oldest transfer is evicted and counted"
+        );
+
+        // Id 1 lost its state, so its final chunk can no longer complete anything.
+        assert_eq!(
+            decoder.decode(&finals[0], &limits),
+            Err(DecodeError::Malformed(
+                "kitty final chunk without a pending transfer"
+            ))
+        );
+        for (offset, final_chunk) in finals[1..].iter().enumerate() {
+            let id = offset as u8 + 2;
+            let image = decoder
+                .decode(final_chunk, &limits)
+                .unwrap()
+                .unwrap_or_else(|| panic!("id {id} must still finish"));
+            assert_eq!((image.width, image.height), (2, 1));
+            assert_eq!(image.pixel(0, 0), Some([id, 2, 3, 4]));
+            assert_eq!(image.pixel(1, 0), Some([5, 6, 7, 8]));
+        }
+        assert_eq!(decoder.pending_transfers(), 0);
+    }
+
+    #[test]
+    fn the_aggregate_bound_evicts_the_oldest_transfer() {
+        // A 5x5 RGBA image is 100 bytes, 136 base64 symbols. With a 200-byte
+        // per-message bound the aggregate bound is 400 symbols: one nearly-full
+        // transfer plus the first chunk of three others no longer fits.
+        let limits = DecodeLimits {
+            max_input_bytes: 200,
+            ..DecodeLimits::default()
+        };
+        let raw: Vec<u8> = (0..100u8).collect();
+        let encoded = b64_encode(&raw);
+        assert_eq!(encoded.len(), 136);
+        let body = |id: u32, more: bool, data: &[u8]| {
+            kitty_chunk("f=32,s=5,v=5", Some(id), Some(more), data)
+        };
+
+        let mut decoder = ImageDecoder::new();
+        // Id 1 holds 170 symbols of a payload that is never finished.
+        let filler = vec![b'A'; 170];
+        assert_eq!(
+            decoder.decode(&body(1, true, &filler), &limits).unwrap(),
+            None
+        );
+        // Ids 2 and 3 hold the first chunk of a real image each.
+        for id in 2..=3u32 {
+            assert_eq!(
+                decoder
+                    .decode(&body(id, true, &encoded[..100]), &limits)
+                    .unwrap(),
+                None
+            );
+        }
+        assert_eq!(decoder.pending_bytes(), 370);
+
+        // The fourth first-chunk pushes the total to 470, past the 400-symbol
+        // aggregate bound, so the oldest transfer is evicted — not the newest.
+        assert_eq!(
+            decoder
+                .decode(&body(4, true, &encoded[..100]), &limits)
+                .unwrap(),
+            None
+        );
+        assert_eq!(decoder.dropped(), 1);
+        assert_eq!(decoder.pending_transfers(), 3);
+        assert_eq!(decoder.pending_bytes(), 300);
+
+        // The evicted id is gone; the ones that remain still finish normally.
+        assert!(matches!(
+            decoder.decode(&body(1, false, b"AAAA"), &limits),
+            Err(DecodeError::Malformed(_))
+        ));
+        let image = decoder
+            .decode(&body(2, false, &encoded[100..]), &limits)
+            .unwrap()
+            .expect("id 2 finished");
+        assert_eq!((image.width, image.height), (5, 5));
+        assert_eq!(image.pixel(0, 0), Some([0, 1, 2, 3]));
+        assert_eq!(image.pixel(4, 4), Some([96, 97, 98, 99]));
+    }
+
+    #[test]
+    fn a_lone_chunk_does_not_disturb_a_later_single_chunk_image() {
+        let limits = DecodeLimits::default();
+        let mut decoder = ImageDecoder::new();
+        let rgba = [7, 8, 9, 255, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let png = png_bytes(2, 2, &rgba);
+
+        // A transfer that never finishes stays in flight; it must not be spliced
+        // into the single-chunk image that arrives next.
+        let stray = chunked("f=100", 4, &b64_encode(&png), 2);
+        assert_eq!(decoder.decode(&stray[0], &limits).unwrap(), None);
+        assert!(decoder.pending_bytes() > 0);
+
+        let image = decoder
+            .decode(&kitty_png(&png), &limits)
+            .unwrap()
+            .expect("a single-chunk image");
+        assert_eq!(image.pixel(0, 0), Some([7, 8, 9, 255]));
+        assert_eq!(image.pixel(1, 1), Some([9, 10, 11, 12]));
+        assert_eq!(
+            decoder.pending_transfers(),
+            1,
+            "the stray chunk is still in flight, untouched"
+        );
+        assert!(decoder.pending_bytes() > 0);
     }
 }
