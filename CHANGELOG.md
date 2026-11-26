@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-11-26
+
+### Fixed
+
+- Copying no longer asks to install `wl-clipboard` when it is installed. The
+  helper inherited a `TMPDIR` pointing at a directory that had gone away, so
+  `wl-copy` died with `mkdtemp: No such file or directory` and the terminal
+  blamed the installation. A `TMPDIR` that is not a directory is now dropped for
+  the helper, which falls back to `/tmp`, and a failure quotes the helper's own
+  message instead of a generic one. Paste reports the same distinction.
+
 ## [1.1.2] - 2026-11-26
 
 ### Changed
