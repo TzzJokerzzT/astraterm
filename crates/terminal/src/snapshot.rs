@@ -27,7 +27,11 @@ pub struct CellFlags {
 }
 
 /// One grid cell.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Rows are built cell by cell, so the struct stays cheap to clone: every field
+/// but `zerowidth` is a scalar, and `zerowidth` is `None` for all but the handful
+/// of cells that carry a grapheme continuation.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CellSnapshot {
     pub ch: char,
     pub fg: SnapshotColor,
@@ -37,6 +41,11 @@ pub struct CellSnapshot {
     pub wide: bool,
     /// Second half of a double-width character: drawn as part of the previous cell.
     pub wide_spacer: bool,
+    /// Codepoints that continue `ch` inside one grapheme cluster, in the order the
+    /// emulator received them: variation selectors, joiners, keycaps, tag
+    /// characters and combining marks. The renderer shapes them directly after
+    /// `ch`, so the shaper always sees the cluster whole.
+    pub zerowidth: Option<Box<[char]>>,
 }
 
 impl Default for CellSnapshot {
@@ -48,14 +57,24 @@ impl Default for CellSnapshot {
             flags: CellFlags::default(),
             wide: false,
             wide_spacer: false,
+            zerowidth: None,
         }
     }
 }
 
 impl CellSnapshot {
     /// Plain text content, treating spacers as empty.
-    pub fn text(self) -> char {
+    ///
+    /// The zero-width continuations are deliberately left out: this is the text
+    /// search, URL detection and the clipboard copy for a single cell use, and it
+    /// keeps the characters a user selected.
+    pub fn text(&self) -> char {
         if self.wide_spacer { ' ' } else { self.ch }
+    }
+
+    /// Codepoints that continue this cell's character, in receipt order.
+    pub fn zerowidth(&self) -> &[char] {
+        self.zerowidth.as_deref().unwrap_or_default()
     }
 }
 

@@ -467,12 +467,13 @@ const ANCHOR_TOLERANCE: f32 = 0.5;
 /// boundary inside a cluster would shape the pieces separately: `👍` and `🏽` are
 /// two codepoints of one glyph, and painting them as two items paints two glyphs.
 ///
-/// The snapshot carries only the base character of a cluster stored in one cell, so
-/// the variation-selector, joiner, keycap, tag and combining-mark ranges only fire
-/// for data that survives a cell the model split — which is why the preserved cases
-/// are a skin-tone modifier in its own cell and a pair of regional indicators. See
-/// T6 in `odd/tasks/grid-anchored-glyphs.md` for the terminal-crate prerequisite
-/// that would carry `Cell::zerowidth()` here.
+/// The snapshot carries the codepoints the model stored as zero-width data of a
+/// cell ([`CellSnapshot::zerowidth`], S9), so these ranges fire for the selectors,
+/// keycaps, tags and combining marks that share a cell with their base — `❤️` and
+/// `e`+U+0301 arrive whole — and for a skin-tone modifier in a wide cell of its
+/// own. A joiner at the end of a cell also joins the *next* cell, whatever that
+/// cell holds, which is what keeps a ZWJ sequence such as `👨‍👩‍👧` whole; see
+/// [`cluster_at`].
 fn cluster_continuation(c: char) -> bool {
     matches!(c,
         // Variation selectors (text and emoji presentation).
@@ -515,7 +516,7 @@ fn regional_indicator(c: char) -> bool {
     matches!(c, '\u{1F1E6}'..='\u{1F1FF}')
 }
 
-/// One grapheme cluster of a row, as far as the snapshot still preserves it.
+/// One grapheme cluster of a row.
 struct Cluster<'a> {
     /// Grid column of the first cell.
     column: usize,
@@ -531,11 +532,18 @@ struct Cluster<'a> {
 /// Reads the cluster that starts at `column` and decides whether it is anchored.
 ///
 /// The walk absorbs every following cell that continues the base — a wide cell and
-/// its spacer, a skin-tone modifier in its own cell, the second half of a flag — and
-/// stops at the first cell that starts a new cluster. Anchoring is then measured, not
-/// listed: a wide base always anchors (the model already gave it two columns), and a
-/// cluster whose shaped advance disagrees with the columns reserved for it anchors by
-/// more than [`ANCHOR_TOLERANCE`].
+/// its spacer, a skin-tone modifier in its own cell, the second half of a flag, and
+/// the member of a ZWJ sequence that follows a joiner — and stops at the first cell
+/// that starts a new cluster. A hidden cell never continues anything: it paints a
+/// space and hands its own style to nothing.
+///
+/// The cluster reports exactly the columns it consumed, so the walk of the row can
+/// advance by what it reports without skipping a cell. A wide base whose spacer is
+/// missing therefore owns one column, not two (S10).
+///
+/// Anchoring is then measured, not listed: a wide base always anchors (the model
+/// already gave it two columns), and a cluster whose shaped advance disagrees with
+/// the columns reserved for it anchors by more than [`ANCHOR_TOLERANCE`].
 fn cluster_at<'a>(
     row: &'a RowSnapshot,
     column: usize,
@@ -546,17 +554,30 @@ fn cluster_at<'a>(
     let mut text = String::new();
     push_cell_text(&mut text, base);
     // A cluster holds at most one regional-indicator pair, so the third indicator
-    // starts the next cluster instead of joining this one.
-    let mut indicators = usize::from(regional_indicator(base.ch));
+    // starts the next cluster instead of joining this one. A hidden cell is not a
+    // half of anything: it paints a space, so it must not seed the count either.
+    let mut indicators = usize::from(!base.flags.hidden && regional_indicator(base.ch));
     let mut end = column + 1;
     while let Some(cell) = row.cells.get(end) {
         let continues = if cell.wide_spacer {
             // A spacer belongs to the wide cell before it, as it always did.
             true
+        } else if cell.flags.hidden {
+            // A hidden cell neither continues a cluster nor contributes an
+            // indicator: absorbing it would append its space to the cluster, and
+            // absorbing the visible cell after it would paint that cell in the
+            // hidden cell's style (S10).
+            false
+        } else if text.ends_with('\u{200D}') {
+            // The cell before ended with a zero-width joiner, so this cell is the
+            // next member of the same sequence whatever its codepoint is: a ZWJ
+            // emoji is stored as one wide cell per member, with the joiner kept as
+            // zero-width data of the cell before it.
+            true
         } else if regional_indicator(cell.ch) {
             indicators == 1
         } else {
-            !cell.flags.hidden && cluster_continuation(cell.ch)
+            cluster_continuation(cell.ch)
         };
         if !continues {
             break;
@@ -567,8 +588,7 @@ fn cluster_at<'a>(
         }
         end += 1;
     }
-    // A wide base owns two columns even when the model wrote no spacer for it.
-    let columns = (end - column).max(if base.wide { 2 } else { 1 });
+    let columns = end - column;
     let reserved = columns as f32 * cell_width;
     let measured = measure.advance(&text);
     Cluster {
@@ -581,12 +601,17 @@ fn cluster_at<'a>(
 }
 
 /// Appends one cell's text to a cluster, hiding a hidden cell behind a space.
+///
+/// The zero-width continuations the model kept for the cell follow its base
+/// character, so the shaper receives the cluster whole instead of separate cells
+/// that would paint as separate glyphs (S9).
 fn push_cell_text(text: &mut String, cell: &CellSnapshot) {
     if cell.flags.hidden {
         text.push(' ');
-    } else {
-        text.push(cell.ch);
+        return;
     }
+    text.push(cell.ch);
+    text.extend(cell.zerowidth().iter().copied());
 }
 
 /// Stable identifier of the text segment that starts at `column` of `row_id`.
@@ -1198,18 +1223,18 @@ mod tests {
     #[test]
     fn inverse_swaps_foreground_and_background() {
         let snapshot = snapshot("\x1b[7mI\x1b[0m", 5, 1);
-        let cell = snapshot.lines[0].cells[0];
+        let cell = &snapshot.lines[0].cells[0];
         assert!(cell.flags.inverse);
-        let (foreground, _, _) = cell_style(&cell, &theme());
+        let (foreground, _, _) = cell_style(cell, &theme());
         assert_eq!(foreground, theme().background);
-        assert_eq!(cell_background(&cell, &theme()), Some(theme().foreground));
+        assert_eq!(cell_background(cell, &theme()), Some(theme().foreground));
     }
 
     #[test]
     fn dim_text_loses_contrast() {
         let snapshot = snapshot("\x1b[2mD\x1b[0m", 5, 1);
-        let cell = snapshot.lines[0].cells[0];
-        let (dim, _, _) = cell_style(&cell, &theme());
+        let cell = &snapshot.lines[0].cells[0];
+        let (dim, _, _) = cell_style(cell, &theme());
         assert_ne!(dim, theme().foreground);
         assert!(dim.mix(theme().background, 0.0) == dim);
     }
@@ -1543,6 +1568,200 @@ mod tests {
         assert_eq!(items[0].position, (0.0, 0.0));
         assert_eq!(segment_text(&items[1]), "\u{1F1EB}\u{1F1F7}");
         assert_eq!(items[1].position, (2.0 * cell_width, 0.0));
+    }
+
+    #[test]
+    fn zero_width_continuations_shape_inside_one_cluster() {
+        // S9: with the snapshot carrying the zero-width data, the shaper receives the
+        // whole grapheme cluster instead of its base character alone, and no segment
+        // boundary falls inside it.
+        let cases: [(&str, &str, usize); 5] = [
+            // Emoji presentation selector.
+            ("\u{2764}\u{FE0F}", "\u{2764}\u{FE0F}", 1),
+            // Keycap: selector plus enclosing keycap.
+            ("\u{0031}\u{FE0F}\u{20E3}", "1\u{FE0F}\u{20E3}", 1),
+            // Text presentation selector.
+            ("\u{2764}\u{FE0E}", "\u{2764}\u{FE0E}", 1),
+            // Combining acute accent.
+            ("e\u{0301}", "e\u{0301}", 1),
+            // ZWJ family emoji: three wide cells joined by the joiners kept in the
+            // zero-width data of the cell before each one.
+            (
+                "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+                "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+                6,
+            ),
+        ];
+        for (input, expected, columns) in cases {
+            let snapshot = snapshot(input, 10, 1);
+            let mut font = TestFont::new();
+            let (metrics, mut measure) = font.painter();
+            let cell_width = metrics.width;
+            let cluster = cluster_at(&snapshot.lines[0], 0, cell_width, &mut measure);
+            assert_eq!(cluster.text, expected, "{input:?} is one cluster");
+            assert_eq!(cluster.columns, columns, "{input:?} owns its columns");
+            let items = row_text_item(
+                0,
+                0,
+                0,
+                &snapshot.lines[0],
+                &theme(),
+                Rect::new(0, 0, 200, 20),
+                cell_width,
+                &mut measure,
+            );
+            assert!(
+                items
+                    .iter()
+                    .any(|item| segment_text(item).contains(expected)),
+                "{input:?} must reach the shaper in one segment instead of split: {:?}",
+                items.iter().map(segment_text).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A row of explicitly built cells: a shape the emulator rarely emits but a
+    /// snapshot can still carry.
+    fn row_of(cells: Vec<CellSnapshot>) -> RowSnapshot {
+        RowSnapshot { cells }
+    }
+
+    #[test]
+    fn a_wide_base_without_a_spacer_does_not_skip_the_next_cell() {
+        // S10: a wide cell normally owns two columns, the second being its spacer.
+        // When the spacer is genuinely missing the cluster must still consume exactly
+        // the columns it reports, or the cell after it is skipped and never painted.
+        let row = row_of(vec![
+            CellSnapshot {
+                ch: '你',
+                wide: true,
+                ..Default::default()
+            },
+            CellSnapshot {
+                ch: 'x',
+                ..Default::default()
+            },
+        ]);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
+        let cell_width = metrics.width;
+        let items = row_text_item(
+            0,
+            0,
+            0,
+            &row,
+            &theme(),
+            Rect::new(0, 0, 200, 20),
+            cell_width,
+            &mut measure,
+        );
+        assert_eq!(items.len(), 2, "the wide glyph and the cell after it");
+        assert_eq!(segment_text(&items[0]), "你");
+        assert_eq!(
+            items[1].position.0, cell_width,
+            "the next cell keeps its own column"
+        );
+        assert!(
+            segment_text(&items[1]).starts_with('x'),
+            "the cell after a wide base is still painted"
+        );
+    }
+
+    #[test]
+    fn a_hidden_indicator_does_not_absorb_the_visible_one() {
+        // S10: a hidden cell contributes no regional indicator, so the visible half
+        // after it starts its own cluster instead of inheriting the hidden style.
+        let row = row_of(vec![
+            CellSnapshot {
+                ch: '\u{1F1EA}',
+                fg: SnapshotColor::Indexed(1),
+                flags: CellFlags {
+                    hidden: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            CellSnapshot {
+                ch: '\u{1F1F8}',
+                fg: SnapshotColor::Indexed(2),
+                ..Default::default()
+            },
+        ]);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
+        let cell_width = metrics.width;
+        let hidden = cluster_at(&row, 0, cell_width, &mut measure);
+        assert_eq!(hidden.text, " ", "a hidden cell paints as a space");
+        assert_eq!(hidden.columns, 1, "a hidden cell owns no continuation");
+        let visible = cluster_at(&row, 1, cell_width, &mut measure);
+        assert_eq!(visible.text, "\u{1F1F8}");
+        assert_eq!(visible.columns, 1);
+        let items = row_text_item(
+            0,
+            0,
+            0,
+            &row,
+            &theme(),
+            Rect::new(0, 0, 200, 20),
+            cell_width,
+            &mut measure,
+        );
+        let span = items
+            .iter()
+            .flat_map(|item| &item.spans)
+            .find(|span| span.text.contains('\u{1F1F8}'))
+            .expect("the visible indicator is painted");
+        assert_eq!(span.text, "\u{1F1F8}", "the hidden cell does not join it");
+        assert_eq!(
+            span.color,
+            rgba(theme().ansi[2], 1.0),
+            "the visible half keeps its own style"
+        );
+    }
+
+    #[test]
+    fn a_hidden_continuation_does_not_join_the_visible_indicator() {
+        // S10 the other way round: a hidden cell neither continues a cluster nor
+        // lends its hidden state to the visible half it follows.
+        let row = row_of(vec![
+            CellSnapshot {
+                ch: '\u{1F1EA}',
+                fg: SnapshotColor::Indexed(2),
+                ..Default::default()
+            },
+            CellSnapshot {
+                ch: '\u{1F1F8}',
+                fg: SnapshotColor::Indexed(1),
+                flags: CellFlags {
+                    hidden: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ]);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
+        let cell_width = metrics.width;
+        let cluster = cluster_at(&row, 0, cell_width, &mut measure);
+        assert_eq!(cluster.text, "\u{1F1EA}", "the hidden half stays out");
+        assert_eq!(cluster.columns, 1);
+        let items = row_text_item(
+            0,
+            0,
+            0,
+            &row,
+            &theme(),
+            Rect::new(0, 0, 200, 20),
+            cell_width,
+            &mut measure,
+        );
+        let span = items
+            .iter()
+            .flat_map(|item| &item.spans)
+            .find(|span| span.text.contains('\u{1F1EA}'))
+            .expect("the visible indicator is painted");
+        assert_eq!(span.text, "\u{1F1EA}", "no hidden space is appended");
+        assert_eq!(span.color, rgba(theme().ansi[2], 1.0));
     }
 
     #[test]

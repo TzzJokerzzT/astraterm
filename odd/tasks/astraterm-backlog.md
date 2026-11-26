@@ -9,7 +9,7 @@ con specs `S#` y slices, como se hizo con `astraterm-terminal-capabilities.md`.
 
 ## Estado actual
 
-Rama `main`. **489 tests**, `cargo clippy --workspace --all-targets` sin advertencias,
+Rama `main`. **529 tests**, `cargo clippy --workspace --all-targets` sin advertencias,
 `cargo fmt --check` limpio.
 
 Versión publicada: **1.0.0** — tag `v1.0.0` (que apunta al commit `3806289`) y release
@@ -46,6 +46,10 @@ Ya implementado y cerrado:
 | Las imágenes sobreviven a un resize                   | `fix(app)` (1.1.4)              |
 | El escáner resincroniza tras un OSC malformado        | `dd3b534` (1.1.1)               |
 | Kitty: `m=0` en un chunk y no desalojar al añadir     | `fe4eceb` (1.1.5)               |
+| Glifos anchos y de fallback anclados a la rejilla     | `2cc3feb`                       |
+| Anclaje por medición del clúster, no por lista blanca | `4f96b50`                       |
+| Winsize del PTY igual a la rejilla pintada            | `1bcff2c`                       |
+| `zerowidth` en `CellSnapshot` (clústeres de emoji)    | pendiente de commit             |
 
 De la lista de mejoras B1–B18 de este documento, **solo las notificaciones OSC 9/777
 y el kitty por chunks están hechas**. Todo lo demás sigue pendiente.
@@ -303,6 +307,38 @@ capturas.
 `crates/app/src/app.rs`: en una sesión con `REPORT_EVENT_TYPES` (nvim, por ejemplo), una
 tecla consumida como atajo igual emite su release. Atuin no lo expone porque no pide ese
 flag. Coste S, riesgo de romper atajos si se hace mal.
+
+### B19. Rendimiento del recorrido por clústeres
+
+- **Por qué**: el anclaje por medición recorre la fila clúster por clúster. La revisión nativa
+  midió dos costes: se asigna un `String` nuevo por celda y por frame antes de consultar la caché
+  de avances, y esa caché se vacía entera al llegar a 4096 entradas, así que una pantalla con más
+  de 4096 clústeres distintos (texto CJK grande) la llena y la vacía dentro del mismo frame y
+  vuelve a formar todo cada frame.
+- **Dónde**: `crates/renderer/src/paint.rs` (`cluster_at`, `push_cell_text`) y
+  `crates/renderer/src/text.rs` (`ClusterWidths`).
+- **Qué**: reutilizar un búfer por fila en vez de asignar por celda, y desalojar por antigüedad en
+  lugar de vaciar la caché completa. Medir con un perfil antes y después.
+- **Coste**: S/M.
+- **Verificación**: un test que llene la caché pasadas las 4096 entradas y compruebe que no se
+  vacía; perfil de un frame con una pantalla de CJK densa.
+
+### B20. Robustez de los tests de medición y limpieza de rangos
+
+- **Por qué**: los tests nuevos construyen `FontSystem::new()` y afirman avances concretos de
+  fallback (devanagari más ancho que una celda, emoji a 2.075 celdas). Dependen de las fuentes
+  instaladas en la máquina, así que en CI sin la fuente por defecto pueden fallar en vez de saltar.
+  Además, `cluster_continuation` enumera selectores de variación, ZWJ, keycaps, tags y bloques
+  combinantes que solo son alcanzables desde que `zerowidth` llega al renderer, y conviene que el
+  predicado y sus tests digan cuáles son alcanzables y cuáles no.
+- **Dónde**: `crates/renderer/src/text.rs` (tests de medición), `crates/renderer/src/paint.rs`
+  (`cluster_continuation`).
+- **Qué**: fijar la fuente del test en vez de depender del sistema, o saltar con un mensaje claro
+  cuando la fuente no esté; revisar el predicado de continuaciones contra lo que la capa de
+  terminal entrega hoy.
+- **Coste**: S.
+- **Verificación**: `cargo test -p astraterm-renderer` en un entorno sin la fuente configurada; el
+  test debe saltar, no fallar.
 
 ---
 

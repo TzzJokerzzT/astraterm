@@ -36,16 +36,25 @@ skin-tone modifier (U+1F3FB-U+1F3FF) or a pair of regional indicators (U+1F1E6-U
 the anchored segment of its base character, so `👍🏽` and `🇪🇸` stay whole instead of anchoring base
 and continuation separately.
 
-The rest of the cluster data never reaches the renderer: `convert_cell`
-(`crates/terminal/src/engine.rs:576`) drops `Cell::zerowidth()` and `CellSnapshot` has no field for
-it, so `❤️` arrives as `❤`, `1️⃣` as `1`, `👨‍👩‍👧` as three independent wide cells and `e` + U+0301 as
-`e`. That is identical in the baseline, so those cases are a pre-existing terminal-crate defect, not
-a renderer regression; they are tracked as T6 and are explicitly out of scope for this feature.
+The cluster data now reaches the renderer: `CellSnapshot` carries `Cell::zerowidth()` and
+`convert_cell` no longer discards it, so `❤️`, `1️⃣`, `👨‍👩‍👧` and `e` + U+0301 arrive whole and are
+shaped with their base (S9). What remains of the old limitation is the copy and search text: it is
+built from the base character only, so a copied emoji keeps its visuals but not its selectors.
 
 S8. The decision to anchor a cell must come from measurement, not from a hardcoded list of
 codepoints: a cluster is anchored when its shaped advance disagrees with the columns the model
 reserved for it. The emoji/symbol whitelist does not cover a fallback script, so `क` still drifts
 at 1.280 cells per glyph while the grid reserves one.
+
+S9. The zero-width continuations of a cell must reach the renderer. `CellSnapshot` carries the
+codepoints `Cell::zerowidth()` holds for that cell, and `convert_cell` stops discarding them, so
+U+FE0E/U+FE0F, ZWJ sequences, keycaps, tag characters and combining marks are shaped with their
+base. With that in place `❤️`, `1️⃣`, `👨‍👩‍👧` and `e`+U+0301 must reach the shaper whole, and the
+narrowed scope of S7 stops applying.
+
+S10. Two correctness invariants the review found: a wide cell with no following `wide_spacer` must
+not swallow the cell that follows it, and a hidden cell must not absorb a visible continuation nor
+lend it its style.
 
 ## Tasks
 
@@ -54,9 +63,10 @@ T2 — S5 — session/app: initial winsize from the real rectangle and observabl
 T3 — S6 — differential check on plain rows, docs in `docs/TERMINAL_COMPATIBILITY.md` — commit 3
 T4 — S7 — anchored segment per preserved grapheme cluster (skin-tone, regional-indicator pair) — commit 4
 T5 — S8 — replace the whitelist with a measured split driven by the shaped advance — commit 4
-T6 — S7 remainder — carry `Cell::zerowidth()` into `CellSnapshot` from `crates/terminal/src/engine.rs`
-     so U+FE0E/FE0F, ZWJ sequences, keycaps, tags and combining marks survive; blocked, not scheduled
-     here because it changes a snapshot contract outside this feature's scope
+T6 — S9 — carry `Cell::zerowidth()` into `CellSnapshot` from `crates/terminal/src/engine.rs` and
+     feed it back into the shaping text — commit 5
+T7 — S10 — a wide cell without a spacer must not skip the next cell; a hidden cell must not absorb a
+     visible continuation — commit 5
 
 ## Log
 
@@ -101,3 +111,10 @@ decision, verbatim: «Solo renderer ahora (recomendado)». S7 is therefore narro
 clusters, T6 records the terminal-crate prerequisite as out of scope, and the paint tests must
 derive their grid width from the measured style so measurement-driven anchoring does not anchor
 plain ASCII.
+
+L6. After the native review approved the measured-anchoring slice, the user asked to close what was
+left open before starting new work: «Cerremos lo que esta abierto. Para luego hacer unos cambios que
+tengo en mente y continuar con el backlog». T6 is therefore scheduled instead of deferred, the two
+correctness findings of the review (R3-003, R2-002) are folded into the same commit, and the four
+remaining findings (R2-001, R3-001, R3-002, R3-004) stay as backlog entries because they are
+performance and test-hygiene work rather than defects.

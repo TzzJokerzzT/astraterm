@@ -591,6 +591,13 @@ fn convert_cell(cell: &alacritty_terminal::term::cell::Cell) -> CellSnapshot {
         wide: flags.contains(Flags::WIDE_CHAR),
         wide_spacer: flags.contains(Flags::WIDE_CHAR_SPACER)
             || flags.contains(Flags::LEADING_WIDE_CHAR_SPACER),
+        // S9: everything the model stored as zero-width data of this cell —
+        // variation selectors, joiners, keycaps, tag characters and combining
+        // marks — travels with the base character, so the shaper can see the
+        // cluster whole.
+        zerowidth: cell
+            .zerowidth()
+            .map(|codepoints| codepoints.to_vec().into_boxed_slice()),
     }
 }
 
@@ -833,5 +840,62 @@ mod notification_event_tests {
             "",
             "the foreign OSC must not print anything either"
         );
+    }
+}
+
+#[cfg(test)]
+mod zerowidth_snapshot_tests {
+    use super::{EngineOptions, TerminalEngine};
+
+    /// The cell at `column` of the first row, as the renderer receives it.
+    fn cell_text(engine: &mut TerminalEngine, column: usize) -> (char, Vec<char>) {
+        let snapshot = engine.snapshot();
+        let cell = &snapshot.lines[0].cells[column];
+        (cell.ch, cell.zerowidth().to_vec())
+    }
+
+    #[test]
+    fn zero_width_codepoints_reach_the_snapshot() {
+        // S9: `convert_cell` used to drop `Cell::zerowidth()`, so the renderer
+        // shaped the base character alone: `❤️` arrived as `❤`, `1️⃣` as `1`.
+        let cases: [(&str, char, &[char]); 4] = [
+            // Emoji presentation selector.
+            ("\u{2764}\u{FE0F}", '\u{2764}', &['\u{FE0F}']),
+            // Keycap: the presentation selector and the enclosing keycap.
+            ("\u{0031}\u{FE0F}\u{20E3}", '1', &['\u{FE0F}', '\u{20E3}']),
+            // Text presentation selector.
+            ("\u{2764}\u{FE0E}", '\u{2764}', &['\u{FE0E}']),
+            // Combining acute accent.
+            ("e\u{0301}", 'e', &['\u{0301}']),
+        ];
+        for (input, base, zerowidth) in cases {
+            let mut engine = TerminalEngine::new(EngineOptions {
+                cols: 10,
+                rows: 2,
+                ..Default::default()
+            });
+            engine.process(input.as_bytes());
+            assert_eq!(
+                cell_text(&mut engine, 0),
+                (base, zerowidth.to_vec()),
+                "the zero-width data of {input:?} must survive into the snapshot"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zwj_sequence_reaches_the_snapshot_whole() {
+        // S9: the model stores a ZWJ sequence across the wide cells of its members
+        // and keeps each joiner as zero-width data of the cell before it, so the
+        // family emoji arrives as three wide cells joined by the data between them.
+        let mut engine = TerminalEngine::new(EngineOptions {
+            cols: 10,
+            rows: 2,
+            ..Default::default()
+        });
+        engine.process("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}".as_bytes());
+        assert_eq!(cell_text(&mut engine, 0), ('\u{1F468}', vec!['\u{200D}']));
+        assert_eq!(cell_text(&mut engine, 2), ('\u{1F469}', vec!['\u{200D}']));
+        assert_eq!(cell_text(&mut engine, 4), ('\u{1F467}', Vec::new()));
     }
 }

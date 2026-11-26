@@ -80,7 +80,7 @@ fn background_and_attributes_are_reported() {
     let mut engine = engine(20, 2);
     feed(&mut engine, "\x1b[1;3;4;9;48;2;10;20;30mstyled\x1b[0m");
     let snapshot = engine.snapshot();
-    let cell = snapshot.lines[0].cells[0];
+    let cell = &snapshot.lines[0].cells[0];
     assert!(cell.flags.bold);
     assert!(cell.flags.italic);
     assert!(cell.flags.underline);
