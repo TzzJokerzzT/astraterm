@@ -2,14 +2,14 @@
 #
 # Arch Linux PKGBUILD for AstraTerm.
 #
-# The `source` line points at the release tarball that `makepkg --allsource`
-# produces from this repository. Checksums are deliberately skipped here:
+# The `source` line points at the release tarball that makepkg --allsource
+# produces from this repository.
 #
-#   *** Fill in the real release tarball checksums before publishing. ***
-#
-# Replace `sha256sums=('SKIP')` with the output of
-# `updpkgsums` (or `sha256sum astraterm-$pkgver.tar.gz`) once the release
-# tarball exists. Publishing with `SKIP` defeats the point of a source hash.
+# `sha256sums=('SKIP')` is deliberate, not an oversight that a release forgot:
+# this PKGBUILD travels inside the tarball it would have to authenticate, so a
+# real hash here would have to contain itself. If you need a verified build,
+# publish the PKGBUILD as a separate artifact or verify the tag out of band
+# (`git verify-tag v$pkgver`), which is what the release actually depends on.
 
 pkgname=astraterm
 pkgver=1.1.4

@@ -288,23 +288,18 @@ impl ImageDecoder {
         }
 
         // A final chunk (`m=0` or no `m`) either closes a transfer this decoder
-        // holds, or is a complete single-chunk image.
-        if let Some(id) = header.id {
-            if let Some(index) = self.position(id) {
-                let mut transfer = self.transfers.remove(index);
-                if transfer.data.len() + data.len() > limits.max_input_bytes {
-                    return Err(too_large(limits));
-                }
-                transfer.data.extend_from_slice(data);
-                return finish_transfer(&transfer, limits).map(Some);
+        // holds, or is a complete single-chunk image. Kitty lets the sender spell
+        // `m=0` out even when there is only one chunk, so an explicit last-chunk
+        // flag without state is just an image, not a mistake.
+        if let Some(id) = header.id
+            && let Some(index) = self.position(id)
+        {
+            let mut transfer = self.transfers.remove(index);
+            if transfer.data.len() + data.len() > limits.max_input_bytes {
+                return Err(too_large(limits));
             }
-            if header.more == Some(false) {
-                // Only chunked sends say `m=0` explicitly, and by then the state
-                // must exist; without it the chunk cannot be part of an image.
-                return Err(DecodeError::Malformed(
-                    "kitty final chunk without a pending transfer",
-                ));
-            }
+            transfer.data.extend_from_slice(data);
+            return finish_transfer(&transfer, limits).map(Some);
         }
 
         decode_kitty_data(&header, data, limits).map(Some)
@@ -326,7 +321,13 @@ impl ImageDecoder {
             self.transfers.remove(index);
             return Err(too_large(limits));
         }
-        self.make_room(id, data.len(), limits.max_input_bytes.saturating_mul(2));
+        let appending = self.position(id).is_some();
+        self.make_room(
+            id,
+            data.len(),
+            limits.max_input_bytes.saturating_mul(2),
+            appending,
+        );
         match self.position(id) {
             Some(index) => self.transfers[index].data.extend_from_slice(data),
             None => self.transfers.push(KittyTransfer {
@@ -349,8 +350,12 @@ impl ImageDecoder {
     /// `keep` is the transfer the caller is about to append to, and is never the
     /// one evicted: its own size is bounded by the per-transfer limit, which is
     /// half the aggregate bound, so evicting the others always makes room.
-    fn make_room(&mut self, keep: u32, incoming: usize, aggregate_max: usize) {
-        while self.transfers.len() >= MAX_IN_FLIGHT_TRANSFERS
+    ///
+    /// The live-transfer count only matters when a **new** transfer is created:
+    /// appending to one already in flight does not increase the count, so a
+    /// continuation chunk must never evict a sibling transfer.
+    fn make_room(&mut self, keep: u32, incoming: usize, aggregate_max: usize, appending: bool) {
+        while (!appending && self.transfers.len() >= MAX_IN_FLIGHT_TRANSFERS)
             || self.pending_bytes() + incoming > aggregate_max
         {
             let Some(index) = self
@@ -1437,15 +1442,18 @@ mod tests {
     }
 
     #[test]
-    fn a_final_chunk_without_a_pending_transfer_is_malformed() {
+    fn an_explicit_last_chunk_without_state_is_a_single_chunk_image() {
+        // Kitty lets the sender spell `m=0` on a lone chunk. Refusing it would drop
+        // images the previous decoder accepted, so it decodes as one chunk here.
+        let limits = DecodeLimits::default();
         let mut decoder = ImageDecoder::new();
-        let message = kitty_chunk("f=100", Some(7), Some(false), b"AAAA");
-        assert_eq!(
-            decoder.decode(&message, &DecodeLimits::default()),
-            Err(DecodeError::Malformed(
-                "kitty final chunk without a pending transfer"
-            ))
-        );
+        let raw = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let message = kitty_chunk("f=32,s=2,v=1", Some(7), Some(false), &b64_encode(&raw));
+        let image = decoder
+            .decode(&message, &limits)
+            .unwrap()
+            .expect("an image, not a chunk");
+        assert_eq!((image.width, image.height), (2, 1));
         assert_eq!(decoder.pending_transfers(), 0);
     }
 
@@ -1481,6 +1489,32 @@ mod tests {
     }
 
     #[test]
+    fn a_continuation_chunk_never_evicts_another_transfer() {
+        // Four transfers live is the bound, not a reason to evict when a chunk
+        // simply continues one of them: the count is not growing.
+        let limits = DecodeLimits::default();
+        let mut decoder = ImageDecoder::new();
+        let mut chunks = Vec::new();
+        for id in 1..=4u32 {
+            let raw = [id as u8, 2, 3, 4, 5, 6, 7, 8];
+            chunks.push(chunked("f=32,s=2,v=1", id, &b64_encode(&raw), 2));
+        }
+        for chunk in &chunks {
+            decoder.decode(&chunk[0], &limits).unwrap();
+        }
+        assert_eq!(decoder.pending_transfers(), MAX_IN_FLIGHT_TRANSFERS);
+        assert_eq!(decoder.dropped(), 0);
+
+        let image = decoder
+            .decode(&chunks[0][1], &limits)
+            .unwrap()
+            .expect("the continued transfer finishes");
+        assert_eq!((image.width, image.height), (2, 1));
+        assert_eq!(decoder.dropped(), 0, "no sibling transfer was evicted");
+        assert_eq!(decoder.pending_transfers(), 3);
+    }
+
+    #[test]
     fn the_oldest_transfer_is_evicted_so_the_other_ones_still_decode() {
         let limits = DecodeLimits::default();
         let mut decoder = ImageDecoder::new();
@@ -1508,12 +1542,11 @@ mod tests {
             "the oldest transfer is evicted and counted"
         );
 
-        // Id 1 lost its state, so its final chunk can no longer complete anything.
-        assert_eq!(
-            decoder.decode(&finals[0], &limits),
-            Err(DecodeError::Malformed(
-                "kitty final chunk without a pending transfer"
-            ))
+        // Id 1 lost its state. Its final chunk is now read as a standalone image
+        // and, being half a frame, must not decode: no silent success either way.
+        assert!(
+            decoder.decode(&finals[0], &limits).is_err(),
+            "half a frame must not decode as an image"
         );
         for (offset, final_chunk) in finals[1..].iter().enumerate() {
             let id = offset as u8 + 2;
