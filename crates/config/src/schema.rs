@@ -193,6 +193,22 @@ pub struct FontConfig {
     /// a few columns fewer. Off, the measured advance is used exactly as it comes out
     /// of the shaper.
     pub integer_cell_width: bool,
+    /// Hint glyph outlines to the pixel grid when they are rasterised.
+    ///
+    /// Off by default, and then cosmic-text builds the swash scaler with
+    /// `hint(false)`: a glyph's outline is scaled to the requested size and sampled,
+    /// so a stem keeps its fractional width and a dithered block keeps its own
+    /// pattern. On, swash snaps stems and edges to whole pixels.
+    ///
+    /// Off is the default because hinting is what loses weight at the sizes a
+    /// terminal actually uses. The dither of `▓▒░` (U+2591..U+2593) is a one-to-two
+    /// pixel pattern, so a hinted 18.33 ppem buffer — the size
+    /// `integer_cell_width` produces — rounds every other dot onto a different pixel
+    /// boundary and the gradient reads as a coarse hatch with dark vertical stripes,
+    /// while `·` (U+00B7) and other thin glyphs drop whole pixel rows. Hinted
+    /// rasterisation is also the look most other terminal emulators do *not* ship, so
+    /// a user who wants the old AstraTerm look sets `hinting = true`.
+    pub hinting: bool,
     /// Additional families used when a glyph is missing from `family`.
     pub fallbacks: Vec<String>,
 }
@@ -207,6 +223,7 @@ impl Default for FontConfig {
             letter_spacing: 0.0,
             ligatures: false,
             integer_cell_width: false,
+            hinting: false,
             fallbacks: vec![
                 "JetBrains Mono".to_owned(),
                 "Symbols Nerd Font".to_owned(),
@@ -576,6 +593,45 @@ mod tests {
                 .issues
                 .iter()
                 .any(|issue| issue.field.contains("integer_cell_hight")),
+            "an unknown key still warns: {:?}",
+            outcome.issues
+        );
+        assert!(
+            outcome.validation().is_valid(),
+            "an unknown key stays a warning: {:?}",
+            outcome.issues
+        );
+    }
+
+    #[test]
+    fn hinting_defaults_off_and_parses_when_asked() {
+        assert!(
+            !FontConfig::default().hinting,
+            "hinted rasterisation is what coarsens a dithered block at a fractional size, \
+             so unhinted is the shipped default"
+        );
+        assert!(!Config::default().font.hinting);
+
+        let config: Config = toml::from_str("[font]\nhinting = true\n").unwrap();
+        assert!(config.font.hinting);
+
+        // Absent key and absent table both keep the default.
+        let config: Config = toml::from_str("[font]\nsize = 12.0\n").unwrap();
+        assert!(!config.font.hinting);
+        let config: Config = toml::from_str("[terminal]\nimages = true\n").unwrap();
+        assert!(!config.font.hinting);
+    }
+
+    #[test]
+    fn an_unknown_sibling_of_hinting_is_still_reported() {
+        let text = "[font]\nhinting = true\nhintng = false\n";
+        let outcome = crate::loader::parse_str(text, "test").unwrap();
+        assert!(outcome.config.font.hinting);
+        assert!(
+            outcome
+                .issues
+                .iter()
+                .any(|issue| issue.field.contains("hintng")),
             "an unknown key still warns: {:?}",
             outcome.issues
         );

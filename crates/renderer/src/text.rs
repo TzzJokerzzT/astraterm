@@ -12,7 +12,8 @@ use std::collections::HashMap;
 use astraterm_config::schema::FontConfig;
 use astraterm_core::CellMetrics;
 use cosmic_text::{
-    Attrs, Buffer, Family, FeatureTag, FontFeatures, FontSystem, Metrics, Shaping, Style, Weight,
+    Attrs, Buffer, CacheKeyFlags, Family, FeatureTag, FontFeatures, FontSystem, Metrics, Shaping,
+    Style, Weight,
 };
 use glyphon::{Color as GlyphonColor, TextArea, TextBounds};
 
@@ -26,6 +27,8 @@ pub struct TextStyle {
     pub letter_spacing: f32,
     /// Ligatures requested by configuration.
     pub ligatures: bool,
+    /// Hint glyph outlines to the pixel grid, as requested by configuration.
+    pub hinting: bool,
     pub metrics: Metrics,
     pub cell: CellMetrics,
     pub scale: f32,
@@ -43,6 +46,7 @@ impl TextStyle {
             weight: Weight(font.weight),
             letter_spacing: font.letter_spacing,
             ligatures: font.ligatures,
+            hinting: font.hinting,
             metrics,
             cell,
             scale,
@@ -273,6 +277,7 @@ fn measure_cluster(font_system: &mut FontSystem, style: &TextStyle, text: &str) 
     let mut attrs = Attrs::new()
         .family(Family::Name(&family))
         .weight(style.weight)
+        .cache_key_flags(cache_key_flags(style.hinting))
         .font_features(font_features(style.ligatures));
     if style.letter_spacing.abs() > f32::EPSILON {
         attrs = attrs.letter_spacing(style.letter_spacing);
@@ -316,6 +321,7 @@ fn shape(font_system: &mut FontSystem, style: &TextStyle, item: &TextItem) -> Bu
                     (span.color[2] * 255.0) as u8,
                     (span.color[3] * 255.0) as u8,
                 ))
+                .cache_key_flags(cache_key_flags(style.hinting))
                 .font_features(features.clone());
             if style.letter_spacing.abs() > f32::EPSILON {
                 attrs = attrs.letter_spacing(style.letter_spacing);
@@ -331,6 +337,7 @@ fn shape(font_system: &mut FontSystem, style: &TextStyle, item: &TextItem) -> Bu
     let default_attrs = Attrs::new()
         .family(Family::Name(&family))
         .weight(style.weight)
+        .cache_key_flags(cache_key_flags(style.hinting))
         .font_features(features);
     buffer.set_rich_text(span_refs, &default_attrs, Shaping::Advanced, None);
     buffer.shape_until_scroll(font_system, false);
@@ -354,6 +361,22 @@ pub fn font_features(ligatures: bool) -> FontFeatures {
         features.disable(FeatureTag::DISCRETIONARY_LIGATURES);
     }
     features
+}
+
+/// Glyph-cache flags that decide how the rasteriser treats the outline.
+///
+/// cosmic-text hints by default — `swash.rs` builds its scaler with
+/// `hint(!flags.contains(DISABLE_HINTING))` — so an unhinted terminal has to say so
+/// on every attribute it shapes with: the flag travels from `Attrs` into the
+/// `CacheKey` of each laid-out glyph, and that key is what glyphon's atlas uses to
+/// rasterise it. Setting it in one shaping path only would show one texture for a
+/// measured advance and another for the painted glyph.
+fn cache_key_flags(hinting: bool) -> CacheKeyFlags {
+    if hinting {
+        CacheKeyFlags::empty()
+    } else {
+        CacheKeyFlags::DISABLE_HINTING
+    }
 }
 
 /// Shaping metrics and cell metrics for a font configuration.
@@ -401,7 +424,8 @@ pub fn measure_cell(font_system: &mut FontSystem, font: &FontConfig, scale: f32)
     buffer.set_size(Some(4096.0), Some(line_height));
     let attrs = Attrs::new()
         .family(Family::Name(&font.family))
-        .weight(Weight(font.weight));
+        .weight(Weight(font.weight))
+        .cache_key_flags(cache_key_flags(font.hinting));
     // Ten ASCII cells: dividing the shaped width averages out rounding.
     buffer.set_text("MMMMMMMMMM", &attrs, Shaping::Advanced, None);
     buffer.shape_until_scroll(font_system, false);
@@ -431,6 +455,7 @@ fn style_key(font: &FontConfig, scale: f32) -> u64 {
     font.letter_spacing.to_bits().hash(&mut hasher);
     font.ligatures.hash(&mut hasher);
     font.integer_cell_width.hash(&mut hasher);
+    font.hinting.hash(&mut hasher);
     scale.to_bits().hash(&mut hasher);
     hasher.finish()
 }
@@ -666,6 +691,110 @@ mod tests {
         assert_ne!(
             off.key, on.key,
             "toggling the option has to invalidate shaped rows"
+        );
+    }
+
+    fn hinted_font() -> FontConfig {
+        FontConfig {
+            hinting: true,
+            ..mono_font()
+        }
+    }
+
+    #[test]
+    fn hinting_is_off_by_default() {
+        assert!(!FontConfig::default().hinting);
+    }
+
+    #[test]
+    fn the_style_key_tracks_the_hinting_choice() {
+        let mut system = FontSystem::new();
+        let off = TextStyle::new(&mono_font(), 1.0, &mut system);
+        let on = TextStyle::new(&hinted_font(), 1.0, &mut system);
+        assert!(!off.hinting);
+        assert!(on.hinting);
+        assert_ne!(
+            off.key, on.key,
+            "toggling hinting has to invalidate shaped rows"
+        );
+    }
+
+    /// Every shaped glyph carries the flag into the atlas key, so the rasteriser
+    /// the renderer reaches through glyphon is the one the configuration asked for.
+    fn glyph_cache_flags(font: &FontConfig, text: &str) -> Vec<CacheKeyFlags> {
+        let mut system = FontSystem::new();
+        let style = TextStyle::new(font, 1.0, &mut system);
+        let mut cache = RowCache::new();
+        cache.update(&mut system, &style, &scene_with(21, text));
+        cache
+            .rows
+            .get(&21)
+            .expect("the row was shaped into the cache")
+            .buffer
+            .layout_runs()
+            .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.cache_key_flags))
+            .collect()
+    }
+
+    #[test]
+    fn hinting_off_marks_the_glyph_cache_key_unhinted() {
+        let unhinted = glyph_cache_flags(&mono_font(), "Mn");
+        assert!(!unhinted.is_empty(), "the row shaped at least one glyph");
+        for flags in &unhinted {
+            assert!(
+                flags.contains(CacheKeyFlags::DISABLE_HINTING),
+                "an unhinted style must not reach a hinted glyph: {flags:?}"
+            );
+        }
+
+        let hinted = glyph_cache_flags(&hinted_font(), "Mn");
+        assert!(!hinted.is_empty());
+        for flags in &hinted {
+            assert!(
+                !flags.contains(CacheKeyFlags::DISABLE_HINTING),
+                "a hinted style keeps cosmic-text's own hinting: {flags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unhinted_whole_pixel_cells_keep_the_shaped_advance_on_the_grid() {
+        // The reporter's configuration: `integer_cell_width = true` shapes at a
+        // fractional ppem, and unhinting must not move the advance off the cell.
+        let mut system = FontSystem::new();
+        let font = integer_width_font();
+        assert!(
+            !font.hinting,
+            "the shipped default combined with whole-pixel cells"
+        );
+        let style = TextStyle::new(&font, 1.0, &mut system);
+        let mut cache = RowCache::new();
+        cache.update(&mut system, &style, &scene_with(22, "MMMMMMMMMM"));
+        let run = cache
+            .rows
+            .get(&22)
+            .expect("the row was shaped into the cache")
+            .buffer
+            .layout_runs()
+            .next()
+            .expect("one shaped run");
+        let advance = run.line_w / 10.0;
+        assert!(
+            (advance - style.cell.width).abs() <= 0.01,
+            "shaped advance {advance} against cell width {}",
+            style.cell.width
+        );
+    }
+
+    #[test]
+    fn toggling_hinting_does_not_move_the_measured_cell() {
+        let mut system = FontSystem::new();
+        let unhinted = measure_cell(&mut system, &mono_font(), 1.0);
+        let hinted = measure_cell(&mut system, &hinted_font(), 1.0);
+        assert_eq!(
+            unhinted, hinted,
+            "the advance comes from unhinted glyph metrics, so the toggle only changes \
+             rasterisation"
         );
     }
 

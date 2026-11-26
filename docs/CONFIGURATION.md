@@ -222,6 +222,7 @@ Typography. Every key here applies live.
 | `letter_spacing` | float | `0.0` | −5–20; outside is an error | Extra tracking between shaped clusters, in pixels. Unlike `size`, it is **not** multiplied by the display scale. |
 | `ligatures` | bool | `false` | `true`, `false` | Enables the font's `liga` and `calt` features. Off, both are explicitly disabled so a cell never depends on a glyph substitution. |
 | `integer_cell_width` | bool | `false` | `true`, `false` | Makes the cell advance a whole number of pixels by rasterising the font at the slightly larger size whose advance rounds to that width, so the grid and the shaper agree. On, block glyphs (`█ ▓ ▒ ░`) no longer antialias their edge against the pixel grid, which removes the dark seam between the steps of a gradient drawn with them. Off, the measured advance is used as is. Applies live. |
+| `hinting` | bool | `false` | `true`, `false` | Hints glyph outlines to the pixel grid when they are rasterised: stems and block edges snap to whole pixels instead of being sampled at their fractional position. Off, a glyph keeps its real weight and a dithered block keeps its own pattern; on, text on a low-density screen looks crisper but coarser, `▓▒░` (`U+2591`–`U+2593`) shades turn into a hatch with dark vertical stripes, and thin glyphs such as `·` (`U+00B7`) lose pixel rows. Off is the default, matching what other terminals ship. Applies live. |
 | `fallbacks` | array of strings | `["JetBrains Mono", "Symbols Nerd Font", "Noto Color Emoji", "DejaVu Sans Mono", "monospace"]` | any strings | **Accepted but not read.** Missing glyphs are resolved by cosmic-text through the system font database; this list is never passed to the shaper. |
 
 ### `[appearance]`
@@ -565,6 +566,7 @@ line_height = 1.2           # row height as a multiple of size (0.8-3.0)
 letter_spacing = 0.0        # extra tracking in pixels (-5 to 20)
 ligatures = false           # enable the font's liga/calt features
 integer_cell_width = false  # stretch the font so a cell is a whole pixel wide
+hinting = false             # snap glyph outlines to the pixel grid
 fallbacks = ["JetBrains Mono", "Noto Color Emoji", "monospace"]  # accepted; not read
 
 [appearance]
@@ -717,6 +719,24 @@ The visible cost is the size. With the shipped default config the advance rises
 from 7.8 px to 8 px, which is the same font at about 13.33 instead of 13, so text
 is very slightly larger and slightly fewer columns fit: a 2490 px pane goes from
 319 columns to 311. The row height is rounded, so it usually does not change.
+
+### Hinting
+
+`font.hinting` is `false`, and that default is deliberate. Glyph rasterisation
+follows the shaper's own default unless it is told otherwise, and hinting snaps
+every stem to the pixel grid of the size the buffer happens to have. At the
+fractional size a stretched, whole-pixel cell produces, the one-to-two pixel
+dither of `▓▒░` (`U+2591`–`U+2593`) lands on uneven pixel boundaries: a smooth
+shade run reads as a coarse hatch with dark vertical stripes, and a `·`
+(`U+00B7`) filler dot loses whole pixel rows and looks small and sparse. Unhinted
+rasterisation keeps each glyph's real outline, which is what makes the shade run
+and the dots look the way they do in foot.
+
+`hinting = true` restores the snapped look. It suits a low-density screen where
+text wants extra crispness, and it costs exactly the weight above: dithered
+blocks become hatches and thin glyphs become thinner. The cell advance is the
+same either way — the shaper measures unhinted metrics — so turning it on changes
+no columns, only the glyphs.
 
 ## See also
 
