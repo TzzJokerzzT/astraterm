@@ -31,11 +31,16 @@ failed PTY resize must be observable rather than silently discarded.
 S6. No regression for the common row: a row made only of 1-column cells in the primary font must
 still produce one text item with one span per style run, exactly as before.
 
-S7. A segment boundary must never fall inside a grapheme cluster. A variation selector (U+FE0E,
-U+FE0F), a zero-width joiner sequence, a skin-tone modifier (U+1F3FB-U+1F3FF), a keycap sequence, a
-tag sequence, a combining mark, or a pair of regional indicators belongs to the anchored segment of
-its base character, so the shaper still receives the cluster whole. Valid input such as `❤️`,
-`👍🏽`, `👨‍👩‍👧`, `1️⃣` and `🇪🇸` must not be split across items.
+S7. A segment boundary must never fall inside a grapheme cluster that the snapshot still preserves. A
+skin-tone modifier (U+1F3FB-U+1F3FF) or a pair of regional indicators (U+1F1E6-U+1F1FF) belongs to
+the anchored segment of its base character, so `👍🏽` and `🇪🇸` stay whole instead of anchoring base
+and continuation separately.
+
+The rest of the cluster data never reaches the renderer: `convert_cell`
+(`crates/terminal/src/engine.rs:576`) drops `Cell::zerowidth()` and `CellSnapshot` has no field for
+it, so `❤️` arrives as `❤`, `1️⃣` as `1`, `👨‍👩‍👧` as three independent wide cells and `e` + U+0301 as
+`e`. That is identical in the baseline, so those cases are a pre-existing terminal-crate defect, not
+a renderer regression; they are tracked as T6 and are explicitly out of scope for this feature.
 
 S8. The decision to anchor a cell must come from measurement, not from a hardcoded list of
 codepoints: a cluster is anchored when its shaped advance disagrees with the columns the model
@@ -47,8 +52,11 @@ at 1.280 cells per glyph while the grid reserves one.
 T1 — S2, S3, S4 — renderer: grid-anchored segments, segment ids in the text cache, per-segment clip — commit 1
 T2 — S5 — session/app: initial winsize from the real rectangle and observable PTY resize — commit 2
 T3 — S6 — differential check on plain rows, docs in `docs/TERMINAL_COMPATIBILITY.md` — commit 3
-T4 — S7 — one anchored segment per grapheme cluster; the whitelist may only decide the base — commit 4
-T5 — S8 — replace the whitelist with a measured split driven by the shaped advance — commit 5
+T4 — S7 — anchored segment per preserved grapheme cluster (skin-tone, regional-indicator pair) — commit 4
+T5 — S8 — replace the whitelist with a measured split driven by the shaped advance — commit 4
+T6 — S7 remainder — carry `Cell::zerowidth()` into `CellSnapshot` from `crates/terminal/src/engine.rs`
+     so U+FE0E/FE0F, ZWJ sequences, keycaps, tags and combining marks survive; blocked, not scheduled
+     here because it changes a snapshot contract outside this feature's scope
 
 ## Log
 
@@ -81,3 +89,15 @@ the S4 wording mismatch. User decisions, verbatim: «1. ¿Cómo cierro R3-001 y 
 Medir y partir (recomendado)» and «2. S4: ¿alineo la spec con el código o el código con la spec? —
 Ajustar el texto de la spec». S4 therefore now documents the one-cell slack, S7 records the cluster
 invariant, and S8 records that the anchoring decision must be measured rather than listed.
+
+L5. The T4 writer measured the data path before editing and stopped: `convert_cell`
+(`crates/terminal/src/engine.rs:576`) discards `Cell::zerowidth()`, so `❤️` reaches the renderer as
+`❤`, `1️⃣` as `1`, `👨‍👩‍👧` as three separate wide cells and `e`+U+0301 as `e`; only `👍🏽` (base cell plus
+modifier cell) and `🇪🇸` (two adjacent cells) survive as clusters. The baseline is equally broken for
+the discarded cases, so R3-001's reachable regression is limited to the two surviving cluster shapes.
+Measured advances with the shipped default font (cell 7.800 px): `क` 9.984 (1.280x), `❤️` 10.893
+(1.396x), `👍🏽`/`⏱`/`👨‍👩‍👧` 16.187 (2.075x), `1️⃣` 7.436 (0.953x), ASCII and powerline 1.000x. User
+decision, verbatim: «Solo renderer ahora (recomendado)». S7 is therefore narrowed to the preserved
+clusters, T6 records the terminal-crate prerequisite as out of scope, and the paint tests must
+derive their grid width from the measured style so measurement-driven anchoring does not anchor
+plain ASCII.
