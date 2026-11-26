@@ -50,6 +50,12 @@ use crate::ui::{
 /// line, so the status message keeps only its beginning.
 const STATUS_NOTIFICATION_CHARS: usize = 80;
 
+/// Grid a session starts at when the window has no usable size yet.
+///
+/// Only used before the compositor has reported a size; the retry in `sync_sizes`
+/// replaces it with the real grid on the first event that carries one.
+const FALLBACK_GRID: (u16, u16) = (80, 24);
+
 /// Minimum gap between two delivered notifications from the same session.
 ///
 /// A program can print thousands of `OSC 9` sequences in one 32 KiB PTY read.
@@ -299,6 +305,14 @@ impl Application {
             },
         )?;
         let metrics = renderer.cell_metrics();
+        // Sessions are created before the window's UI state exists, so the winsize they
+        // start with is derived from the window rectangle with the same geometry the
+        // first `sync_sizes` will use (S5). The renderer's size is what `WindowUi::new`
+        // stores, so the two cannot disagree; when the compositor has not reported a
+        // usable size yet, fall back to the historical 80x24 and let the retry in
+        // `sync_sizes` correct it once a real size arrives.
+        let grid = crate::ui::initial_grid(&config, metrics, renderer.scale(), renderer.size())
+            .unwrap_or(FALLBACK_GRID);
 
         // A profile named on the command line applies to the first window.
         let cli_profile = self
@@ -319,9 +333,9 @@ impl Application {
             );
         }
         let (workspace, panes) = if restore {
-            self.restored_workspace(&config, metrics)
+            self.restored_workspace(&config, metrics, grid)
         } else {
-            self.fresh_workspace(&config, metrics, cli_profile)
+            self.fresh_workspace(&config, metrics, cli_profile, grid)
         };
 
         let mut ui = WindowUi::new(
@@ -349,12 +363,17 @@ impl Application {
     }
 
     /// Creates a workspace with a single tab and one session.
+    ///
+    /// `grid` is the grid the window paints, so it is also the winsize the child
+    /// starts with.
     fn fresh_workspace(
         &mut self,
         config: &Config,
         metrics: astraterm_core::CellMetrics,
         profile: Option<ProfileId>,
+        grid: (u16, u16),
     ) -> (WindowState, BTreeMap<PaneId, Pane>) {
+        let (cols, rows) = grid;
         let pane = PaneId::next();
         let profile_name = profile
             .and_then(|id| config.profiles.get(id.raw().saturating_sub(1) as usize))
@@ -371,8 +390,8 @@ impl Application {
             profile_ref,
             profile,
             self.cli.working_directory.clone(),
-            80,
-            24,
+            cols,
+            rows,
             cell,
         );
         if !self.cli.command.is_empty() {
@@ -380,7 +399,7 @@ impl Application {
             spec.pty.program = self.cli.command[0].clone();
             spec.pty.args = self.cli.command[1..].to_vec();
         }
-        let session = self.sessions.create(pane, &spec, 80, 24);
+        let session = self.sessions.create(pane, &spec, cols, rows);
 
         let mut meta = Pane::new(pane);
         meta.profile = profile;
@@ -409,25 +428,27 @@ impl Application {
         &mut self,
         config: &Config,
         metrics: astraterm_core::CellMetrics,
+        grid: (u16, u16),
     ) -> (WindowState, BTreeMap<PaneId, Pane>) {
         if !config.workspace.restore_on_startup {
-            return self.fresh_workspace(config, metrics, None);
+            return self.fresh_workspace(config, metrics, None, grid);
         }
         let path = self.state_paths.workspace_file();
         let Ok(text) = std::fs::read_to_string(&path) else {
-            return self.fresh_workspace(config, metrics, None);
+            return self.fresh_workspace(config, metrics, None, grid);
         };
         let Ok(snapshot) = toml::from_str::<WorkspaceSnapshot>(&text) else {
             tracing::warn!(path = %path.display(), "workspace metadata is invalid; starting fresh");
-            return self.fresh_workspace(config, metrics, None);
+            return self.fresh_workspace(config, metrics, None, grid);
         };
         let Some(window_snapshot) = snapshot.windows.first() else {
-            return self.fresh_workspace(config, metrics, None);
+            return self.fresh_workspace(config, metrics, None, grid);
         };
         let Some(restored) = restore_window(window_snapshot, PaneId::next) else {
-            return self.fresh_workspace(config, metrics, None);
+            return self.fresh_workspace(config, metrics, None, grid);
         };
 
+        let (cols, rows) = grid;
         let mut panes = BTreeMap::new();
         for (pane, meta) in &restored.panes {
             let profile_id = meta
@@ -451,15 +472,15 @@ impl Application {
                 profile_ref,
                 profile_id,
                 meta.cwd.clone(),
-                80,
-                24,
+                cols,
+                rows,
                 cell,
             );
             if !self.cli.command.is_empty() {
                 spec.pty.program = self.cli.command[0].clone();
                 spec.pty.args = self.cli.command[1..].to_vec();
             }
-            if let Err(error) = self.sessions.create(*pane, &spec, 80, 24) {
+            if let Err(error) = self.sessions.create(*pane, &spec, cols, rows) {
                 tracing::warn!(error = %error, "could not recreate a session");
             }
             let mut pane_meta = Pane::new(*pane);
@@ -882,9 +903,11 @@ impl Application {
         };
         let mut resized = false;
         let mut resized_grids: Vec<(SessionId, (i32, i32))> = Vec::new();
+        // The engine matching the grid is not evidence that the child's winsize does,
+        // so a session whose PTY never took the last winsize is retried here (S5).
         for (pane, (cols, rows)) in sizes {
             if let Some(session) = self.sessions.for_pane_mut(pane)
-                && session.engine.size() != (cols, rows)
+                && (session.engine.size() != (cols, rows) || !session.pty_matches(cols, rows))
             {
                 session.resize(cols, rows, cell.0, cell.1);
                 resized_grids.push((session.id, session.engine.line_range()));
@@ -893,7 +916,7 @@ impl Application {
         }
         if let Some((session_id, (cols, rows))) = floating_size
             && let Some(session) = self.sessions.get_mut(session_id)
-            && session.engine.size() != (cols, rows)
+            && (session.engine.size() != (cols, rows) || !session.pty_matches(cols, rows))
         {
             session.resize(cols, rows, cell.0, cell.1);
             resized_grids.push((session.id, session.engine.line_range()));

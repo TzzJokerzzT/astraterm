@@ -190,6 +190,10 @@ impl PtyHandle {
     }
 
     /// Notifies the PTY of a new size. Never blocks.
+    ///
+    /// Returns whether the writer thread accepted the request for delivery. The
+    /// `ioctl` itself runs on that thread; when the kernel rejects it the writer logs
+    /// the target size instead of discarding the failure.
     pub fn resize(&self, cols: u16, rows: u16, cell_width: u16, cell_height: u16) -> bool {
         self.input
             .try_send(Input::Resize {
@@ -453,13 +457,24 @@ pub fn spawn_with_waker(spec: &PtySpec, waker: Option<Waker>) -> Result<PtyHandl
                         cell_width,
                         cell_height,
                     } => {
+                        let (cols, rows) = (cols.max(1), rows.max(1));
                         let size = PtySize {
-                            rows: rows.max(1),
-                            cols: cols.max(1),
+                            rows,
+                            cols,
                             pixel_width: cell_width.saturating_mul(cols),
                             pixel_height: cell_height.saturating_mul(rows),
                         };
-                        let _ = master.resize(size);
+                        // A winsize the kernel refused is the difference between the
+                        // grid that is painted and the one the child believes it has
+                        // (S5), so a failed ioctl is reported instead of discarded.
+                        if let Err(error) = master.resize(size) {
+                            tracing::warn!(
+                                cols,
+                                rows,
+                                error = %error,
+                                "the PTY rejected the winsize"
+                            );
+                        }
                     }
                     Input::Shutdown => break,
                 }
@@ -666,6 +681,29 @@ mod tests {
             ..PtySpec::default()
         };
         let mut handle = spawn(&spec).unwrap();
+        let output = wait_for_output(&handle, "30 100");
+        assert!(output.contains("30 100"), "got {output:?}");
+        wait_for_exit(&mut handle);
+    }
+
+    #[test]
+    fn a_queued_resize_is_visible_to_the_child() {
+        // The child reads one line and only then prints the winsize, so the resize is
+        // ordered before the read returns: the writer thread applies it before it
+        // writes the line, which is what makes this a test and not a race.
+        let spec = PtySpec {
+            program: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), "read line; stty size".to_owned()],
+            cols: 40,
+            rows: 10,
+            ..PtySpec::default()
+        };
+        let mut handle = spawn(&spec).unwrap();
+        assert!(handle.resize(100, 30, 8, 16), "the resize must be queued");
+        assert!(
+            handle.write_blocking(b"go\n"),
+            "the child must get the line"
+        );
         let output = wait_for_output(&handle, "30 100");
         assert!(output.contains("30 100"), "got {output:?}");
         wait_for_exit(&mut handle);

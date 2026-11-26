@@ -279,6 +279,88 @@ pub fn upper_layer_clip(float: Option<Rect>, modal: bool, size: Size) -> Option<
     }
 }
 
+/// Padding in device pixels.
+fn padding_of(config: &Config, scale: f32) -> astraterm_core::Padding {
+    astraterm_core::Padding {
+        x: (config.appearance.padding_x as f32 * scale) as u32,
+        y: (config.appearance.padding_y as f32 * scale) as u32,
+    }
+}
+
+/// Height of the tab strip in device pixels, zero when it is hidden.
+fn tab_strip_height_of(config: &Config, metrics: CellMetrics) -> u32 {
+    match config.appearance.tab_bar_position {
+        TabBarPosition::Hidden => 0,
+        _ => (metrics.height as f32 * TAB_STRIP_ROWS) as u32 + CHROME_PADDING,
+    }
+}
+
+/// Height of the status bar in device pixels, zero when it is hidden.
+fn status_bar_height_of(config: &Config, metrics: CellMetrics) -> u32 {
+    if config.appearance.show_status_bar {
+        metrics.height + CHROME_PADDING
+    } else {
+        0
+    }
+}
+
+/// Width of the vertical tab strip in device pixels, zero for the other positions.
+fn tab_strip_width_of(config: &Config, scale: f32, size: Size) -> u32 {
+    match config.appearance.tab_bar_position {
+        TabBarPosition::Right => {
+            let requested = (config.appearance.tab_strip_width as f32 * scale) as u32;
+            requested.min(size.width.saturating_sub(160))
+        }
+        _ => 0,
+    }
+}
+
+/// Rectangle available to the terminal panes of a window of `size`.
+fn terminal_rect_of(config: &Config, metrics: CellMetrics, scale: f32, size: Size) -> Rect {
+    chrome::terminal_rect(
+        config.appearance.tab_bar_position,
+        size,
+        tab_strip_height_of(config, metrics),
+        tab_strip_width_of(config, scale, size),
+        status_bar_height_of(config, metrics),
+    )
+}
+
+/// Grid size for a pane rectangle of a window at `scale`.
+fn grid_size_of(config: &Config, metrics: CellMetrics, scale: f32, rect: Rect) -> (u16, u16) {
+    let padding = padding_of(config, scale);
+    let inner = Rect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width.saturating_sub(2 * padding.x),
+        height: rect.height.saturating_sub(2 * padding.y),
+    };
+    metrics.grid_size(inner)
+}
+
+/// Grid a window of `size` paints, computed before its [`WindowUi`] exists.
+///
+/// Sessions are created before the window's UI state, and the winsize a session
+/// starts with has to be the grid the first frame paints (S5). This repeats the
+/// geometry `WindowUi::terminal_rect` and `WindowUi::grid_size` use, so the initial
+/// winsize and the first `sync_sizes` cannot disagree.
+///
+/// `None` when the compositor has not reported a usable size yet: callers then fall
+/// back to their historical default and the retry in `sync_sizes` corrects it once a
+/// real size arrives.
+pub fn initial_grid(
+    config: &Config,
+    metrics: CellMetrics,
+    scale: f32,
+    size: Size,
+) -> Option<(u16, u16)> {
+    if size.width == 0 || size.height == 0 {
+        return None;
+    }
+    let rect = terminal_rect_of(config, metrics, scale, size);
+    Some(grid_size_of(config, metrics, scale, rect))
+}
+
 /// One window and everything it draws.
 pub struct WindowUi {
     pub id: WindowId,
@@ -367,48 +449,26 @@ impl WindowUi {
 
     /// Padding in device pixels.
     pub fn padding(&self) -> astraterm_core::Padding {
-        astraterm_core::Padding {
-            x: (self.config.appearance.padding_x as f32 * self.scale) as u32,
-            y: (self.config.appearance.padding_y as f32 * self.scale) as u32,
-        }
+        padding_of(&self.config, self.scale)
     }
 
     /// Height of the tab strip, zero when hidden.
     pub fn tab_strip_height(&self) -> u32 {
-        match self.config.appearance.tab_bar_position {
-            TabBarPosition::Hidden => 0,
-            _ => (self.metrics.height as f32 * TAB_STRIP_ROWS) as u32 + CHROME_PADDING,
-        }
+        tab_strip_height_of(&self.config, self.metrics)
     }
 
     pub fn status_bar_height(&self) -> u32 {
-        if self.config.appearance.show_status_bar {
-            self.metrics.height + CHROME_PADDING
-        } else {
-            0
-        }
+        status_bar_height_of(&self.config, self.metrics)
     }
 
     /// Width of the vertical tab strip, zero for the other positions.
     pub fn tab_strip_width(&self) -> u32 {
-        match self.config.appearance.tab_bar_position {
-            TabBarPosition::Right => {
-                let requested = (self.config.appearance.tab_strip_width as f32 * self.scale) as u32;
-                requested.min(self.size.width.saturating_sub(160))
-            }
-            _ => 0,
-        }
+        tab_strip_width_of(&self.config, self.scale, self.size)
     }
 
     /// Rectangle available to the terminal panes.
     pub fn terminal_rect(&self) -> Rect {
-        chrome::terminal_rect(
-            self.config.appearance.tab_bar_position,
-            self.size,
-            self.tab_strip_height(),
-            self.tab_strip_width(),
-            self.status_bar_height(),
-        )
+        terminal_rect_of(&self.config, self.metrics, self.scale, self.size)
     }
 
     /// Rectangle of the tab strip.
@@ -454,14 +514,7 @@ impl WindowUi {
 
     /// Grid size for a pane rectangle.
     pub fn grid_size(&self, rect: Rect) -> (u16, u16) {
-        let padding = self.padding();
-        let inner = Rect {
-            x: rect.x,
-            y: rect.y,
-            width: rect.width.saturating_sub(2 * padding.x),
-            height: rect.height.saturating_sub(2 * padding.y),
-        };
-        self.metrics.grid_size(inner)
+        grid_size_of(&self.config, self.metrics, self.scale, rect)
     }
 
     /// Pane under a pointer position.
@@ -1780,6 +1833,42 @@ mod tests {
     fn url_detection_ignores_non_web_words() {
         let text = "ssh user@host and mailto:x@y";
         assert_eq!(url_at(text, 2), None);
+    }
+
+    #[test]
+    fn the_window_geometry_is_computed_before_the_ui_exists() {
+        let config = Config::default();
+        // Cell 10x20 at scale 1: the top strip is 20 + 6 = 26 tall, the default
+        // padding is 12x10 and the status bar is off, so a 800x600 window has
+        // 776x554 pixels of cells: 77 columns and 27 rows.
+        let metrics = CellMetrics {
+            width: 10.0,
+            height: 20,
+            baseline: 14.0,
+        };
+        let grid = initial_grid(&config, metrics, 1.0, Size::new(800, 600));
+        assert_eq!(grid, Some((77, 27)));
+        assert_ne!(
+            grid,
+            Some((80, 24)),
+            "the historical default is not the grid the window paints"
+        );
+    }
+
+    #[test]
+    fn a_window_without_a_reported_size_has_no_initial_grid() {
+        let config = Config::default();
+        let metrics = CellMetrics {
+            width: 10.0,
+            height: 20,
+            baseline: 14.0,
+        };
+        assert_eq!(initial_grid(&config, metrics, 1.0, Size::new(0, 0)), None);
+        assert_eq!(
+            initial_grid(&config, metrics, 1.0, Size::new(800, 0)),
+            None,
+            "a zero height is no more usable than a zero window"
+        );
     }
 
     #[test]
