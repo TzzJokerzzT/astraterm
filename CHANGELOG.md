@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-26
+
+### Added
+
+- Kitty graphics sent in chunks (`m=1`) are reassembled and drawn. Clients that
+  split an image across several escape sequences (`kitten icat`, `yazi`, `chafa`
+  in kitty mode) now work instead of being refused.
+- In-flight transfers are bounded: a per-transfer and aggregate byte budget, at
+  most four live transfers, and the oldest one dropped when the budget runs out.
+  A final chunk without a transfer, or a chunk without an image id, is an error
+  rather than a silently truncated image.
+
 ## [1.0.0] - 2026-11-23
 
 First public version: a native terminal emulator for Linux whose window, tabs
