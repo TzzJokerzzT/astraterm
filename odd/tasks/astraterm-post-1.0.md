@@ -37,6 +37,17 @@ S3.4 Si el usuario declina el `git fetch --tags`, el mensaje lo dice: no se inte
 S3.5 Las rutas de `--version` quedan cubiertas por comprobaciones repetibles (matriz con
     tag temporal o arnés de shell), no solo por prueba manual.
 
+S5. **Las imágenes no desaparecen por redimensionar**, de B2.
+S5.1 Un `resize` deja de descartar imágenes cuyo ancla sigue existiendo en el búfer,
+    aunque quede fuera de la pantalla visible: se conservan y se ven al volver a ellas.
+S5.2 Solo se descarta un ancla cuando su línea ya no existe en el búfer (historial
+    recortado o pantalla alternativa), y eso se cuenta, no se hace en silencio.
+S5.3 La documentación dice la verdad sobre el límite: recolocar el ancla con exactitud
+    exigiría un mapa viejo→nuevo de líneas que `alacritty_terminal` no expone. Lo medido
+    es que el reflow mueve los números (20→40 cols movió un marcador de la línea 4 a la 3
+    y no lo devolvió al volver a 20), así que el ancla puede quedar una o más líneas
+    desplazada; lo que no puede pasar es que la imagen desaparezca por un resize.
+
 S4. **Versionado por slice.**
 S4.1 B1 es feature: `1.1.0` (MINOR).
 S4.2 B12 y B19 son correcciones sin cambio de contrato: `1.1.1` y `1.1.2` (PATCH).
@@ -51,6 +62,7 @@ S4.3 Cada bump actualiza `Cargo.toml`, `PKGBUILD`, el test de `cli.rs` y `CHANGE
 | T2 | S2 | Corrección del estado del scanner al cerrar un OSC ajeno | worker | `dd3b534` (1.1.1) |
 | T3 | S3 | Mensajes, orden de comprobaciones y doc de `--version` | worker | `0bdefec` (1.1.2) |
 | T4 | S4 | Bumps 1.1.0, 1.1.1 y 1.1.2 con CHANGELOG | inline | `78a690d`, `a8fb211`, `5808930` |
+| T5 | S5 | Un resize conserva las anclas que siguen en el búfer, cuenta las que pierden su línea y documenta el límite | worker | pendiente |
 
 ## Log
 
@@ -79,3 +91,23 @@ L3 (cierre, evidencia):
   `cargo build --release --locked` sin tocar el lockfile.
 - Los tres releases están **sin taggear**: `v1.1.0`, `v1.1.1` y `v1.1.2` los decide y
   publica el usuario.
+
+L4 (cierre de T5, evidencia):
+- Rojo medido antes de tocar código: en `SessionImages`, un ancla en la línea 30 de un
+  búfer que llega a la 60 se descartaba al redimensionar a 24 filas (`left: [1]` frente
+  a `right: [1, 2]`), porque la regla miraba la pantalla y no el búfer.
+- `drop_outside(rows, cols)` pasa a `drop_evicted(range: (i32, i32))` y conserva el
+  ancla mientras `line_range()` la siga conteniendo; la comprobación de columna
+  desaparece (una imagen desplazada a la derecha ya la recorta `image_rect`).
+- `SessionImages::dropped_anchors()` cuenta las anclas descartadas porque su línea ya
+  no existe (resize, historial recortado, pantalla alternativa). No entra en
+  `ui.status`; `sync_sizes` lo anota en `tracing::debug!`.
+- Verificación: **505 tests**, clippy sin advertencias y `cargo fmt --check` limpio.
+- Comprobado en ventana con la build de este árbol: imagen anclada en la columna 100,
+  ventana estrechada a ~60 columnas (la imagen sale de la pantalla) y ensanchada de
+  nuevo: la imagen vuelve, es decir el ancla sobrevivió al resize. Con la regla anterior
+  esa ancla se descartaba por columna y no volvía.
+- Límite conocido y documentado en `docs/TERMINAL_COMPATIBILITY.md`: el reflow mueve los
+  números de línea, así que el ancla puede quedar una o más líneas desplazada; y como el
+  fondo del búfer es la última fila de la pantalla, encoger mucho la altura todavía
+  puede dejar un ancla por debajo del rango y se descarta (contada).

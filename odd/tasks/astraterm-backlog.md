@@ -43,6 +43,7 @@ Ya implementado y cerrado:
 | Kitty graphics por chunks (`m=1`)                     | `e649cc5` (1.1.0)               |
 | Escáner resincroniza tras un OSC malformado           | `dd3b534` (1.1.1)               |
 | Mensajes y orden de `--version` + arnés               | `fix(scripts)` (1.1.2)          |
+| Las imágenes sobreviven a un resize                   | `fix(app)` (1.1.4)              |
 
 De la lista de mejoras B1–B18 de este documento, **solo las notificaciones OSC 9/777
 y el kitty por chunks están hechas**. Todo lo demás sigue pendiente.
@@ -116,17 +117,6 @@ verifica y no mueve el checkout. El camino limpio es un worktree temporal:
 ---
 
 ## Bloque A — Deuda con más valor por línea
-
-### B2. Reanclaje de imágenes en resize
-
-- **Por qué**: redimensionar la ventana descarta imágenes que deberían moverse con su
-  línea. Es deuda explícita del slice de imágenes.
-- **Dónde**: `crates/app/src/ui.rs` (`SessionImages`, `drop_outside`) y
-  `crates/terminal/src/image.rs` (`ImageStore::retain_anchored`, que hoy solo puede
-  descartar). El core renumera líneas al reflow y hoy nadie lo traduce.
-- **Coste**: M.
-- **Verificación**: test puro de que un ancla sobrevive a un resize que mueve su línea, y
-  prueba visual con `yazi` redimensionando.
 
 ### B3. `set_ime_cursor_area`
 
