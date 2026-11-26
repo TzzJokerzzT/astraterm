@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-26
+
+### Added
+
+- The floating terminal inherits the directory of the pane it is opened from, and a
+  new tab inherits the active tab's live directory: both follow the pane's real
+  directory, refreshed from `/proc`, so a `cd` in the parent is inherited. An
+  explicit `working_directory` path still wins, and the policy applies after the
+  parent's directory.
+- Splits created while the floating terminal has the keyboard land inside the
+  floating terminal, which now holds its own layout with per-pane scene ids, sizes,
+  hit testing, dividers and focus. Clicking a floating pane focuses it, the focus
+  keys traverse the float and stop at its edges, and hiding then showing it restores
+  the pane that was active. The mosaic, its reflow and its persistence never see it.
+- `[font] integer_cell_width` stretches the font so the cell advance is a whole
+  pixel, which shrinks the dark seam between the steps of a gradient drawn with
+  block glyphs from 12 units to 3-4. Costs a few columns.
+- `[font] hinting`, off by default, rasterises glyphs unhinted. Hinted one-pixel
+  dither landed on uneven boundaries and hinted thin ink lost covered pixels, which
+  is what made `▓▒░` look like a coarse hatch and the `·` filler look sparse.
+- `[font] solid_shades`, off by default, paints `░▒▓` as one flat blend of the
+  foreground over the background at 25/50/75 %, emulating foot's
+  `box-drawing-solid-shades` and suppressing the font's own dither.
+
+### Fixed
+
+- Glyph colours are no longer converted to linear light on a plain UNORM surface,
+  which had been drawing every glyph darker than the theme asked: a 256-colour 238
+  filler dot measured 22 instead of 68, and block-glyph gradients collapsed from
+  118 to 46. Text and backgrounds now share one colour space and match foot.
+- Wide and fallback glyphs are anchored to the grid, so a prompt or a status line
+  drawn with powerline and nerd glyphs no longer drifts after an emoji or a CJK
+  glyph. Anchoring is decided by the measured advance, not by a list of codepoints,
+  so a fallback script such as devanagari is covered too.
+- `CellSnapshot` carries the zero-width continuations of a cell, so `❤️`, `1️⃣` and
+  `👨‍👩‍👧` reach the shaper whole instead of losing their selectors and joiners, and
+  clusters the snapshot preserves are no longer split between items.
+- A session starts with the winsize derived from the real window rectangle and a
+  refused winsize is retried, instead of beginning at a hardcoded 80x24.
+- A wide cell with no following spacer no longer swallows the cell after it, and a
+  hidden region indicator no longer absorbs the visible one or lends it its style.
+- `docs/CONFIGURATION.md` documents every key with its type, default, accepted
+  values and effect, and four schema comments that contradicted the implementation
+  were corrected.
+
 ## [1.1.5] - 2026-11-26
 
 ### Fixed
