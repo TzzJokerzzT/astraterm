@@ -685,7 +685,8 @@ impl ImageStore {
     }
 
     /// Keeps only the placements the predicate accepts, recomputing the byte
-    /// total. Resizing uses this to drop anchors the reflow no longer has.
+    /// total. Resizing uses this to drop the anchors whose buffer line the reflow
+    /// removed.
     pub fn retain_anchored<F>(&mut self, mut keep: F)
     where
         F: FnMut(&ImagePlacement) -> bool,

@@ -881,13 +881,13 @@ impl Application {
             return;
         };
         let mut resized = false;
-        let mut resized_grids: Vec<(SessionId, u16, u16)> = Vec::new();
+        let mut resized_grids: Vec<(SessionId, (i32, i32))> = Vec::new();
         for (pane, (cols, rows)) in sizes {
             if let Some(session) = self.sessions.for_pane_mut(pane)
                 && session.engine.size() != (cols, rows)
             {
                 session.resize(cols, rows, cell.0, cell.1);
-                resized_grids.push((session.id, cols, rows));
+                resized_grids.push((session.id, session.engine.line_range()));
                 resized = true;
             }
         }
@@ -896,15 +896,26 @@ impl Application {
             && session.engine.size() != (cols, rows)
         {
             session.resize(cols, rows, cell.0, cell.1);
-            resized_grids.push((session.id, cols, rows));
+            resized_grids.push((session.id, session.engine.line_range()));
             resized = true;
         }
-        // A resize reflows the buffer, and an image anchor is a bare line number:
-        // nothing can be re-anchored, so the anchors the new grid cannot show are
-        // discarded instead of being drawn on the wrong line.
-        for (session, cols, rows) in resized_grids {
+        // A resize reflows the buffer and an image anchor is a bare line number, so
+        // the anchors the new grid kept are kept with it, off screen or not: the
+        // drawing path already culls what the view does not show, and scrolling back
+        // brings the image along (S5.1). Only the anchors whose line the reflow
+        // removed go, and that is counted on the session (S5.2).
+        for (session, range) in resized_grids {
             if let Some(images) = self.images.get_mut(&session) {
-                images.drop_outside(rows, cols);
+                let dropped = images.drop_evicted(range);
+                if dropped > 0 {
+                    tracing::debug!(
+                        session = ?session,
+                        dropped,
+                        total = images.dropped_anchors(),
+                        lines = ?range,
+                        "resize removed image anchors whose buffer line is gone"
+                    );
+                }
             }
         }
         if resized && let Some(ui) = self.windows.get(&window_id) {

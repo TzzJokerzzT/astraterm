@@ -35,7 +35,7 @@ names the test that covers it.
 | Damage tracking | changed rows reported per snapshot | `damage_reports_rows_that_changed` |
 | Buffer text | visible screen text and per-line text | `snapshot_text_round_trips_visible_lines`, `line_text_exposes_buffer_lines_for_search` |
 | OSC 52 | disabled by default | `osc52_is_disabled_by_default` |
-| Images (opt-in) | kitty graphics, iTerm2 `OSC 1337;File=` and sixel captured before the VT parser; decode, anchoring and drawing behind `terminal.images` | `the_engine_keeps_the_text_and_hands_the_images_over`, `arbitrary_chunking_does_not_change_the_result` (`crates/terminal/tests/image_scanner.rs`); `png_over_max_dimension_is_rejected_before_expanding`, `kitty_chunked_transfer_is_unsupported`, `iterm2_inline_zero_is_unsupported` (`crates/terminal/src/image_decode.rs`); `a_captured_kitty_image_is_anchored_and_drawn`, `images_are_discarded_without_decoding_when_the_option_is_off`, `a_partially_visible_image_is_clipped_instead_of_overflowing` (`crates/app/src/ui.rs`) |
+| Images (opt-in) | kitty graphics, iTerm2 `OSC 1337;File=` and sixel captured before the VT parser; decode, anchoring and drawing behind `terminal.images` | `the_engine_keeps_the_text_and_hands_the_images_over`, `arbitrary_chunking_does_not_change_the_result` (`crates/terminal/tests/image_scanner.rs`); `png_over_max_dimension_is_rejected_before_expanding`, `kitty_chunked_transfer_is_unsupported`, `iterm2_inline_zero_is_unsupported` (`crates/terminal/src/image_decode.rs`); `a_captured_kitty_image_is_anchored_and_drawn`, `images_are_discarded_without_decoding_when_the_option_is_off`, `a_partially_visible_image_is_clipped_instead_of_overflowing`, `an_anchor_the_resize_pushed_off_screen_keeps_its_image`, `a_resize_drops_and_counts_the_anchors_beyond_the_buffer` (`crates/app/src/ui.rs`) |
 | Malformed sequences | never corrupt the grid | `malformed_escape_sequences_do_not_corrupt_the_grid` |
 
 `OSC 9` and `OSC 777;notify;` are handled the same way as the image protocols:
@@ -370,14 +370,24 @@ or the application.
 
   - An image is anchored to the buffer line the cursor was on when it arrived.
     When the screen scrolls, the anchors move with the lines, so an image follows
-    its line into the scrollback and disappears when that line is dropped. Two
-    cases are not followed: a **resize** never re-anchors (the model can only
-    discard, so an image the reflow moved can end up on a different line), and
-    once the **scrollback is full** the core stops moving the oldest line number,
+    its line into the scrollback and disappears only when that line is dropped.
+  - A **resize** never re-anchors, and the reason is in the core: reflow moves the
+    numbers a line has (measured with a marker on line 4 of a pane that went from 20
+    to 40 columns: it became line 3 and stayed there when the pane went back to 20),
+    and `alacritty_terminal` exposes no old-to-new line map. An anchor can therefore
+    end up one or more lines away from the text it belongs to after a resize. That is
+    a limitation, not a silent drop: a resize **keeps every anchor whose line still
+    exists in the buffer**, on screen or not. An image in the scrollback is culled
+    while it is out of view and drawn again when the view is scrolled back to it. Only
+    anchors whose line the reflow removed (truncated history, the alternate screen
+    replacing the grid) are dropped, and those drops are counted in
+    `SessionImages::dropped_anchors` rather than happening unnoticed.
+  - Once the **scrollback is full** the core stops moving the oldest line number,
     so a very old image can stay pinned to a row instead of scrolling away.
   - Anchors are dropped when the **alternate screen** is entered or left, because
     the two grids have independent line numbers. A program that draws images on
-    the alternate screen keeps them only while it stays there.
+    the alternate screen keeps them only while it stays there. Those anchors are
+    counted like any other anchor whose line does not exist on the shown grid.
   - kitty image *placement* (`c=`, `r=`, `x=`, `y=`, `z=`, `p=`) is ignored: the
     image is drawn at the cursor cell with the size its pixels imply.
   - No delete/query actions (`a=d`, `a=q`), no animation, no multiple image

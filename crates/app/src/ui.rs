@@ -1462,6 +1462,12 @@ pub struct SessionImages {
     top_line: i32,
     /// Alternate-screen flag observed at the last intake.
     alternate_screen: bool,
+    /// Anchors dropped because the buffer line they named no longer exists, by any
+    /// of the rules that can lose a line: a resize the reflow did not carry them
+    /// through, truncated history, or the alternate screen replacing the grid.
+    /// Clearing because the option is off is not counted: that is a policy, not a
+    /// line that went away. This is a diagnostic counter, never shown in the UI.
+    dropped: usize,
 }
 
 impl SessionImages {
@@ -1482,7 +1488,13 @@ impl SessionImages {
             next_id: session.raw() << 32,
             top_line,
             alternate_screen: false,
+            dropped: 0,
         }
+    }
+
+    /// Anchors dropped so far because the buffer line they named stopped existing.
+    pub fn dropped_anchors(&self) -> usize {
+        self.dropped
     }
 
     /// Anchors a decoded image and keeps its pixels for drawing.
@@ -1585,6 +1597,9 @@ impl SessionImages {
         if survived {
             return false;
         }
+        // The grid the anchors were numbered against is gone, so every anchor now
+        // names a line that does not exist on the screen being shown.
+        self.dropped += self.store.len();
         self.clear();
         true
     }
@@ -1615,13 +1630,18 @@ impl SessionImages {
         self.retain(|placement| placement.anchor_line >= line);
     }
 
-    /// Drops the anchors a grid of `rows` x `cols` cells can never show.
+    /// Drops the anchors whose buffer line a resize removed, and returns how many.
     ///
-    /// Called after a resize. Nothing is re-anchored — the anchoring model can only
-    /// drop — so an image the reflow moved to another line keeps pointing at its old
-    /// line number.
-    pub fn drop_outside(&mut self, rows: u16, cols: u16) {
-        self.retain(|placement| placement.anchor_line < rows as i32 && placement.column < cols);
+    /// Called after a resize with the buffer range the reflow left behind
+    /// ([`TerminalEngine::line_range`]). Nothing is re-anchored: recovering where a
+    /// line moved would need an old-to-new map that `alacritty_terminal` does not
+    /// expose, so an image the reflow shifted keeps pointing at its old line number
+    /// (S5.3). What the resize must not do is throw away an anchor that still has a
+    /// line: an anchor in the scrollback keeps its image, and drawing it is already
+    /// culled by `image_rect` until the view scrolls back to it (S5.1).
+    pub fn drop_evicted(&mut self, range: (i32, i32)) -> usize {
+        let (top, bottom) = range;
+        self.retain(|placement| (top..=bottom).contains(&placement.anchor_line))
     }
 
     /// Moves every anchor by `delta` lines, keeping placements and pixels paired.
@@ -1639,18 +1659,24 @@ impl SessionImages {
         self.rebuild(placements, images);
     }
 
-    /// Keeps only the placements the predicate accepts, with their pixels.
-    fn retain(&mut self, mut keep: impl FnMut(&ImagePlacement) -> bool) {
+    /// Keeps only the placements the predicate accepts, with their pixels, and
+    /// counts the ones it dropped.
+    fn retain(&mut self, mut keep: impl FnMut(&ImagePlacement) -> bool) -> usize {
         let mut placements = Vec::with_capacity(self.store.len());
         let mut images = Vec::with_capacity(self.images.len());
         let taken = std::mem::take(&mut self.images);
+        let mut dropped = 0;
         for (placement, image) in self.store.placements().iter().zip(taken) {
             if keep(placement) {
                 placements.push(*placement);
                 images.push(image);
+            } else {
+                dropped += 1;
             }
         }
+        self.dropped += dropped;
         self.rebuild(placements, images);
+        dropped
     }
 
     /// Rebuilds the store from paired placements and pixels.
@@ -2128,19 +2154,58 @@ mod tests {
     }
 
     #[test]
-    fn resize_discards_the_anchors_the_new_grid_cannot_show() {
-        let mut images = SessionImages::new(SessionId::from_raw(10), 0);
-        assert!(images.insert(anchored(30, 0, 1, 1), pixels(2, 2, 1)));
-        assert!(images.insert(anchored(2, 0, 1, 1), pixels(2, 2, 2)));
-        assert!(images.insert(anchored(0, 100, 1, 1), pixels(2, 2, 3)));
+    fn an_anchor_the_resize_pushed_off_screen_keeps_its_image() {
+        let mut images = SessionImages::new(SessionId::from_raw(20), 0);
+        // A 24-row screen over a buffer whose oldest line is -30: line 30 has no
+        // cell on screen but is a real buffer line, and -6 is in the scrollback.
+        assert!(images.insert(anchored(-6, 0, 1, 1), pixels(2, 2, 1)));
+        assert!(images.insert(anchored(30, 0, 1, 1), pixels(2, 2, 2)));
 
-        images.drop_outside(24, 80);
+        let dropped = images.drop_evicted((-30, 60));
 
         let kept: Vec<u8> = images
             .items()
             .map(|(_, _, pixels)| pixels.rgba[0])
             .collect();
-        assert_eq!(kept, vec![2]);
+        assert_eq!(
+            kept,
+            vec![1, 2],
+            "an anchor keeps its image while its line exists in the buffer"
+        );
+        assert_eq!(dropped, 0);
+        assert_eq!(images.dropped_anchors(), 0);
+    }
+
+    #[test]
+    fn a_resize_drops_and_counts_the_anchors_beyond_the_buffer() {
+        let mut images = SessionImages::new(SessionId::from_raw(21), 0);
+        assert!(images.insert(anchored(-2, 0, 1, 1), pixels(2, 2, 1)));
+        assert!(images.insert(anchored(50, 0, 1, 1), pixels(2, 2, 2)));
+
+        let dropped = images.drop_evicted((-20, 40));
+
+        let kept: Vec<u8> = images
+            .items()
+            .map(|(_, _, pixels)| pixels.rgba[0])
+            .collect();
+        assert_eq!(kept, vec![1], "line 50 is past the last buffer line");
+        assert_eq!(dropped, 1);
+        assert_eq!(
+            images.dropped_anchors(),
+            1,
+            "the drop is counted instead of happening silently"
+        );
+    }
+
+    #[test]
+    fn a_resize_without_images_drops_and_counts_nothing() {
+        let mut images = SessionImages::new(SessionId::from_raw(22), 0);
+
+        assert_eq!(images.drop_evicted((-20, 40)), 0);
+
+        assert!(images.is_empty());
+        assert_eq!(images.items().count(), 0);
+        assert_eq!(images.dropped_anchors(), 0);
     }
 
     #[test]
