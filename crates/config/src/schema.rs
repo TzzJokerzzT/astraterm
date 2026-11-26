@@ -23,8 +23,8 @@ pub struct Config {
     pub notifications: NotificationsConfig,
     /// Action name to key chord, for example `new-tab = "ctrl+shift+t"`.
     pub keys: BTreeMap<String, String>,
-    /// Named profiles. The first profile is the implicit default unless a
-    /// profile is requested explicitly.
+    /// Named profiles. Nothing selects one implicitly: a session uses the global
+    /// settings unless a profile is requested by name (`--profile`).
     pub profiles: Vec<Profile>,
 }
 
@@ -285,8 +285,9 @@ pub struct AppearanceConfig {
     pub status_bar_ram: bool,
     /// Show the clock in the status bar.
     pub status_bar_clock: bool,
-    /// Clock format: `%H %M %S %d %m %Y %b %a` are supported, everything else is
-    /// literal text.
+    /// Clock format, handed whole to the platform `strftime`, so every conversion
+    /// it knows (`%H %M %S %d %m %Y %b %a` and the rest) works and anything unknown
+    /// is literal text. Empty or unusable values fall back to `%H:%M`.
     pub clock_format: String,
     pub show_window_controls: bool,
     pub accent_color: String,
@@ -296,9 +297,10 @@ pub struct AppearanceConfig {
     pub tab_strip_width: u32,
     /// Use smaller tab labels without the profile hint.
     pub compact_tabs: bool,
-    /// Thickness of the divider between panes, in logical pixels.
+    /// Thickness of the divider between panes, in device pixels (not scaled by the
+    /// window's scale factor).
     pub divider_thickness: u32,
-    /// Gap between panes, in logical pixels.
+    /// Gap between panes, in device pixels (not scaled by the window's scale factor).
     pub pane_gap: u32,
 }
 
@@ -353,7 +355,9 @@ pub struct PerformanceConfig {
     pub gpu_acceleration: bool,
     /// Reduce work: no cursor blink, no effects, batched redraws.
     pub low_power_mode: bool,
-    /// Upper bound for idle redraws per second (0 means unlimited on demand).
+    /// Intended upper bound for idle redraws per second. Accepted and validated but
+    /// not read yet: idle redraws are still governed by the blink timer alone, so any
+    /// value here has no effect today.
     pub max_fps_when_idle: u32,
 }
 
