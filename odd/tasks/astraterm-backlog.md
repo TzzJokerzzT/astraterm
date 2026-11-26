@@ -40,9 +40,10 @@ Ya implementado y cerrado:
 | `--version <tag>` en el script de instalación        | `272b3d6`                       |
 | Política de tags y releases                          | `215bbf2`                       |
 | Guardas de `--version`: árbol sucio y repo contenedor | `2c18d32`, `3806289`            |
+| Kitty graphics por chunks (`m=1`)                     | `e649cc5` (1.1.0)               |
 
 De la lista de mejoras B1–B18 de este documento, **solo las notificaciones OSC 9/777
-están hechas**. Todo lo demás sigue pendiente.
+y el kitty por chunks están hechas**. Todo lo demás sigue pendiente.
 
 ---
 
@@ -89,7 +90,9 @@ Decidido; no se vuelve a discutir en cada release:
 En este orden, siempre:
 
 1. `Cargo.toml`: `version`.
-2. `Cargo.lock`: se actualiza solo con `cargo build --release --locked`.
+2. `Cargo.lock`: se regenera con `cargo build --release` **sin** `--locked` (con `--locked`
+   falla a propósito, porque el bump invalida el lock). Después `cargo build --release
+   --locked` debe completar sin tocar nada.
 3. `packaging/linux/PKGBUILD`: `pkgver`.
 4. `CHANGELOG.md`: entrada con secciones (`Added`, `Changed`, `Fixed`) y fecha real
    tomada de `date -I`, nunca inventada.
@@ -111,19 +114,6 @@ verifica y no mueve el checkout. El camino limpio es un worktree temporal:
 ---
 
 ## Bloque A — Deuda con más valor por línea
-
-### B1. Kitty graphics por chunks (`m=1`)
-
-- **Por qué**: casi todos los clientes reales (`kitten icat`, `yazi`, `chafa` en modo
-  kitty) trocean la imagen. Hoy el soporte kitty solo cubre el caso de un chunk, así que
-  la feature recién cerrada sirve de poco en la práctica.
-- **Dónde**: `crates/terminal/src/image_decode.rs`, `decode_kitty` devuelve
-  `DecodeError::Unsupported` para `m=1`. Falta estado de transferencia por id de imagen y
-  límite agregado entre chunks.
-- **Coste**: M. Requiere estado persistente en el decoder (no en el scanner, que ya
-  reensambla la secuencia completa).
-- **Verificación**: fixtures propios con una imagen partida en 2–3 chunks; caso de chunks
-  intercalados de dos ids distintos; exceso del límite agregado.
 
 ### B2. Reanclaje de imágenes en resize
 
