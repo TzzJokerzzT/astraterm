@@ -20,8 +20,9 @@ paints 2.076 cells; `U+1F4C1` (📁) reserves 2 and paints 2.076; `U+4F60` (你)
 S3. The filler space that `row_text_item` pushes after a wide cell must be removed: the anchored
 segment of the wide glyph already occupies its two columns.
 
-S4. An anchored segment must be clipped to the cell rectangle of its own columns, so an over-wide
-glyph cannot bleed into the neighbouring cell.
+S4. An anchored segment must be clipped to the cell rectangle of the columns it owns plus one
+cell of slack, so an over-wide fallback glyph is not cut in half while the bleed stays bounded to
+the single neighbouring cell.
 
 S5. A session must never paint grid `cols x rows` while its PTY winsize says something else.
 Sessions are created at the grid derived from the current window rectangle, not `80, 24`, and a
@@ -30,11 +31,24 @@ failed PTY resize must be observable rather than silently discarded.
 S6. No regression for the common row: a row made only of 1-column cells in the primary font must
 still produce one text item with one span per style run, exactly as before.
 
+S7. A segment boundary must never fall inside a grapheme cluster. A variation selector (U+FE0E,
+U+FE0F), a zero-width joiner sequence, a skin-tone modifier (U+1F3FB-U+1F3FF), a keycap sequence, a
+tag sequence, a combining mark, or a pair of regional indicators belongs to the anchored segment of
+its base character, so the shaper still receives the cluster whole. Valid input such as `❤️`,
+`👍🏽`, `👨‍👩‍👧`, `1️⃣` and `🇪🇸` must not be split across items.
+
+S8. The decision to anchor a cell must come from measurement, not from a hardcoded list of
+codepoints: a cluster is anchored when its shaped advance disagrees with the columns the model
+reserved for it. The emoji/symbol whitelist does not cover a fallback script, so `क` still drifts
+at 1.280 cells per glyph while the grid reserves one.
+
 ## Tasks
 
 T1 — S2, S3, S4 — renderer: grid-anchored segments, segment ids in the text cache, per-segment clip — commit 1
 T2 — S5 — session/app: initial winsize from the real rectangle and observable PTY resize — commit 2
 T3 — S6 — differential check on plain rows, docs in `docs/TERMINAL_COMPATIBILITY.md` — commit 3
+T4 — S7 — one anchored segment per grapheme cluster; the whitelist may only decide the base — commit 4
+T5 — S8 — replace the whitelist with a measured split driven by the shaped advance — commit 5
 
 ## Log
 
@@ -59,3 +73,11 @@ Not defects, but they change how the prompt looks: `[window] opacity = 0.7` agai
 L3. Scope decision by the user: «Arreglo dirigido (recomendado)» — anchor the painted advance to the
 model's column width for emoji/wide glyphs and synchronize the initial PTY size. The per-cell
 placement redesign and the emoji-only and PTY-only alternatives were offered and not chosen.
+
+L4. Provider refuter finding R3-001 (critical, introduced): deciding per cell splits multi-codepoint
+grapheme clusters, so `❤️`, `👍🏽` and ZWJ sequences reach the shaper broken. Independent
+verifier confirmed S2-S6 otherwise and measured the residual S8 gap (devanagari `क` at 1.280x) and
+the S4 wording mismatch. User decisions, verbatim: «1. ¿Cómo cierro R3-001 y el hueco de S2? —
+Medir y partir (recomendado)» and «2. S4: ¿alineo la spec con el código o el código con la spec? —
+Ajustar el texto de la spec». S4 therefore now documents the one-cell slack, S7 records the cluster
+invariant, and S8 records that the anchoring decision must be measured rather than listed.
