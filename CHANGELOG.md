@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.4] - 2026-11-26
+
+### Fixed
+
+- Images no longer disappear when the window is resized. Only anchors whose line
+  has left the buffer are dropped, and those are counted; an image that merely
+  scrolled out of view survives and comes back. The anchor can still end up a line
+  or more off after a reflow, because `alacritty_terminal` renumbers lines and
+  exposes no old-to-new map: the guarantee is that the image does not vanish.
+
 ## [1.1.3] - 2026-11-26
 
 ### Fixed
