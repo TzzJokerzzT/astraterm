@@ -223,6 +223,7 @@ Typography. Every key here applies live.
 | `ligatures` | bool | `false` | `true`, `false` | Enables the font's `liga` and `calt` features. Off, both are explicitly disabled so a cell never depends on a glyph substitution. |
 | `integer_cell_width` | bool | `false` | `true`, `false` | Makes the cell advance a whole number of pixels by rasterising the font at the slightly larger size whose advance rounds to that width, so the grid and the shaper agree. On, block glyphs (`█ ▓ ▒ ░`) stop drifting against the pixel grid and the dark seam between the steps of a gradient drawn with them gets much narrower: measured at 12 units before and 3–4 after. It is shrunk, not removed, so a gradient can still read as separated steps. The shade and dot glyphs themselves do not change: a renderer that substitutes a solid shade for `▓▒░` (foot does) reads differently for that reason, not because of this option. Off, the measured advance is used as is. Applies live. |
 | `hinting` | bool | `false` | `true`, `false` | Hints glyph outlines to the pixel grid when they are rasterised: stems and block edges snap to whole pixels instead of being sampled at their fractional position. Off, a glyph keeps its real weight and a dithered block keeps its own pattern; on, text on a low-density screen looks crisper but coarser, `▓▒░` (`U+2591`–`U+2593`) shades turn into a hatch with dark vertical stripes, and thin glyphs such as `·` (`U+00B7`) lose pixel rows. Off is the default, matching what other terminals ship. Applies live. |
+| `solid_shades` | bool | `false` | `true`, `false` | Paints `░▒▓` (`U+2591` LIGHT SHADE, `U+2592` MEDIUM SHADE, `U+2593` DARK SHADE) as one flat colour per cell instead of the font's dither: the cell is filled with the foreground blended over its own background at 25 %, 50 % and 75 %, and the glyph is not drawn. Reverse video blends the swapped pair, and a `dim` cell blends its dimmed foreground. Emulates foot, whose `box-drawing-solid-shades` defaults to `yes`. Off by default because it changes how three standard Unicode characters render. Applies live. |
 | `fallbacks` | array of strings | `["JetBrains Mono", "Symbols Nerd Font", "Noto Color Emoji", "DejaVu Sans Mono", "monospace"]` | any strings | **Accepted but not read.** Missing glyphs are resolved by cosmic-text through the system font database; this list is never passed to the shaper. |
 
 ### `[appearance]`
@@ -567,6 +568,7 @@ letter_spacing = 0.0        # extra tracking in pixels (-5 to 20)
 ligatures = false           # enable the font's liga/calt features
 integer_cell_width = false  # stretch the font so a cell is a whole pixel wide
 hinting = false             # snap glyph outlines to the pixel grid
+solid_shades = false        # fill ░▒▓ flat instead of drawing the font's dither
 fallbacks = ["JetBrains Mono", "Noto Color Emoji", "monospace"]  # accepted; not read
 
 [appearance]
@@ -737,6 +739,30 @@ text wants extra crispness, and it costs exactly the weight above: dithered
 blocks become hatches and thin glyphs become thinner. The cell advance is the
 same either way — the shaper measures unhinted metrics — so turning it on changes
 no columns, only the glyphs.
+
+### Solid shades
+
+`font.solid_shades` is `false`, so `░▒▓` (`U+2591`–`U+2593`) are painted by the
+font as it ships them: a fine one-to-two pixel checkerboard whose mean ink is
+about 25 / 50 / 75 % of the foreground, with its peaks at the full foreground
+colour.
+
+foot does not draw that dither. Its `box-drawing-solid-shades` defaults to `yes`,
+and it fills each of those three cells with a single flat colour — the foreground
+blended over the background at 25 / 50 / 75 %. A gradient drawn with the shade
+blocks therefore looks smooth in foot and dithered here, and that difference is
+the substitution, not a rendering fault.
+
+`solid_shades = true` turns the substitution on: those cells are filled with the
+same blend foot paints and the glyph is suppressed, so the dither is never drawn
+on top of the fill. It is off by default because it changes how three standard
+Unicode characters render — a typographic decision for the user to make, not one
+to make for them. `inverse` and `dim` need nothing extra: the blend is taken from
+the colours the cell would otherwise paint, so an inverted shade fills with the
+swapped pair and a dimmed one with its dimmed foreground. Selection and cursor
+behave as they do for an explicit cell background: the opaque fill covers a
+selection highlight painted beneath the cell, and the cursor still paints on top
+of the cell.
 
 ## See also
 

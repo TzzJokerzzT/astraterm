@@ -209,6 +209,21 @@ pub struct FontConfig {
     /// rasterisation is also the look most other terminal emulators do *not* ship, so
     /// a user who wants the old AstraTerm look sets `hinting = true`.
     pub hinting: bool,
+    /// Paint `░▒▓` (`U+2591` LIGHT SHADE, `U+2592` MEDIUM SHADE, `U+2593` DARK
+    /// SHADE) as one flat colour per cell instead of the font's own dither.
+    ///
+    /// Each of the three stands for a coverage of the foreground over the cell's
+    /// background: `U+2591` is 25 %, `U+2592` is 50 % and `U+2593` is 75 %, and the
+    /// cell is filled with exactly that blend. The glyph is not drawn, so the fine
+    /// one-to-two pixel checkerboard the font ships for those characters never
+    /// appears.
+    ///
+    /// Off by default, because it changes how three standard Unicode characters
+    /// render. It exists to emulate foot, which does this by default
+    /// (`box-drawing-solid-shades = yes`): a gradient drawn with the shade blocks
+    /// reads as smooth flat steps there and as a dither here, and a program ported
+    /// from foot looks different only because of this substitution. Set it to match.
+    pub solid_shades: bool,
     /// Additional families used when a glyph is missing from `family`.
     pub fallbacks: Vec<String>,
 }
@@ -224,6 +239,7 @@ impl Default for FontConfig {
             ligatures: false,
             integer_cell_width: false,
             hinting: false,
+            solid_shades: false,
             fallbacks: vec![
                 "JetBrains Mono".to_owned(),
                 "Symbols Nerd Font".to_owned(),
@@ -632,6 +648,45 @@ mod tests {
                 .issues
                 .iter()
                 .any(|issue| issue.field.contains("hintng")),
+            "an unknown key still warns: {:?}",
+            outcome.issues
+        );
+        assert!(
+            outcome.validation().is_valid(),
+            "an unknown key stays a warning: {:?}",
+            outcome.issues
+        );
+    }
+
+    #[test]
+    fn solid_shades_defaults_off_and_parses_when_asked() {
+        assert!(
+            !FontConfig::default().solid_shades,
+            "painting a shade as a flat fill changes how three standard Unicode \
+             characters render, so it is opt-in"
+        );
+        assert!(!Config::default().font.solid_shades);
+
+        let config: Config = toml::from_str("[font]\nsolid_shades = true\n").unwrap();
+        assert!(config.font.solid_shades);
+
+        // Absent key and absent table both keep the default.
+        let config: Config = toml::from_str("[font]\nsize = 12.0\n").unwrap();
+        assert!(!config.font.solid_shades);
+        let config: Config = toml::from_str("[terminal]\nimages = true\n").unwrap();
+        assert!(!config.font.solid_shades);
+    }
+
+    #[test]
+    fn an_unknown_sibling_of_solid_shades_is_still_reported() {
+        let text = "[font]\nsolid_shades = true\nsolid_shade_mode = false\n";
+        let outcome = crate::loader::parse_str(text, "test").unwrap();
+        assert!(outcome.config.font.solid_shades);
+        assert!(
+            outcome
+                .issues
+                .iter()
+                .any(|issue| issue.field.contains("solid_shade_mode")),
             "an unknown key still warns: {:?}",
             outcome.issues
         );

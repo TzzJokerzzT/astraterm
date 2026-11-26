@@ -299,6 +299,9 @@ pub struct PaintOptions {
     pub focused: bool,
     /// Divider colour, also used for the focus border when unfocused.
     pub show_border: bool,
+    /// Paint `░▒▓` (`U+2591`..`U+2593`) as a flat blend of the cell's own colours
+    /// instead of the font's dither.
+    pub solid_shades: bool,
 }
 
 impl Default for PaintOptions {
@@ -310,6 +313,7 @@ impl Default for PaintOptions {
             background_alpha: 1.0,
             focused: true,
             show_border: true,
+            solid_shades: false,
         }
     }
 }
@@ -391,6 +395,13 @@ pub fn paint_pane(
     // below the glyphs.
     paint_cell_backgrounds(scene, (origin_x, origin_y), snapshot, theme, metrics, lines);
 
+    // Solid shades are flat fills between the cell background and the glyphs. The
+    // glyph of a shade cell is suppressed in the text path below, so the dither is
+    // never painted on top of the fill.
+    if options.solid_shades {
+        paint_solid_shades(scene, (origin_x, origin_y), snapshot, theme, metrics, lines);
+    }
+
     for (row, line) in snapshot.lines.iter().enumerate().take(lines) {
         let y = origin_y + row as i32 * metrics.height as i32;
         let clip = Rect::new(inner.x, y, inner.width, metrics.height);
@@ -403,6 +414,7 @@ pub fn paint_pane(
             clip,
             cell_w,
             measure,
+            options.solid_shades,
         ) {
             scene.push_text(item);
         }
@@ -549,10 +561,11 @@ fn cluster_at<'a>(
     column: usize,
     cell_width: f32,
     measure: &mut ClusterMeasurer<'_>,
+    solid_shades: bool,
 ) -> Cluster<'a> {
     let base = &row.cells[column];
     let mut text = String::new();
-    push_cell_text(&mut text, base);
+    push_cell_text(&mut text, base, solid_shades);
     // A cluster holds at most one regional-indicator pair, so the third indicator
     // starts the next cluster instead of joining this one. A hidden cell is not a
     // half of anything: it paints a space, so it must not seed the count either.
@@ -583,7 +596,7 @@ fn cluster_at<'a>(
             break;
         }
         if !cell.wide_spacer {
-            push_cell_text(&mut text, cell);
+            push_cell_text(&mut text, cell, solid_shades);
             indicators += usize::from(regional_indicator(cell.ch));
         }
         end += 1;
@@ -602,11 +615,17 @@ fn cluster_at<'a>(
 
 /// Appends one cell's text to a cluster, hiding a hidden cell behind a space.
 ///
+/// A cell painted as a solid shade is hidden the same way: it is still a one-column
+/// cell that simply paints no glyph, so measuring a space keeps its cluster equal to
+/// the columns the model reserved. Leaving it out of the text instead would make the
+/// measurement look like a missing glyph and anchor every shade cell into a segment
+/// of its own.
+///
 /// The zero-width continuations the model kept for the cell follow its base
 /// character, so the shaper receives the cluster whole instead of separate cells
 /// that would paint as separate glyphs (S9).
-fn push_cell_text(text: &mut String, cell: &CellSnapshot) {
-    if cell.flags.hidden {
+fn push_cell_text(text: &mut String, cell: &CellSnapshot, solid_shades: bool) {
+    if cell.flags.hidden || (solid_shades && shade_factor(cell.ch).is_some()) {
         text.push(' ');
         return;
     }
@@ -649,6 +668,7 @@ fn row_text_item(
     clip: Rect,
     cell_width: f32,
     measure: &mut ClusterMeasurer<'_>,
+    solid_shades: bool,
 ) -> Vec<TextItem> {
     let mut items: Vec<TextItem> = Vec::new();
     let mut spans: Vec<Span> = Vec::new();
@@ -664,7 +684,7 @@ fn row_text_item(
             column += 1;
             continue;
         }
-        let cluster = cluster_at(row, column, cell_width, measure);
+        let cluster = cluster_at(row, column, cell_width, measure, solid_shades);
         column = cluster.column + cluster.columns;
         if cluster.anchored {
             flush_clean_run(
@@ -860,6 +880,45 @@ pub fn cell_underlined(cell: &CellSnapshot) -> bool {
     cell.flags.underline && !cell.flags.hidden
 }
 
+/// Foreground coverage of a shade block character, or `None` for any other one.
+///
+/// `U+2591`, `U+2592` and `U+2593` are what a program reaches for to draw a gradient,
+/// and they are the three foot paints as a flat fill by default (its
+/// `box-drawing-solid-shades`): 25 %, 50 % and 75 % of the foreground over the
+/// background, instead of the one-to-two pixel dither the font ships for them.
+pub fn shade_factor(ch: char) -> Option<f32> {
+    match ch {
+        '\u{2591}' => Some(0.25),
+        '\u{2592}' => Some(0.5),
+        '\u{2593}' => Some(0.75),
+        _ => None,
+    }
+}
+
+/// Flat colour a shade cell paints while `font.solid_shades` is on, or `None` for a
+/// cell that is not a shade.
+///
+/// The blend is between the colours the cell would actually paint, so reverse video
+/// and dim come out right: [`cell_style`] already swapped foreground and background
+/// for `inverse` and mixed a `dim` foreground toward its own background, and
+/// [`cell_background`] performs the same swap, so an inverted shade fills with the
+/// exchanged pair and a dim one fills with the dimmed foreground. A hidden cell
+/// paints no glyph and no fill at all.
+///
+/// [`Rgb::mix`] interpolates *toward* its argument, so mixing the background toward
+/// the foreground by `factor` is `foreground * factor + background * (1 - factor)`:
+/// the foreground laid over the background at that coverage, the same arithmetic the
+/// dither stands in for.
+fn cell_solid_shade(cell: &CellSnapshot, theme: &Palette) -> Option<Rgb> {
+    if cell.flags.hidden || cell.wide_spacer {
+        return None;
+    }
+    let factor = shade_factor(cell.ch)?;
+    let (foreground, _, _) = cell_style(cell, theme);
+    let background = cell_background(cell, theme).unwrap_or(theme.background);
+    Some(background.mix(foreground, factor))
+}
+
 /// Column range (exclusive end) of the selection within one line.
 fn selection_columns(
     selection: astraterm_terminal::snapshot::SelectionSpan,
@@ -913,14 +972,21 @@ fn paint_cursor(
     match style {
         CursorVisual::Block => {
             scene.push_quad(Rect::new(x, y, width, height), theme.cursor, 1.0);
-            // Repaint the character under the cursor in the contrast colour.
+            // Repaint the character under the cursor in the contrast colour. A cell
+            // painted as a solid shade owns no glyph, so it keeps none under the
+            // cursor either: the block already covers it.
             if let Some(cell) = snapshot.cell(cursor.column, cursor.row) {
                 let (_, bold, italic) = cell_style(cell, theme);
+                let text = if options.solid_shades && shade_factor(cell.ch).is_some() {
+                    ' '.to_string()
+                } else {
+                    cell.text().to_string()
+                };
                 scene.push_text(TextItem {
                     id: id_base + 0x10_000 + cursor.row as u64,
                     position: (x as f32, y as f32),
                     spans: vec![Span {
-                        text: cell.text().to_string(),
+                        text,
                         color: rgba(theme.cursor_text, 1.0),
                         bold,
                         italic,
@@ -1016,6 +1082,35 @@ pub fn paint_cell_backgrounds(
                     metrics.width.ceil().max(1.0) as u32,
                     thickness,
                 ),
+                color,
+                1.0,
+            );
+        }
+    }
+}
+
+/// Paints a shade block as one flat fill per cell, on top of the cell backgrounds
+/// and below the glyphs.
+///
+/// Only `U+2591`..`U+2593` are touched: every other cell, and every cell while
+/// `font.solid_shades` is off, keeps whatever the font draws.
+fn paint_solid_shades(
+    scene: &mut Scene,
+    origin: (i32, i32),
+    snapshot: &Snapshot,
+    theme: &Palette,
+    metrics: CellMetrics,
+    max_rows: usize,
+) {
+    for (row, line) in snapshot.lines.iter().enumerate().take(max_rows) {
+        let y = origin.1 + row as i32 * metrics.height as i32;
+        for (column, cell) in line.cells.iter().enumerate() {
+            let Some(color) = cell_solid_shade(cell, theme) else {
+                continue;
+            };
+            let x = origin.0 + (column as f32 * metrics.width) as i32;
+            scene.push_quad(
+                Rect::new(x, y, metrics.width.ceil().max(1.0) as u32, metrics.height),
                 color,
                 1.0,
             );
@@ -1253,6 +1348,7 @@ mod tests {
             Rect::new(0, 0, 100, 20),
             metrics.width,
             &mut measure,
+            false,
         );
         assert_eq!(items.len(), 1, "hidden one-column cells stay one run");
         let text: String = items[0]
@@ -1278,6 +1374,7 @@ mod tests {
             Rect::new(0, 0, 100, 20),
             metrics.width,
             &mut measure,
+            false,
         );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].spans.len(), 1);
@@ -1298,6 +1395,7 @@ mod tests {
             Rect::new(0, 0, 200, 20),
             metrics.width,
             &mut measure,
+            false,
         );
         let item = &items[0];
         assert!(item.spans.len() >= 2, "each colour becomes its own span");
@@ -1332,6 +1430,7 @@ mod tests {
             Rect::new(0, 0, 100, 20),
             cell_width,
             &mut measure,
+            false,
         );
         let starts: Vec<usize> = items
             .iter()
@@ -1385,6 +1484,7 @@ mod tests {
             Rect::new(0, 0, 100, 20),
             cell_width,
             &mut measure,
+            false,
         );
         assert_eq!(items.len(), 3, "two wide segments plus the ASCII run");
         assert_eq!(items[0].position.0, 0.0);
@@ -1435,6 +1535,7 @@ mod tests {
             clip,
             metrics.width,
             &mut measure,
+            false,
         );
         assert_eq!(items.len(), 1);
         let item = &items[0];
@@ -1509,6 +1610,7 @@ mod tests {
             Rect::new(0, 0, 200, 20),
             cell_width,
             &mut measure,
+            false,
         );
         assert_eq!(items.len(), 1, "base and modifier are one segment");
         let item = &items[0];
@@ -1537,6 +1639,7 @@ mod tests {
             Rect::new(0, 0, 200, 20),
             cell_width,
             &mut measure,
+            false,
         );
         assert_eq!(items.len(), 1, "the flag is one segment");
         let item = &items[0];
@@ -1562,6 +1665,7 @@ mod tests {
             Rect::new(0, 0, 200, 20),
             cell_width,
             &mut measure,
+            false,
         );
         assert_eq!(items.len(), 2, "two flags, two segments");
         assert_eq!(segment_text(&items[0]), "\u{1F1EA}\u{1F1F8}");
@@ -1597,7 +1701,7 @@ mod tests {
             let mut font = TestFont::new();
             let (metrics, mut measure) = font.painter();
             let cell_width = metrics.width;
-            let cluster = cluster_at(&snapshot.lines[0], 0, cell_width, &mut measure);
+            let cluster = cluster_at(&snapshot.lines[0], 0, cell_width, &mut measure, false);
             assert_eq!(cluster.text, expected, "{input:?} is one cluster");
             assert_eq!(cluster.columns, columns, "{input:?} owns its columns");
             let items = row_text_item(
@@ -1609,6 +1713,7 @@ mod tests {
                 Rect::new(0, 0, 200, 20),
                 cell_width,
                 &mut measure,
+                false,
             );
             assert!(
                 items
@@ -1654,6 +1759,7 @@ mod tests {
             Rect::new(0, 0, 200, 20),
             cell_width,
             &mut measure,
+            false,
         );
         assert_eq!(items.len(), 2, "the wide glyph and the cell after it");
         assert_eq!(segment_text(&items[0]), "你");
@@ -1690,10 +1796,10 @@ mod tests {
         let mut font = TestFont::new();
         let (metrics, mut measure) = font.painter();
         let cell_width = metrics.width;
-        let hidden = cluster_at(&row, 0, cell_width, &mut measure);
+        let hidden = cluster_at(&row, 0, cell_width, &mut measure, false);
         assert_eq!(hidden.text, " ", "a hidden cell paints as a space");
         assert_eq!(hidden.columns, 1, "a hidden cell owns no continuation");
-        let visible = cluster_at(&row, 1, cell_width, &mut measure);
+        let visible = cluster_at(&row, 1, cell_width, &mut measure, false);
         assert_eq!(visible.text, "\u{1F1F8}");
         assert_eq!(visible.columns, 1);
         let items = row_text_item(
@@ -1705,6 +1811,7 @@ mod tests {
             Rect::new(0, 0, 200, 20),
             cell_width,
             &mut measure,
+            false,
         );
         let span = items
             .iter()
@@ -1742,7 +1849,7 @@ mod tests {
         let mut font = TestFont::new();
         let (metrics, mut measure) = font.painter();
         let cell_width = metrics.width;
-        let cluster = cluster_at(&row, 0, cell_width, &mut measure);
+        let cluster = cluster_at(&row, 0, cell_width, &mut measure, false);
         assert_eq!(cluster.text, "\u{1F1EA}", "the hidden half stays out");
         assert_eq!(cluster.columns, 1);
         let items = row_text_item(
@@ -1754,6 +1861,7 @@ mod tests {
             Rect::new(0, 0, 200, 20),
             cell_width,
             &mut measure,
+            false,
         );
         let span = items
             .iter()
@@ -1793,6 +1901,7 @@ mod tests {
             clip,
             cell_width,
             &mut measure,
+            false,
         );
         assert_eq!(items.len(), 4, "three anchored clusters plus the ASCII run");
         for (column, item) in items.iter().take(3).enumerate() {
@@ -2114,6 +2223,137 @@ mod tests {
         assert!(
             scene.images.is_empty(),
             "an empty destination rectangle draws nothing"
+        );
+    }
+
+    /// Paints one row of `text` with the solid-shade substitution on or off.
+    fn shaded_scene(text: &str, solid_shades: bool) -> (Scene, CellMetrics) {
+        let snapshot = snapshot(text, 10, 1);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
+        let mut scene = Scene::default();
+        paint_pane(
+            &mut scene,
+            0,
+            Rect::new(0, 0, 200, 40),
+            &snapshot,
+            &theme(),
+            metrics,
+            PaintOptions {
+                solid_shades,
+                draw_cursor: false,
+                ..Default::default()
+            },
+            &mut measure,
+        );
+        (scene, metrics)
+    }
+
+    /// The cell-sized quads of a scene, in paint order.
+    ///
+    /// A shade fill is one cell; the batched cell background of a run and the pane
+    /// background are wider, so they never appear here.
+    fn cell_quads(scene: &Scene, metrics: CellMetrics) -> Vec<Quad> {
+        let cell_width = metrics.width.ceil().max(1.0) as u32;
+        scene
+            .quads
+            .iter()
+            .copied()
+            .filter(|quad| quad.rect.height == metrics.height && quad.rect.width <= cell_width)
+            .collect()
+    }
+
+    /// Concatenated text of every text item in a scene.
+    fn scene_text(scene: &Scene) -> String {
+        scene
+            .texts
+            .iter()
+            .flat_map(|item| item.spans.iter())
+            .map(|span| span.text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn solid_shades_blend_each_shade_toward_its_foreground() {
+        // White on black: U+2591, U+2592 and U+2593 paint 25, 50 and 75 % of the
+        // foreground over the background, which is what foot's
+        // `box-drawing-solid-shades` does instead of the font's own dither.
+        let (scene, metrics) = shaded_scene(
+            "\x1b[38;2;255;255;255m\x1b[48;2;0;0;0m\u{2591}\u{2592}\u{2593}\x1b[0m",
+            true,
+        );
+        let fills = cell_quads(&scene, metrics);
+        assert_eq!(fills.len(), 3, "one flat fill per shade cell: {fills:?}");
+        assert_eq!(fills[0].color, rgba(Rgb::new(64, 64, 64), 1.0), "25 %");
+        assert_eq!(fills[1].color, rgba(Rgb::new(128, 128, 128), 1.0), "50 %");
+        assert_eq!(fills[2].color, rgba(Rgb::new(191, 191, 191), 1.0), "75 %");
+
+        // With the option off the same row paints no fill at all.
+        let (off, metrics) = shaded_scene(
+            "\x1b[38;2;255;255;255m\x1b[48;2;0;0;0m\u{2591}\u{2592}\u{2593}\x1b[0m",
+            false,
+        );
+        assert!(
+            cell_quads(&off, metrics).is_empty(),
+            "the shipped behaviour keeps the font's own dither"
+        );
+    }
+
+    #[test]
+    fn an_inverted_shade_blends_the_swapped_colours() {
+        // Blue text on red, inverted: the cell paints red text on blue, so U+2591
+        // is 25 % red over blue, not 25 % blue over red.
+        let (scene, metrics) =
+            shaded_scene("\x1b[7m\x1b[38;2;0;0;255m\x1b[48;2;255;0;0m\u{2591}\x1b[0m", true);
+        let fills = cell_quads(&scene, metrics);
+        // One cell of explicit background, painted in the swapped background colour,
+        // then the flat fill on top of it.
+        assert_eq!(fills.len(), 2, "one background and one fill: {fills:?}");
+        assert_eq!(
+            fills[0].color,
+            rgba(Rgb::new(0, 0, 255), 1.0),
+            "the inverted background is the original foreground"
+        );
+        assert_eq!(fills[1].color, rgba(Rgb::new(64, 0, 191), 1.0));
+        assert_ne!(
+            fills[1].color,
+            rgba(Rgb::new(191, 0, 64), 1.0),
+            "the unswapped blend would be the other way round"
+        );
+    }
+
+    #[test]
+    fn a_shade_glyph_is_suppressed_only_when_solid_shades_is_on() {
+        let (off, _) = shaded_scene("\u{2592}x", false);
+        let (on, _) = shaded_scene("\u{2592}x", true);
+        assert!(
+            scene_text(&off).starts_with('\u{2592}'),
+            "off, the font draws the dither: {:?}",
+            scene_text(&off)
+        );
+        assert!(
+            !scene_text(&on).contains('\u{2592}'),
+            "on, the glyph must not be drawn on top of the fill: {:?}",
+            scene_text(&on)
+        );
+        assert!(
+            scene_text(&on).starts_with(" x"),
+            "the suppressed cell still occupies its column: {:?}",
+            scene_text(&on)
+        );
+        // The cell is still one column, so the row is not split into an anchored
+        // segment per suppressed cell (which is what happens to a missing glyph).
+        assert_eq!(off.texts.len(), 1, "one clean run per row");
+        assert_eq!(on.texts.len(), 1, "a suppressed shade is not a missing glyph");
+    }
+
+    #[test]
+    fn a_non_shade_cell_is_unaffected_by_solid_shades() {
+        let (off, _) = shaded_scene("A", false);
+        let (on, _) = shaded_scene("A", true);
+        assert_eq!(
+            on, off,
+            "the substitution only touches U+2591, U+2592 and U+2593"
         );
     }
 }

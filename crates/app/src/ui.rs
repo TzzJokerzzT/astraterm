@@ -1038,6 +1038,9 @@ impl WindowUi {
                 background_alpha: 0.0,
                 focused: focused == Some(*pane),
                 show_border,
+                // Shades are painted as flat blends only when the user asked for
+                // foot's substitution; the default keeps the font's dither.
+                solid_shades: self.config.font.solid_shades,
             };
             paint::paint_pane(
                 &mut scene,
@@ -1139,6 +1142,7 @@ impl WindowUi {
                 background_alpha: 1.0,
                 focused: focused == pane,
                 show_border,
+                solid_shades: self.config.font.solid_shades,
             };
             paint::paint_pane(
                 scene,
