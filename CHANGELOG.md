@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-26
+
+### Fixed
+
+- A malformed OSC (for example `ESC ] 9 BEL`, a notification introducer without
+  its `;`) no longer stops the scanner from recognising images and
+  notifications. The terminator was being swallowed along with the rejected
+  prefix, so the scanner waited for another one and every sequence in between
+  was missed. Applies to both BEL and ST terminated sequences.
+
 ## [1.1.0] - 2026-11-26
 
 ### Added
