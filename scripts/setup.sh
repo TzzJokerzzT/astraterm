@@ -32,16 +32,17 @@
 #                    current user with packaging/linux/install.sh
 #   --no-build       skip `cargo build --release --locked`
 #   --version <tag>  build a specific release (`v1.0.0` or `1.0.0`). The script
-#                    verifies that HEAD is exactly that tag and refuses
-#                    otherwise; it never runs `git checkout`/`git switch` or
-#                    fetches tags in --dry-run.
+#                    verifies that HEAD is exactly that tag and that the working
+#                    tree is clean, and refuses otherwise; it never runs
+#                    `git checkout`/`git switch` or fetches tags in --dry-run.
 #
 # Exit codes:
 #   0  success, nothing left to do (declining the package installation is not
 #      an error: the step is skipped and the build still runs)
 #   2  usage error or wrong user (root)
 #   3  Rust toolchain missing or older than 1.85
-#   4  the requested `--version` tag is missing, or HEAD is not at that tag
+#   4  the requested `--version` tag is missing, HEAD is not at that tag, or the
+#      working tree has changes
 #   other  the exit status of the command that failed (cargo, pacman, ...)
 #
 # See docs/INSTALL.md for the requirements per distribution.
@@ -82,15 +83,16 @@ Options:
   --install        after a successful build, install the binary for the current user
                    with packaging/linux/install.sh
   --no-build       skip the release build
-  --version <tag>  build a specific release (v1.0.0, or 1.0.0). The tag must exist
-                   and HEAD must be exactly at it; the script stops otherwise and
-                   never runs git checkout/git switch itself.
+  --version <tag>  build a specific release (v1.0.0, or 1.0.0). The tag must exist,
+                   HEAD must be exactly at it and the working tree must be clean;
+                   the script stops otherwise and never runs git checkout/git
+                   switch itself.
   -h, --help       show this help
 
 Exit codes: 0 success, 2 usage error or root, 3 Rust toolchain missing or
-            older than 1.85, 4 the --version tag is missing or HEAD is not at
-            it; a failing command exits with its own status. Declining the
-            package installation is not a failure.
+            older than 1.85, 4 the --version tag is missing, HEAD is not at it,
+            or the working tree has changes; a failing command exits with its
+            own status. Declining the package installation is not a failure.
 
 Documentation: docs/INSTALL.md
 EOF
@@ -161,6 +163,39 @@ confirm() {
     esac
 }
 
+# "1 commit" / "3 commits", for the --version messages.
+commit_count() {
+    if [ "$1" -eq 1 ]; then
+        printf '1 commit'
+    else
+        printf '%s commits' "$1"
+    fi
+}
+
+# Being at the tag is not the whole promise: uncommitted or untracked files would
+# still be compiled, and an untracked Cargo configuration or build script changes
+# the binary as effectively as an edit does. A status that cannot be read is not
+# evidence of a clean tree either. Called once HEAD has been shown to be at the
+# requested tag, so the message can only ever blame the tree, never the tag.
+require_clean_tree() {
+    local dirty
+    if ! dirty=$(git -C "$root_dir" status --porcelain 2>&1); then
+        fail "$EXIT_VERSION" \
+            "git status failed, so the working tree cannot be shown to be clean." \
+            "$dirty" \
+            "Repair the repository (a corrupt index, for example) and re-run."
+    fi
+    if [ -n "$dirty" ]; then
+        fail "$EXIT_VERSION" \
+            "HEAD is $requested_version, but the working tree has changes:" \
+            "$dirty" \
+            "Building now would install code that is not that release: what gets" \
+            "compiled has to be exactly what was published. Commit, stash or remove" \
+            "them and re-run:" \
+            "  git -C $root_dir status --short"
+    fi
+}
+
 set_requested_version() {
     local raw=${1-} tag
     if [ -z "$raw" ]; then
@@ -207,6 +242,10 @@ check_requested_version() {
         return 0
     fi
 
+    # Set when `git fetch --tags` was actually attempted, so the "tag still
+    # missing" message can tell a declined prompt from a failed one.
+    local fetch_attempted=0
+
     step "Requested version: $requested_version"
 
     if ! command -v git >/dev/null 2>&1; then
@@ -242,7 +281,11 @@ check_requested_version() {
                 "\`git fetch --tags\`:" \
                 "  git fetch --tags"
         fi
+        # Declining a fetch and a fetch that was tried and failed are different
+        # facts, and the message below has to say which one happened: after a
+        # declined prompt nothing was attempted, so blaming the fetch would be false.
         if confirm "fetch tags from the remote? (uses the network)"; then
+            fetch_attempted=1
             if ! run git -C "$root_dir" fetch --tags; then
                 fail "$EXIT_VERSION" \
                     "\`git fetch --tags\` failed, so $requested_version cannot be verified." \
@@ -252,63 +295,75 @@ check_requested_version() {
             info "skipped \`git fetch --tags\`"
         fi
         if ! git -C "$root_dir" rev-parse -q --verify "refs/tags/$requested_version" >/dev/null 2>&1; then
+            if [ "$fetch_attempted" -eq 1 ]; then
+                fail "$EXIT_VERSION" \
+                    "tag $requested_version does not exist." \
+                    "\`git fetch --tags\` ran and brought the tags up to date, so the" \
+                    "remote does not publish that tag either." \
+                    "Check the version you asked for against the available tags:" \
+                    "  git tag -l 'v*'"
+            fi
             fail "$EXIT_VERSION" \
                 "tag $requested_version does not exist." \
-                "It is not in this clone, and fetching the tags did not bring it either." \
-                "Check the version you asked for against the available tags:" \
+                "The tags were not fetched: you declined, so fetching them was never" \
+                "attempted and this clone may simply predate the tag." \
+                "Run \`git fetch --tags\` yourself (that uses the network) and re-run," \
+                "or check the version you asked for against the available tags:" \
                 "  git tag -l 'v*'"
         fi
     fi
 
-    # Being at the tag is not the whole promise: uncommitted or untracked files would
-    # still be compiled, and an untracked Cargo configuration or build script changes
-    # the binary as effectively as an edit does. A status that cannot be read is not
-    # evidence of a clean tree either.
-    local dirty
-    if ! dirty=$(git -C "$root_dir" status --porcelain 2>&1); then
-        fail "$EXIT_VERSION" \
-            "git status failed, so the working tree cannot be shown to be clean." \
-            "$dirty" \
-            "Repair the repository (a corrupt index, for example) and re-run."
-    fi
-    if [ -n "$dirty" ]; then
-        fail "$EXIT_VERSION" \
-            "$requested_version is checked out, but the working tree has changes:" \
-            "$dirty" \
-            "Building now would install code that is not that release. Commit, stash or" \
-            "remove them and re-run:" \
-            "  git -C $root_dir status --short"
-    fi
-
+    # The order matters: HEAD is compared with the tag *before* the tree is
+    # inspected, so a dirty tree at another commit is never reported as "the tag
+    # is here with changes" when the tag is not in the tree at all.
     local head_tag head_commit tag_commit
     head_tag=$(git -C "$root_dir" describe --tags --exact-match HEAD 2>/dev/null || true)
-    if [ "$head_tag" = "$requested_version" ]; then
+    head_commit=$(git -C "$root_dir" rev-parse --verify HEAD)
+    tag_commit=$(git -C "$root_dir" rev-parse --verify "refs/tags/$requested_version^{commit}")
+    if [ "$head_tag" = "$requested_version" ] || [ "$tag_commit" = "$head_commit" ]; then
+        # `git describe` returns one tag arbitrarily when a commit carries
+        # several, so a tag that points at HEAD also satisfies the request.
+        require_clean_tree
         ok "the working tree is exactly $requested_version and clean"
         return 0
     fi
-    # `git describe` returns one tag arbitrarily when a commit carries several,
-    # so a tag that points at HEAD still satisfies the request.
-    head_commit=$(git -C "$root_dir" rev-parse --verify HEAD)
-    tag_commit=$(git -C "$root_dir" rev-parse --verify "refs/tags/$requested_version^{commit}")
-    if [ "$tag_commit" = "$head_commit" ]; then
-        ok "$requested_version points at HEAD and the tree is clean (git describe reported ${head_tag:-no exact tag})"
-        return 0
-    fi
 
-    local head_short description
+    # HEAD is somewhere else. Say how far: `git rev-list --count A..B` counts
+    # the commits reachable from B but not from A, so the two counts describe the
+    # gap without moving anything.
+    local head_short ahead behind distance description
     head_short=$(git -C "$root_dir" rev-parse --short HEAD)
-    if [ -n "$head_tag" ]; then
-        description="HEAD is $head_short, tagged $head_tag"
+    ahead=$(git -C "$root_dir" rev-list --count "refs/tags/$requested_version..HEAD" 2>/dev/null || true)
+    behind=$(git -C "$root_dir" rev-list --count "HEAD..refs/tags/$requested_version" 2>/dev/null || true)
+    distance=""
+    if [[ $ahead =~ ^[0-9]+$ && $behind =~ ^[0-9]+$ ]] && [ $((ahead + behind)) -gt 0 ]; then
+        if [ "$ahead" -gt 0 ] && [ "$behind" -gt 0 ]; then
+            distance="$(commit_count "$ahead") after $requested_version and $(commit_count "$behind") before it, so the history diverged"
+        elif [ "$ahead" -gt 0 ]; then
+            distance="$(commit_count "$ahead") after $requested_version"
+        else
+            distance="$(commit_count "$behind") before $requested_version"
+        fi
+    fi
+    if [ -n "$distance" ]; then
+        description="HEAD is $distance ($head_short)"
     else
         description="HEAD is $head_short, which is not an exact tag"
     fi
+    if [ -n "$head_tag" ]; then
+        description="$description, tagged $head_tag"
+    fi
+
     fail "$EXIT_VERSION" \
         "this checkout is not at $requested_version: $description." \
         "Building here would install a binary that is not $requested_version, so the" \
         "script stops. It never changes your checkout; moving the tree is your call." \
-        "Run these two commands yourself:" \
+        "Either move this checkout to the release and build there:" \
         "  git checkout $requested_version" \
-        "  ./scripts/setup.sh --version $requested_version --install"
+        "  ./scripts/setup.sh --version $requested_version --install" \
+        "or build the release in a temporary worktree, leaving this tree untouched:" \
+        "  git worktree add /tmp/astraterm-$requested_version $requested_version" \
+        "  /tmp/astraterm-$requested_version/scripts/setup.sh --version $requested_version --install"
 }
 
 require_normal_user() {

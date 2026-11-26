@@ -51,7 +51,7 @@ if the checkout is not at that release; see
 | `--yes`, `-y` | Do not ask for confirmation before installing packages (`sudo` still asks for your password) |
 | `--install` | After a successful build, install the binary, desktop entry and icons for the current user |
 | `--no-build` | Skip `cargo build --release --locked` |
-| `--version <tag>` | Build a specific release (`v1.0.0`, or `1.0.0`). The tag must exist and `HEAD` must be exactly at it; the script stops otherwise and never changes your checkout |
+| `--version <tag>` | Build a specific release (`v1.0.0`, or `1.0.0`). The tag must exist, `HEAD` must be exactly at it and the working tree must be clean; the script stops with code `4` otherwise and never changes your checkout |
 | `--help` | Show the help text |
 
 ### `--dry-run` semantics
@@ -65,7 +65,8 @@ the printed plan matches the machine you are on. Use it to review the exact
 With `--version`, `--dry-run` never uses the network: if the tag is missing it
 prints `would run: git fetch --tags` and exits with code `4`, because a real run
 would first ask for confirmation and then fetch. It also reports when the tag
-exists but `HEAD` is somewhere else, without moving anything.
+exists but `HEAD` is somewhere else (with the distance to the tag), and when the
+working tree is dirty, without moving anything.
 
 ### Installing a specific release (`--version`)
 
@@ -89,9 +90,20 @@ a side effect of an installer. What it does instead:
 3. Requires `git describe --tags --exact-match HEAD` to report exactly that tag
    (or, equivalently, that the tag points at `HEAD`). This is what guarantees
    that the binary built and installed here is the release you asked for. If it
-   does not match, the script exits with code `4`, names the version that *is*
-   in the tree, and prints the command you have to run yourself.
-4. Only then continues with the normal flow (checks, build, `--install`).
+   does not match, the script exits with code `4`, says how far `HEAD` is from
+   the tag ("`HEAD` is 3 commits after `v1.0.0`", "… before …", or "the history
+   diverged") and prints the two ways to get to the release: `git checkout
+   v1.0.0`, or a temporary worktree built from the tag, which leaves your tree
+   untouched.
+4. Only then requires a **clean** working tree: no modified tracked files and no
+   untracked files either. A commit is not enough on its own — what gets
+   compiled has to be exactly what was published, and an uncommitted edit, a
+   stray file or a local `.cargo/config.toml` would change the binary without
+   changing the tag. This check runs *after* the tag comparison, so a dirty tree
+   at another commit is reported as "not at that version", not as "the tag is
+   here with changes". If it fails the script exits with code `4` and lists the
+   offending paths.
+5. Only then continues with the normal flow (checks, build, `--install`).
 
 The intended flow, with the checkout step owned by you:
 
@@ -110,7 +122,7 @@ Preview it first with `--dry-run --version v1.0.0`, which uses no network.
 | `0` | Success; nothing left to do. Declining the package installation is not a failure: the step is skipped and the build still runs |
 | `2` | Usage error, unknown flag, `--version` without a value, or the script was started as root |
 | `3` | Rust toolchain missing, or older than 1.85 |
-| `4` | The `--version` tag does not exist, the checkout is not a git checkout, or `HEAD` is not at that tag |
+| `4` | The `--version` tag does not exist, the checkout is not a git checkout, `HEAD` is not at that tag, or the working tree has changes |
 | other | The exit status of the command that failed (`cargo`, `pacman`, `apt-get`, `dnf`) |
 
 The script refuses to run as root: compile as your own user, and let it ask
@@ -236,7 +248,8 @@ in the real checksums before publishing a package.
 | Clipboard does nothing on Wayland | `wl-clipboard` is missing, or the app is not running under Wayland |
 | No save/reload notification | `libnotify` / `notify-send` is missing |
 | `error: the tag vX.Y.Z is not in this clone` | The clone predates the tag: `git fetch --tags`, or run without `--version` to build the tree as it is |
-| `error: this checkout is not at vX.Y.Z` | `HEAD` is elsewhere: `git checkout vX.Y.Z` yourself — the script deliberately does not do it for you |
+| `error: this checkout is not at vX.Y.Z` | `HEAD` is elsewhere: the message says how many commits ahead/behind and prints both fixes — `git checkout vX.Y.Z` yourself, or `git worktree add /tmp/astraterm-vX.Y.Z vX.Y.Z` and build there; the script deliberately moves nothing |
+| `error: HEAD is vX.Y.Z, but the working tree has changes` | You are on the right tag but have modified or untracked files; what gets compiled must be exactly what was published. Commit, stash or remove them and re-run |
 | `error: … is not a git checkout` | You are in an unpacked tarball, so no tag can be verified; clone the repository |
 
 Diagnostics live behind `--debug` (`RUST_LOG=astraterm=debug`).
