@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-11-26
+
+### Changed
+
+- `setup.sh --version` now explains instead of only refusing. When the checkout
+  is not at the requested tag the error names the distance (`4 commits after
+  v1.0.0`, `2 before`, or diverged) and prints both remedies: check out the tag,
+  or build it in a temporary worktree. The script still never moves your tree.
+- The clean-tree requirement is documented, and it is now checked **after**
+  confirming the tag, so a modified file at another commit is no longer reported
+  as if the tag were checked out. A declined `git fetch --tags` says so instead
+  of claiming the fetch failed.
+
+### Added
+
+- `scripts/tests/version-check.sh`: eleven repeatable checks over throwaway git
+  repositories covering every `--version` outcome, including the skip when the
+  flag is absent.
+
 ## [1.1.1] - 2026-11-26
 
 ### Fixed
