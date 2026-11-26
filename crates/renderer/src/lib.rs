@@ -235,7 +235,18 @@ impl Renderer {
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
-        let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
+        // Glyph colour space has to match the target. `Accurate` makes glyphon convert
+        // every glyph colour to linear light, which is right only when the target is itself
+        // an sRGB format that encodes it back on write. On a plain UNORM target the bytes we
+        // hand over are already sRGB-encoded — the same space the quad pipeline writes —
+        // so converting here would darken text and flatten any gradient drawn with block
+        // glyphs. `Web` passes the colour through and keeps text and backgrounds in one space.
+        let color_mode = if format.is_srgb() {
+            glyphon::ColorMode::Accurate
+        } else {
+            glyphon::ColorMode::Web
+        };
+        let mut atlas = TextAtlas::with_color_mode(&device, &queue, &cache, format, color_mode);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
         let overlay_text =
@@ -244,6 +255,7 @@ impl Renderer {
         tracing::info!(
             format = ?format,
             srgb = format.is_srgb(),
+            color_mode = ?color_mode,
             alpha = ?alpha_mode,
             adapter = adapter.get_info().name,
             backend = ?adapter.get_info().backend,
