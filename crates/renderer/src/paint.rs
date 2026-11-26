@@ -12,6 +12,8 @@ use astraterm_terminal::snapshot::{
     CellFlags, CellSnapshot, CursorVisual, RowSnapshot, Snapshot, SnapshotColor,
 };
 
+use crate::text::ClusterMeasurer;
+
 /// A solid rectangle in device pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Quad {
@@ -315,7 +317,10 @@ impl Default for PaintOptions {
 /// Paints one pane's grid into `scene`.
 ///
 /// `id_base` namespaces the text item identifiers so two panes never share a
-/// cached glyph buffer.
+/// cached glyph buffer. `measure` supplies the shaped advance of a grapheme cluster,
+/// which is what decides whether that cluster needs its own grid-anchored segment
+/// (S8); it is handed in rather than reached for because painting owns no font.
+#[allow(clippy::too_many_arguments)]
 pub fn paint_pane(
     scene: &mut Scene,
     id_base: u64,
@@ -324,6 +329,7 @@ pub fn paint_pane(
     theme: &Palette,
     metrics: CellMetrics,
     options: PaintOptions,
+    measure: &mut ClusterMeasurer<'_>,
 ) {
     if rect.is_empty() {
         return;
@@ -388,7 +394,16 @@ pub fn paint_pane(
     for (row, line) in snapshot.lines.iter().enumerate().take(lines) {
         let y = origin_y + row as i32 * metrics.height as i32;
         let clip = Rect::new(inner.x, y, inner.width, metrics.height);
-        for item in row_text_item(id_base + row as u64, origin_x, y, line, theme, clip, cell_w) {
+        for item in row_text_item(
+            id_base + row as u64,
+            origin_x,
+            y,
+            line,
+            theme,
+            clip,
+            cell_w,
+            measure,
+        ) {
             scene.push_text(item);
         }
     }
@@ -436,21 +451,142 @@ pub fn push_border(scene: &mut Scene, rect: Rect, color: Rgb) {
     );
 }
 
-/// Whether a codepoint's glyph may come from a fallback face with an advance the
-/// grid did not reserve.
+/// The advance of a cluster may differ from the columns the model reserved by this
+/// much before the cluster gets its own grid-anchored segment.
 ///
-/// Emoji, emoji presentation selectors and the symbol/dingbat blocks are shaped
-/// by a different font than the terminal family, and that font's advance is not
-/// the cell width the model reserved. Such a cell is painted as its own
-/// grid-anchored segment, so its odd advance cannot push the cells after it.
-fn grid_anchor_required(c: char) -> bool {
+/// Half a pixel absorbs the rounding a monospace font and the cell metrics disagree
+/// by, without letting a real drift through: the gaps this feature exists for are far
+/// larger, measured with the shipped default font as `क` at 1.280 cells where the grid
+/// reserves one, and emoji fallbacks at 2.075 cells where it reserves two.
+const ANCHOR_TOLERANCE: f32 = 0.5;
+
+/// Whether `c` continues the grapheme cluster of the character before it.
+///
+/// This list only recognises a continuation; it never decides that a cluster is
+/// anchored, which is what measurement does (S8). It matters because a segment
+/// boundary inside a cluster would shape the pieces separately: `👍` and `🏽` are
+/// two codepoints of one glyph, and painting them as two items paints two glyphs.
+///
+/// The snapshot carries only the base character of a cluster stored in one cell, so
+/// the variation-selector, joiner, keycap, tag and combining-mark ranges only fire
+/// for data that survives a cell the model split — which is why the preserved cases
+/// are a skin-tone modifier in its own cell and a pair of regional indicators. See
+/// T6 in `odd/tasks/grid-anchored-glyphs.md` for the terminal-crate prerequisite
+/// that would carry `Cell::zerowidth()` here.
+fn cluster_continuation(c: char) -> bool {
     matches!(c,
-        '\u{FE0F}'
-            | '\u{1F000}'..='\u{1FAFF}'
-            | '\u{2600}'..='\u{27BF}'
-            | '\u{23E9}'..='\u{23FA}'
-            | '\u{2B00}'..='\u{2BFF}'
+        // Variation selectors (text and emoji presentation).
+        '\u{FE00}'..='\u{FE0F}'
+            // Zero-width joiner and emoji keycap.
+            | '\u{200D}'
+            | '\u{20E3}'
+            // Skin-tone modifiers.
+            | '\u{1F3FB}'..='\u{1F3FF}'
+            // Tag characters (subdivision flags).
+            | '\u{E0020}'..='\u{E007F}'
+            // Combining marks, which are the general mark categories spelled out by
+            // block: diacritics, Hebrew points, Arabic harakat, Syriac, Devanagari,
+            // the extended and symbol supplements, and the half marks.
+            | '\u{0300}'..='\u{036F}'
+            | '\u{0483}'..='\u{0489}'
+            | '\u{0591}'..='\u{05BD}'
+            | '\u{05BF}'
+            | '\u{05C1}'..='\u{05C7}'
+            | '\u{0610}'..='\u{061A}'
+            | '\u{064B}'..='\u{065F}'
+            | '\u{0670}'
+            | '\u{06D6}'..='\u{06ED}'
+            | '\u{0711}'
+            | '\u{0730}'..='\u{074A}'
+            | '\u{07A6}'..='\u{07B0}'
+            | '\u{0900}'..='\u{0903}'
+            | '\u{093A}'..='\u{094F}'
+            | '\u{0955}'..='\u{0957}'
+            | '\u{0962}'..='\u{0963}'
+            | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}'
+            | '\u{20D0}'..='\u{20F0}'
+            | '\u{FE20}'..='\u{FE2F}'
     )
+}
+
+/// Whether `c` is a regional indicator, half of a flag emoji.
+fn regional_indicator(c: char) -> bool {
+    matches!(c, '\u{1F1E6}'..='\u{1F1FF}')
+}
+
+/// One grapheme cluster of a row, as far as the snapshot still preserves it.
+struct Cluster<'a> {
+    /// Grid column of the first cell.
+    column: usize,
+    /// Columns the cluster owns, including the spacers of its wide cells.
+    columns: usize,
+    /// First cell, whose style paints the whole cluster.
+    base: &'a CellSnapshot,
+    text: String,
+    /// Whether the cluster needs its own grid-anchored segment (S8).
+    anchored: bool,
+}
+
+/// Reads the cluster that starts at `column` and decides whether it is anchored.
+///
+/// The walk absorbs every following cell that continues the base — a wide cell and
+/// its spacer, a skin-tone modifier in its own cell, the second half of a flag — and
+/// stops at the first cell that starts a new cluster. Anchoring is then measured, not
+/// listed: a wide base always anchors (the model already gave it two columns), and a
+/// cluster whose shaped advance disagrees with the columns reserved for it anchors by
+/// more than [`ANCHOR_TOLERANCE`].
+fn cluster_at<'a>(
+    row: &'a RowSnapshot,
+    column: usize,
+    cell_width: f32,
+    measure: &mut ClusterMeasurer<'_>,
+) -> Cluster<'a> {
+    let base = &row.cells[column];
+    let mut text = String::new();
+    push_cell_text(&mut text, base);
+    // A cluster holds at most one regional-indicator pair, so the third indicator
+    // starts the next cluster instead of joining this one.
+    let mut indicators = usize::from(regional_indicator(base.ch));
+    let mut end = column + 1;
+    while let Some(cell) = row.cells.get(end) {
+        let continues = if cell.wide_spacer {
+            // A spacer belongs to the wide cell before it, as it always did.
+            true
+        } else if regional_indicator(cell.ch) {
+            indicators == 1
+        } else {
+            !cell.flags.hidden && cluster_continuation(cell.ch)
+        };
+        if !continues {
+            break;
+        }
+        if !cell.wide_spacer {
+            push_cell_text(&mut text, cell);
+            indicators += usize::from(regional_indicator(cell.ch));
+        }
+        end += 1;
+    }
+    // A wide base owns two columns even when the model wrote no spacer for it.
+    let columns = (end - column).max(if base.wide { 2 } else { 1 });
+    let reserved = columns as f32 * cell_width;
+    let measured = measure.advance(&text);
+    Cluster {
+        column,
+        columns,
+        base,
+        text,
+        anchored: base.wide || (measured - reserved).abs() > ANCHOR_TOLERANCE,
+    }
+}
+
+/// Appends one cell's text to a cluster, hiding a hidden cell behind a space.
+fn push_cell_text(text: &mut String, cell: &CellSnapshot) {
+    if cell.flags.hidden {
+        text.push(' ');
+    } else {
+        text.push(cell.ch);
+    }
 }
 
 /// Stable identifier of the text segment that starts at `column` of `row_id`.
@@ -471,11 +607,14 @@ fn segment_id(row_id: u64, column: usize) -> u64 {
 
 /// Builds the text items for one row, splitting it into grid-anchored segments.
 ///
-/// Adjacent one-column cells whose glyph is guaranteed to advance exactly one
-/// cell are merged into a single item (spans split only by style) so shaping
-/// stays cheap. A wide cell or a cell that may fall back to another face becomes
-/// its own item, positioned at `origin_x + column * cell_width` and clipped to
-/// the columns it owns, so its painted advance never shifts the rest of the row.
+/// The row is walked one grapheme cluster at a time (S7): a cluster never straddles
+/// two items, so the shaper always sees it whole. Clusters whose shaped advance
+/// matches the columns the model reserved for them are merged into one item per style
+/// run, which keeps the common row cheap; a wide cluster, or one whose measured
+/// advance disagrees with its columns (S8), becomes its own item, positioned at
+/// `origin_x + column * cell_width` and clipped to the columns it owns plus one cell
+/// of slack, so its painted advance never shifts the rest of the row.
+#[allow(clippy::too_many_arguments)]
 fn row_text_item(
     row_id: u64,
     origin_x: i32,
@@ -484,6 +623,7 @@ fn row_text_item(
     theme: &Palette,
     clip: Rect,
     cell_width: f32,
+    measure: &mut ClusterMeasurer<'_>,
 ) -> Vec<TextItem> {
     let mut items: Vec<TextItem> = Vec::new();
     let mut spans: Vec<Span> = Vec::new();
@@ -491,13 +631,17 @@ fn row_text_item(
     let mut current_style: Option<(Rgb, bool, bool)> = None;
     let mut run_start: Option<usize> = None;
 
-    for (column, cell) in row.cells.iter().enumerate() {
-        // The spacer belongs to the preceding wide cell: it is painted as part of
-        // that cell's anchored segment and owns no segment of its own.
-        if cell.wide_spacer {
+    let mut column = 0;
+    while column < row.cells.len() {
+        // An orphan spacer owns no segment of its own: the wide cell it belongs to
+        // was never written, so there is nothing to paint.
+        if row.cells[column].wide_spacer {
+            column += 1;
             continue;
         }
-        if cell.wide || grid_anchor_required(cell.ch) {
+        let cluster = cluster_at(row, column, cell_width, measure);
+        column = cluster.column + cluster.columns;
+        if cluster.anchored {
             flush_clean_run(
                 &mut items,
                 &mut spans,
@@ -511,12 +655,12 @@ fn row_text_item(
                 cell_width,
             );
             items.push(anchored_item(
-                row_id, origin_x, y, column, cell, theme, clip, cell_width,
+                row_id, origin_x, y, &cluster, theme, clip, cell_width,
             ));
             continue;
         }
-        run_start.get_or_insert(column);
-        let (foreground, bold, italic) = cell_style(cell, theme);
+        run_start.get_or_insert(cluster.column);
+        let (foreground, bold, italic) = cell_style(cluster.base, theme);
         let style = (foreground, bold, italic);
         if current_style != Some(style) {
             if let Some((color, bold, italic)) = current_style
@@ -531,11 +675,7 @@ fn row_text_item(
             }
             current_style = Some(style);
         }
-        if cell.flags.hidden {
-            current.push(' ');
-        } else {
-            current.push(cell.ch);
-        }
+        current.push_str(&cluster.text);
     }
     flush_clean_run(
         &mut items,
@@ -589,30 +729,36 @@ fn flush_clean_run(
     }
 }
 
-/// Builds the grid-anchored item for one wide or fallback cell.
+/// Builds the grid-anchored item for one cluster.
 ///
-/// The text is the character alone: the item's own columns already reserve the
-/// space a wide glyph needs, so no filler is appended.
-#[allow(clippy::too_many_arguments)]
+/// The text is the whole cluster and nothing else: the item's own columns already
+/// reserve the space a wide glyph needs, so no filler is appended.
 fn anchored_item(
     row_id: u64,
     origin_x: i32,
     y: i32,
-    column: usize,
-    cell: &CellSnapshot,
+    cluster: &Cluster<'_>,
     theme: &Palette,
     clip: Rect,
     cell_width: f32,
 ) -> TextItem {
-    let (color, bold, italic) = cell_style(cell, theme);
-    let ch = if cell.flags.hidden { ' ' } else { cell.ch };
-    let columns = if cell.wide { 2 } else { 1 };
-    let background = cell_column_clip(origin_x, y, column, columns, cell_width, clip);
+    let (color, bold, italic) = cell_style(cluster.base, theme);
+    let background = cell_column_clip(
+        origin_x,
+        y,
+        cluster.column,
+        cluster.columns,
+        cell_width,
+        clip,
+    );
     TextItem {
-        id: segment_id(row_id, column),
-        position: (origin_x as f32 + column as f32 * cell_width, y as f32),
+        id: segment_id(row_id, cluster.column),
+        position: (
+            origin_x as f32 + cluster.column as f32 * cell_width,
+            y as f32,
+        ),
         spans: vec![Span {
-            text: ch.to_string(),
+            text: cluster.text.clone(),
             color: rgba(color, 1.0),
             bold,
             italic,
@@ -865,14 +1011,44 @@ pub fn flags_of(cell: &CellSnapshot) -> CellFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astraterm_config::schema::FontConfig;
     use astraterm_terminal::TerminalEngine;
     use astraterm_terminal::engine::EngineOptions;
+    use cosmic_text::FontSystem;
 
-    fn metrics() -> CellMetrics {
-        CellMetrics {
-            width: 10.0,
-            height: 20,
-            baseline: 15.0,
+    use crate::text::{ClusterMeasurer, ClusterWidths, TextStyle};
+
+    /// The font the tests measure with, plus its advance cache.
+    ///
+    /// Anchoring comes from measurement (S8), so the grid these tests assert against
+    /// has to be the measured one: a hardcoded cell width that disagreed with the
+    /// font would anchor every ASCII cluster and make the split assertions mean
+    /// nothing.
+    struct TestFont {
+        system: FontSystem,
+        style: TextStyle,
+        widths: ClusterWidths,
+    }
+
+    impl TestFont {
+        /// The shipped default font configuration.
+        fn new() -> Self {
+            let mut system = FontSystem::new();
+            let style = TextStyle::new(&FontConfig::default(), 1.0, &mut system);
+            Self {
+                system,
+                style,
+                widths: ClusterWidths::new(),
+            }
+        }
+
+        /// Cell metrics and a measurer for painting one row or pane.
+        fn painter(&mut self) -> (CellMetrics, ClusterMeasurer<'_>) {
+            let cell = self.style.cell;
+            (
+                cell,
+                ClusterMeasurer::new(&mut self.system, &self.style, &mut self.widths),
+            )
         }
     }
 
@@ -894,17 +1070,20 @@ mod tests {
     fn pane_background_and_border_are_painted() {
         let mut scene = Scene::default();
         let snapshot = snapshot("hi", 10, 2);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
         paint_pane(
             &mut scene,
             0,
             Rect::new(0, 0, 200, 100),
             &snapshot,
             &theme(),
-            metrics(),
+            metrics,
             PaintOptions {
                 focused: true,
                 ..Default::default()
             },
+            &mut measure,
         );
         assert!(
             scene.quads.len() >= 5,
@@ -935,13 +1114,15 @@ mod tests {
     fn the_border_stays_opaque_when_the_pane_background_is_transparent() {
         let mut scene = Scene::default();
         let snapshot = snapshot("x", 5, 1);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
         paint_pane(
             &mut scene,
             0,
             Rect::new(0, 0, 100, 40),
             &snapshot,
             &theme(),
-            metrics(),
+            metrics,
             PaintOptions {
                 background_alpha: 0.0,
                 focused: true,
@@ -949,6 +1130,7 @@ mod tests {
                 draw_cursor: false,
                 ..Default::default()
             },
+            &mut measure,
         );
         let edges: Vec<&Quad> = scene
             .quads
@@ -973,17 +1155,20 @@ mod tests {
         let mut focused = Scene::default();
         let mut unfocused = Scene::default();
         let snapshot = snapshot("x", 5, 1);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
         paint_pane(
             &mut focused,
             0,
             Rect::new(0, 0, 50, 20),
             &snapshot,
             &theme(),
-            metrics(),
+            metrics,
             PaintOptions {
                 focused: true,
                 ..Default::default()
             },
+            &mut measure,
         );
         paint_pane(
             &mut unfocused,
@@ -991,11 +1176,12 @@ mod tests {
             Rect::new(0, 0, 50, 20),
             &snapshot,
             &theme(),
-            metrics(),
+            metrics,
             PaintOptions {
                 focused: false,
                 ..Default::default()
             },
+            &mut measure,
         );
         assert_ne!(focused.quads[0].color, unfocused.quads[0].color);
     }
@@ -1031,6 +1217,8 @@ mod tests {
     #[test]
     fn hidden_cells_render_as_spaces() {
         let snapshot = snapshot("\x1b[8msecret\x1b[0m", 10, 1);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
         let items = row_text_item(
             0,
             0,
@@ -1038,7 +1226,8 @@ mod tests {
             &snapshot.lines[0],
             &theme(),
             Rect::new(0, 0, 100, 20),
-            metrics().width,
+            metrics.width,
+            &mut measure,
         );
         assert_eq!(items.len(), 1, "hidden one-column cells stay one run");
         let text: String = items[0]
@@ -1053,6 +1242,8 @@ mod tests {
     #[test]
     fn adjacent_cells_with_the_same_style_share_one_span() {
         let snapshot = snapshot("abcdef", 10, 1);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
         let items = row_text_item(
             0,
             0,
@@ -1060,7 +1251,8 @@ mod tests {
             &snapshot.lines[0],
             &theme(),
             Rect::new(0, 0, 100, 20),
-            metrics().width,
+            metrics.width,
+            &mut measure,
         );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].spans.len(), 1);
@@ -1070,6 +1262,8 @@ mod tests {
     #[test]
     fn style_changes_split_spans() {
         let snapshot = snapshot("\x1b[31mred\x1b[32mgreen\x1b[0m", 20, 1);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
         let items = row_text_item(
             0,
             0,
@@ -1077,7 +1271,8 @@ mod tests {
             &snapshot.lines[0],
             &theme(),
             Rect::new(0, 0, 200, 20),
-            metrics().width,
+            metrics.width,
+            &mut measure,
         );
         let item = &items[0];
         assert!(item.spans.len() >= 2, "each colour becomes its own span");
@@ -1099,7 +1294,9 @@ mod tests {
         // wider), and `cd` is the next clean run, starting at column 3, so `d`
         // lands on column 4 without any filler.
         let snapshot = snapshot("ab⏱cd", 10, 1);
-        let cell_width = 10.0;
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
+        let cell_width = metrics.width;
         let origin_x = 4;
         let items = row_text_item(
             3,
@@ -1109,6 +1306,7 @@ mod tests {
             &theme(),
             Rect::new(0, 0, 100, 20),
             cell_width,
+            &mut measure,
         );
         let starts: Vec<usize> = items
             .iter()
@@ -1136,12 +1334,23 @@ mod tests {
         // The anchored segment is clipped to its own column plus one cell of
         // slack, so a fallback glyph wider than the reserved column is not cut.
         let anchored = &items[1];
-        assert_eq!(anchored.clip, Rect::new(24, 0, 20, 20));
+        assert_eq!(
+            anchored.clip,
+            Rect::new(
+                origin_x + (2.0 * cell_width) as i32,
+                0,
+                (2.0 * cell_width).ceil() as u32,
+                20
+            )
+        );
     }
 
     #[test]
     fn wide_glyphs_own_their_segments_without_filler_spaces() {
         let snapshot = snapshot("你好AB", 10, 1);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
+        let cell_width = metrics.width;
         let items = row_text_item(
             0,
             0,
@@ -1149,19 +1358,28 @@ mod tests {
             &snapshot.lines[0],
             &theme(),
             Rect::new(0, 0, 100, 20),
-            10.0,
+            cell_width,
+            &mut measure,
         );
         assert_eq!(items.len(), 3, "two wide segments plus the ASCII run");
         assert_eq!(items[0].position.0, 0.0);
         assert_eq!(segment_text(&items[0]), "你");
-        assert_eq!(items[1].position.0, 20.0);
+        assert_eq!(items[1].position.0, 2.0 * cell_width);
         assert_eq!(segment_text(&items[1]), "好");
-        assert_eq!(items[2].position.0, 40.0);
+        assert_eq!(items[2].position.0, 4.0 * cell_width);
         assert!(segment_text(&items[2]).starts_with("AB"));
         // Each wide glyph is clipped to the two columns it owns plus the one
         // spare cell.
-        assert_eq!(items[0].clip, Rect::new(0, 0, 30, 20));
-        assert_eq!(items[1].clip, Rect::new(20, 0, 30, 20));
+        let clip_of = |column: usize| {
+            Rect::new(
+                (column as f32 * cell_width) as i32,
+                0,
+                (3.0 * cell_width).ceil() as u32,
+                20,
+            )
+        };
+        assert_eq!(items[0].clip, clip_of(0));
+        assert_eq!(items[1].clip, clip_of(2));
         for item in &items {
             let text = segment_text(item);
             assert!(
@@ -1180,8 +1398,19 @@ mod tests {
         // S6: the common row must behave exactly as before the split, including
         // keeping the whole-row identifier the cache was keyed by.
         let snapshot = snapshot("plain", 10, 1);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
         let clip = Rect::new(0, 0, 100, 20);
-        let items = row_text_item(7, 4, 0, &snapshot.lines[0], &theme(), clip, 10.0);
+        let items = row_text_item(
+            7,
+            4,
+            0,
+            &snapshot.lines[0],
+            &theme(),
+            clip,
+            metrics.width,
+            &mut measure,
+        );
         assert_eq!(items.len(), 1);
         let item = &items[0];
         assert_eq!(item.spans.len(), 1);
@@ -1208,24 +1437,160 @@ mod tests {
     }
 
     #[test]
-    fn grid_anchor_required_covers_fallback_ranges() {
+    fn the_codepoint_list_only_recognises_continuations() {
+        // S7: the list decides whether the next cell still belongs to the cluster
+        // being painted. Anchoring is measured (S8), so no test here asks a
+        // codepoint whether it anchors: `grid_anchor_required` no longer exists.
         for c in [
+            '\u{FE0E}',  // text presentation selector
             '\u{FE0F}',  // emoji presentation selector
-            '\u{1F4C1}', // file folder (emoji fallback)
-            '\u{1F680}', // rocket
-            '\u{23F1}',  // stopwatch
-            '\u{2705}',  // white heavy check mark
-            '\u{2B1B}',  // black large square
+            '\u{200D}',  // zero-width joiner
+            '\u{20E3}',  // keycap
+            '\u{1F3FD}', // skin-tone modifier
+            '\u{E0067}', // tag character
+            '\u{0301}',  // combining acute
+            '\u{094D}',  // devanagari virama
+            '\u{20D0}',  // combining mark for symbols
         ] {
-            assert!(grid_anchor_required(c), "U+{:04X} must anchor", c as u32);
+            assert!(cluster_continuation(c), "U+{:04X} continues a cluster", c as u32);
         }
-        for c in ['a', ' ', 'Z', '0', '你', 'é', '│', '─'] {
+        for c in ['a', ' ', 'Z', '0', '你', 'क', '❤', '\u{1F44D}', '│', '─'] {
             assert!(
-                !grid_anchor_required(c),
-                "U+{:04X} must not anchor",
+                !cluster_continuation(c),
+                "U+{:04X} starts a cluster",
                 c as u32
             );
         }
+        // A regional indicator is a base: the pair rule only absorbs the second
+        // half of a flag, never a third indicator.
+        assert!(regional_indicator('\u{1F1EA}'));
+        assert!(!cluster_continuation('\u{1F1EA}'));
+    }
+
+    #[test]
+    fn a_skin_tone_modifier_stays_in_its_base_segment() {
+        // S7: the model stores the modifier in a wide cell of its own, so deciding
+        // per cell shaped `👍` and `🏽` as two glyphs. One item must carry both.
+        let snapshot = snapshot("\u{1F44D}\u{1F3FD}", 4, 1);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
+        let cell_width = metrics.width;
+        let items = row_text_item(
+            0,
+            0,
+            0,
+            &snapshot.lines[0],
+            &theme(),
+            Rect::new(0, 0, 200, 20),
+            cell_width,
+            &mut measure,
+        );
+        assert_eq!(items.len(), 1, "base and modifier are one segment");
+        let item = &items[0];
+        assert_eq!(segment_text(item), "\u{1F44D}\u{1F3FD}");
+        assert_eq!(item.position, (0.0, 0.0));
+        assert_eq!(item.spans.len(), 1);
+        // The cluster owns the four columns the model reserved (base, its spacer,
+        // the modifier in its own wide cell, its spacer) plus one cell of slack.
+        assert_eq!(item.clip.width, (5.0 * cell_width).ceil() as u32);
+    }
+
+    #[test]
+    fn a_regional_indicator_pair_stays_one_segment() {
+        // S7: the two halves are one-column cells, so a per-cell split drew a pair
+        // of indicator letters instead of the flag.
+        let snapshot = snapshot("\u{1F1EA}\u{1F1F8}", 2, 1);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
+        let cell_width = metrics.width;
+        let items = row_text_item(
+            0,
+            0,
+            0,
+            &snapshot.lines[0],
+            &theme(),
+            Rect::new(0, 0, 200, 20),
+            cell_width,
+            &mut measure,
+        );
+        assert_eq!(items.len(), 1, "the flag is one segment");
+        let item = &items[0];
+        assert_eq!(segment_text(item), "\u{1F1EA}\u{1F1F8}");
+        assert_eq!(item.position, (0.0, 0.0));
+        // Two reserved columns plus the one cell of slack.
+        assert_eq!(item.clip.width, (3.0 * cell_width).ceil() as u32);
+    }
+
+    #[test]
+    fn a_third_regional_indicator_starts_a_new_cluster() {
+        // A cluster holds one flag: the next pair must not be swept into the first.
+        let snapshot = snapshot("\u{1F1EA}\u{1F1F8}\u{1F1EB}\u{1F1F7}", 4, 1);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
+        let cell_width = metrics.width;
+        let items = row_text_item(
+            0,
+            0,
+            0,
+            &snapshot.lines[0],
+            &theme(),
+            Rect::new(0, 0, 200, 20),
+            cell_width,
+            &mut measure,
+        );
+        assert_eq!(items.len(), 2, "two flags, two segments");
+        assert_eq!(segment_text(&items[0]), "\u{1F1EA}\u{1F1F8}");
+        assert_eq!(items[0].position, (0.0, 0.0));
+        assert_eq!(segment_text(&items[1]), "\u{1F1EB}\u{1F1F7}");
+        assert_eq!(items[1].position, (2.0 * cell_width, 0.0));
+    }
+
+    #[test]
+    fn a_fallback_script_anchors_because_its_advance_is_measured() {
+        // S8: `क` is in no emoji or symbol block, so no codepoint list anchors it.
+        // Its shaped advance is 1.280 cells while the model reserves one, so it
+        // drifts exactly the way an emoji fallback does — and the measurement, not
+        // a list, is what splits the row here. ASCII in the same row, whose advance
+        // matches its column, stays in one run.
+        let snapshot = snapshot("\u{0915}\u{0915}\u{0915}ab", 10, 1);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
+        let cell_width = metrics.width;
+        let clip = Rect::new(0, 0, 200, 20);
+        assert!(
+            measure.advance("\u{0915}") - cell_width > ANCHOR_TOLERANCE,
+            "the fixture only proves anything if devanagari actually drifts"
+        );
+        assert!(
+            (measure.advance("a") - cell_width).abs() <= ANCHOR_TOLERANCE,
+            "ASCII advances exactly one cell, so it must not anchor"
+        );
+        let items = row_text_item(
+            0,
+            0,
+            0,
+            &snapshot.lines[0],
+            &theme(),
+            clip,
+            cell_width,
+            &mut measure,
+        );
+        assert_eq!(items.len(), 4, "three anchored clusters plus the ASCII run");
+        for (column, item) in items.iter().take(3).enumerate() {
+            assert_eq!(segment_text(item), "\u{0915}");
+            assert_eq!(item.position, (column as f32 * cell_width, 0.0));
+            assert!(
+                item.clip != clip,
+                "an anchored cluster is clipped to its own column"
+            );
+        }
+        // The ASCII run keeps the row clip and one span: it was never split, which
+        // is what proves the split came from measurement rather than a list.
+        let ascii = &items[3];
+        assert_eq!(ascii.position, (3.0 * cell_width, 0.0));
+        assert_eq!(ascii.clip, clip);
+        assert_eq!(ascii.spans.len(), 1);
+        assert!(segment_text(ascii).starts_with("ab"));
     }
 
     #[test]
@@ -1250,21 +1615,24 @@ mod tests {
         );
         let snapshot = engine.snapshot();
         let mut scene = Scene::default();
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
         paint_pane(
             &mut scene,
             0,
             Rect::new(0, 0, 200, 40),
             &snapshot,
             &theme(),
-            metrics(),
+            metrics,
             PaintOptions::default(),
+            &mut measure,
         );
         let highlight = scene
             .quads
             .iter()
             .find(|quad| quad.color == rgba(theme().selection_background, 1.0))
             .expect("selection highlight");
-        assert_eq!(highlight.rect.width, 50);
+        assert_eq!(highlight.rect.width, (5.0 * metrics.width).ceil() as u32);
         assert_eq!(
             highlight.rect.x, 1,
             "the pane border insets the grid by one pixel"
@@ -1274,6 +1642,8 @@ mod tests {
     #[test]
     fn cursor_is_painted_in_its_configured_shape() {
         let snapshot = snapshot("x", 5, 1);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
         let mut block = Scene::default();
         paint_pane(
             &mut block,
@@ -1281,11 +1651,13 @@ mod tests {
             Rect::new(0, 0, 100, 40),
             &snapshot,
             &theme(),
-            metrics(),
+            metrics,
             PaintOptions::default(),
+            &mut measure,
         );
         // The focused pane border shares the accent colour, so compare cell-sized
         // quads only.
+        let cell_width = metrics.width.ceil().max(1.0) as u32;
         let cell_quads = |scene: &Scene| -> Vec<Quad> {
             scene
                 .quads
@@ -1293,8 +1665,8 @@ mod tests {
                 .copied()
                 .filter(|quad| {
                     quad.color == rgba(theme().cursor, 1.0)
-                        && quad.rect.width <= 10
-                        && quad.rect.height <= 20
+                        && quad.rect.width <= cell_width
+                        && quad.rect.height <= metrics.height
                 })
                 .collect()
         };
@@ -1304,8 +1676,8 @@ mod tests {
             1,
             "block cursor draws exactly one filled cell quad"
         );
-        assert_eq!(block_quads[0].rect.width, 10);
-        assert_eq!(block_quads[0].rect.height, 20);
+        assert_eq!(block_quads[0].rect.width, cell_width);
+        assert_eq!(block_quads[0].rect.height, metrics.height);
 
         let mut beam = Scene::default();
         paint_pane(
@@ -1314,11 +1686,12 @@ mod tests {
             Rect::new(0, 0, 100, 40),
             &snapshot,
             &theme(),
-            metrics(),
+            metrics,
             PaintOptions {
                 cursor_override: Some(CursorVisual::Beam),
                 ..Default::default()
             },
+            &mut measure,
         );
         let beam_quads = cell_quads(&beam);
         assert_eq!(beam_quads.len(), 1);
@@ -1328,6 +1701,8 @@ mod tests {
     #[test]
     fn cursor_is_skipped_when_disabled() {
         let snapshot = snapshot("x", 5, 1);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
         let mut scene = Scene::default();
         paint_pane(
             &mut scene,
@@ -1335,20 +1710,22 @@ mod tests {
             Rect::new(0, 0, 100, 40),
             &snapshot,
             &theme(),
-            metrics(),
+            metrics,
             PaintOptions {
                 draw_cursor: false,
                 ..Default::default()
             },
+            &mut measure,
         );
         // Only the (same-coloured) focus border remains; no cell-sized cursor quad.
+        let cell_width = metrics.width.ceil().max(1.0) as u32;
         assert!(
             !scene
                 .quads
                 .iter()
                 .any(|quad| quad.color == rgba(theme().cursor, 1.0)
-                    && quad.rect.width <= 10
-                    && quad.rect.height <= 20),
+                    && quad.rect.width <= cell_width
+                    && quad.rect.height <= metrics.height),
             "no cursor cell is painted when the cursor is disabled"
         );
     }
@@ -1356,18 +1733,25 @@ mod tests {
     #[test]
     fn cell_backgrounds_are_batched_into_runs() {
         let snapshot = snapshot("\x1b[41mred bg\x1b[0m", 20, 1);
+        let mut font = TestFont::new();
+        let (metrics, _) = font.painter();
         let mut scene = Scene::default();
-        paint_cell_backgrounds(&mut scene, (0, 0), &snapshot, &theme(), metrics(), 1);
+        paint_cell_backgrounds(&mut scene, (0, 0), &snapshot, &theme(), metrics, 1);
         assert_eq!(scene.quads.len(), 1);
         assert_eq!(scene.quads[0].color, rgba(theme().ansi[1], 1.0));
-        assert_eq!(scene.quads[0].rect.width, 60);
+        assert_eq!(
+            scene.quads[0].rect.width,
+            (6.0 * metrics.width).ceil().max(1.0) as u32
+        );
     }
 
     #[test]
     fn underline_draws_a_quad() {
         let snapshot = snapshot("\x1b[4munder\x1b[0m", 10, 1);
+        let mut font = TestFont::new();
+        let (metrics, _) = font.painter();
         let mut scene = Scene::default();
-        paint_cell_backgrounds(&mut scene, (0, 0), &snapshot, &theme(), metrics(), 1);
+        paint_cell_backgrounds(&mut scene, (0, 0), &snapshot, &theme(), metrics, 1);
         assert!(!scene.quads.is_empty());
     }
 

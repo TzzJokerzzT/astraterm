@@ -154,6 +154,8 @@ pub struct Renderer {
     /// font system, swash cache, row cache and viewport stay shared.
     overlay_text: TextRenderer,
     rows: text::RowCache,
+    /// Measured cluster advances that decide which clusters are grid-anchored.
+    widths: text::ClusterWidths,
     style: TextStyle,
     size: Size,
     window: Arc<Window>,
@@ -272,6 +274,7 @@ impl Renderer {
             text_renderer,
             overlay_text,
             rows: text::RowCache::new(),
+            widths: text::ClusterWidths::new(),
             style,
             size: initial_size,
             window,
@@ -301,6 +304,17 @@ impl Renderer {
         self.style.scale
     }
 
+    /// Measurement service for painting: shaped cluster advances under the current
+    /// font.
+    ///
+    /// The anchoring decision belongs to painting (it splits rows into segments) but
+    /// needs the shaped advance, so the renderer lends its font system, style and
+    /// advance cache to whoever composes a frame. One service is enough for a whole
+    /// frame: the cache keeps repeated clusters to a map lookup.
+    pub fn measure(&mut self) -> text::ClusterMeasurer<'_> {
+        text::ClusterMeasurer::new(&mut self.font_system, &self.style, &mut self.widths)
+    }
+
     /// Reacts to a window resize by reconfiguring the surface.
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
         if size.width == 0 || size.height == 0 {
@@ -316,6 +330,7 @@ impl Renderer {
     pub fn set_font(&mut self, font: &FontConfig) {
         self.style = TextStyle::new(font, self.style.scale, &mut self.font_system);
         self.rows.clear();
+        self.widths.clear();
         self.window.request_redraw();
     }
 
@@ -323,6 +338,7 @@ impl Renderer {
     pub fn set_scale(&mut self, scale: f32, font: &FontConfig) {
         self.style = TextStyle::new(font, scale, &mut self.font_system);
         self.rows.clear();
+        self.widths.clear();
         self.window.request_redraw();
     }
 
@@ -556,6 +572,9 @@ impl Renderer {
     /// `from..to` is the layer's slice of the combined instance buffer; the ranges
     /// are rebased because each layer draws from its own buffer.
     /// Drops cached shaped rows (used after a theme change that alters colours).
+    ///
+    /// Measured cluster advances survive: they depend on the font, not on colour, and
+    /// are keyed by the shaping style anyway.
     pub fn invalidate_text_cache(&mut self) {
         self.rows.clear();
     }

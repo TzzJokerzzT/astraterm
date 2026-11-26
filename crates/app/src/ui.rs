@@ -710,6 +710,7 @@ impl WindowUi {
                 &self.theme.palette,
                 self.metrics,
                 options,
+                &mut self.renderer.measure(),
             );
 
             // Images are anchored to buffer lines, so they are drawn from the
@@ -738,7 +739,7 @@ impl WindowUi {
     /// to its own rectangle (see [`upper_layer_clip`]), so no row of the floating
     /// terminal can paint outside its box.
     fn compose_upper_layer(
-        &self,
+        &mut self,
         sessions: &mut SessionManager,
         images: &BTreeMap<SessionId, SessionImages>,
     ) -> Option<Scene> {
@@ -759,7 +760,7 @@ impl WindowUi {
     /// behind it never shows through, and its rows are clipped to that box by
     /// `paint_pane`'s per-row text bounds.
     fn compose_floating(
-        &self,
+        &mut self,
         scene: &mut Scene,
         sessions: &mut SessionManager,
         images: &BTreeMap<SessionId, SessionImages>,
@@ -795,6 +796,7 @@ impl WindowUi {
             &self.theme.palette,
             self.metrics,
             options,
+            &mut self.renderer.measure(),
         );
         if let Some(anchored) = images.get(&session_id) {
             self.compose_images(scene, rect, true, &snapshot, anchored);
