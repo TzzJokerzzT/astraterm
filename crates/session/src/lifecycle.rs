@@ -84,11 +84,79 @@ fn shell_from_config(config: &Config) -> (String, Vec<String>) {
 }
 
 /// Builds a session specification from the configuration.
+///
+/// `cwd` is the directory a `current`/`inherit` policy resolves against. It is the
+/// CLI `--working-directory` for the first window and the parent pane's live
+/// directory for a split; on its own it never overrides the policy.
 pub fn session_spec(
     config: &Config,
     profile: Option<&Profile>,
     profile_id: Option<ProfileId>,
     cwd: Option<PathBuf>,
+    cols: u16,
+    rows: u16,
+    cell: (u16, u16),
+) -> SessionSpec {
+    let policy = working_directory_policy(config, profile);
+    let directory = resolve_directory(policy, cwd.as_deref())
+        .or(cwd)
+        .or_else(astraterm_config::schema::home_dir);
+    build_spec(config, profile, profile_id, directory, cols, rows, cell)
+}
+
+/// Builds the specification for a session created from an existing pane.
+///
+/// A pane opened from another pane — the floating terminal and a new tab — starts
+/// where that pane is *now*: the live directory ([`crate::manager::Session::cwd`],
+/// refreshed from the child's own process) outranks the
+/// `[terminal] working_directory` policy, and an explicit
+/// [`WorkingDirectory::Path`] still outranks both.
+///
+/// `live_cwd` must be the live value, never the directory the pane was created in.
+pub fn session_spec_inheriting(
+    config: &Config,
+    profile: Option<&Profile>,
+    profile_id: Option<ProfileId>,
+    live_cwd: Option<PathBuf>,
+    cols: u16,
+    rows: u16,
+    cell: (u16, u16),
+) -> SessionSpec {
+    let policy = working_directory_policy(config, profile);
+    let directory = inherited_directory(policy, live_cwd.as_deref())
+        .or_else(astraterm_config::schema::home_dir);
+    build_spec(config, profile, profile_id, directory, cols, rows, cell)
+}
+
+/// The policy in force for this session: the profile's, else `[terminal]`'s.
+fn working_directory_policy<'a>(
+    config: &'a Config,
+    profile: Option<&'a Profile>,
+) -> &'a WorkingDirectory {
+    profile
+        .and_then(|profile| profile.working_directory.as_ref())
+        .unwrap_or(&config.terminal.working_directory)
+}
+
+/// The directory a session created from another pane starts in.
+///
+/// The live directory outranks every policy, but never an explicit path: a
+/// configured directory is used as written, so `[terminal] working_directory =
+/// "/srv"` and a profile path keep pointing at themselves.
+fn inherited_directory(policy: &WorkingDirectory, live: Option<&Path>) -> Option<PathBuf> {
+    if matches!(policy, WorkingDirectory::Path(_)) {
+        return resolve_directory(policy, live);
+    }
+    live.filter(|path| path.is_dir())
+        .map(Path::to_path_buf)
+        .or_else(|| resolve_directory(policy, live))
+}
+
+fn build_spec(
+    config: &Config,
+    profile: Option<&Profile>,
+    profile_id: Option<ProfileId>,
+    directory: Option<PathBuf>,
     cols: u16,
     rows: u16,
     cell: (u16, u16),
@@ -108,13 +176,6 @@ pub fn session_spec(
             env.insert(key.clone(), value.clone());
         }
     }
-
-    let directory = profile
-        .and_then(|profile| profile.working_directory.as_ref())
-        .or(Some(&config.terminal.working_directory))
-        .and_then(|policy| resolve_directory(policy, cwd.as_deref()))
-        .or(cwd)
-        .or_else(astraterm_config::schema::home_dir);
 
     let scrollback = config.terminal.scrollback_lines;
     let startup_input = profile.and_then(|profile| profile.startup_command.clone());
@@ -148,6 +209,8 @@ pub fn session_spec(
     }
 }
 
+/// Resolves a policy against `current` and falls back to home when the result is
+/// not an existing directory.
 fn resolve_directory(policy: &WorkingDirectory, current: Option<&Path>) -> Option<PathBuf> {
     let resolved = policy.resolve(current)?;
     if resolved.is_dir() {
@@ -250,6 +313,136 @@ mod tests {
         assert_ne!(
             spec.pty.cwd.as_deref(),
             Some(std::path::Path::new("/definitely/gone"))
+        );
+    }
+
+    #[test]
+    fn the_floating_terminal_starts_in_the_panes_live_directory() {
+        // `open_floating` passes the focused pane's live cwd. The default policy is
+        // `home`, which must not win over it (S1, S4).
+        let live = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let spec = session_spec_inheriting(
+            &config,
+            None,
+            None,
+            Some(live.path().to_path_buf()),
+            80,
+            24,
+            (8, 16),
+        );
+        assert_eq!(spec.pty.cwd.as_deref(), Some(live.path()));
+    }
+
+    #[test]
+    fn a_new_tab_starts_in_the_panes_live_directory() {
+        // `open_tab` passes the focused pane's live cwd and its profile; a profile
+        // without a `working_directory` leaves the default `home` policy in force
+        // (S3, S4).
+        let live = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let profile = Profile::new("work");
+        let spec = session_spec_inheriting(
+            &config,
+            Some(&profile),
+            None,
+            Some(live.path().to_path_buf()),
+            80,
+            24,
+            (8, 16),
+        );
+        assert_eq!(spec.pty.cwd.as_deref(), Some(live.path()));
+    }
+
+    #[test]
+    fn an_explicit_path_wins_over_the_panes_live_directory() {
+        // An explicit `WorkingDirectory::Path` still outranks the live directory
+        // (S4), whether it comes from `[terminal]` or from the profile.
+        let live = tempfile::tempdir().unwrap();
+        let configured = tempfile::tempdir().unwrap();
+        let profile_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.terminal.working_directory = WorkingDirectory::Path(configured.path().to_path_buf());
+        let spec = session_spec_inheriting(
+            &config,
+            None,
+            None,
+            Some(live.path().to_path_buf()),
+            80,
+            24,
+            (8, 16),
+        );
+        assert_eq!(spec.pty.cwd.as_deref(), Some(configured.path()));
+
+        let mut profile = Profile::new("work");
+        profile.working_directory = Some(WorkingDirectory::Path(profile_dir.path().to_path_buf()));
+        let spec = session_spec_inheriting(
+            &config,
+            Some(&profile),
+            None,
+            Some(live.path().to_path_buf()),
+            80,
+            24,
+            (8, 16),
+        );
+        assert_eq!(spec.pty.cwd.as_deref(), Some(profile_dir.path()));
+    }
+
+    #[test]
+    fn a_deleted_live_directory_falls_back_to_the_configured_policy() {
+        let config = Config::default();
+        let spec = session_spec_inheriting(
+            &config,
+            None,
+            None,
+            Some(PathBuf::from("/definitely/gone")),
+            80,
+            24,
+            (8, 16),
+        );
+        assert_eq!(
+            spec.pty.cwd,
+            astraterm_config::schema::home_dir().filter(|home| home.is_dir())
+        );
+    }
+
+    #[test]
+    fn a_split_still_resolves_a_current_policy_to_the_panes_live_directory() {
+        // PRESERVE: `split_pane` keeps passing the parent's directory as the
+        // directory a `current`/`inherit` policy resolves against.
+        let live = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.terminal.working_directory = WorkingDirectory::Policy("current".to_owned());
+        let spec = session_spec(
+            &config,
+            None,
+            None,
+            Some(live.path().to_path_buf()),
+            80,
+            24,
+            (8, 16),
+        );
+        assert_eq!(spec.pty.cwd.as_deref(), Some(live.path()));
+    }
+
+    #[test]
+    fn the_first_window_keeps_using_the_configured_policy() {
+        // PRESERVE: `fresh_workspace` passes `--working-directory`, and the default
+        // `home` policy still ignores it, exactly as before.
+        let cli = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let spec = session_spec(
+            &config,
+            None,
+            None,
+            Some(cli.path().to_path_buf()),
+            80,
+            24,
+            (8, 16),
+        );
+        assert_eq!(
+            spec.pty.cwd,
+            astraterm_config::schema::home_dir().filter(|home| home.is_dir())
         );
     }
 

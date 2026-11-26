@@ -203,7 +203,7 @@ The shell, emulation and session behaviour.
 | `kitty_keyboard` | bool | `true` | `true`, `false` | Advertises and honours the Kitty keyboard protocol: `CSI ? u` is answered with the active flags, `CSI = u` / `CSI > u` / `CSI < u` set, push and pop them, and keys are encoded in the kitty form while flags are active. Off, keys use the xterm encodings. Needs a new session. |
 | `images` | bool | `false` | `true`, `false` | Decodes and draws images sent as kitty graphics, iTerm2 `OSC 1337` or sixel, anchored to the grid. Off, the sequences are still captured by the scanner but dropped without being decoded. Read on every output pump, so it applies live; turning it off drops already-decoded images. |
 | `scrollback_lines` | integer | `10000` | 100–1,000,000; outside is an error | History lines kept per session (bounded memory per pane). Fixed when the session is created. |
-| `working_directory` | string | `"home"` | `"home"`, `"current"`, `"inherit"`, `""`, or an absolute path | Directory a new session starts in. `home`/`""` = `$HOME`; `current`/`inherit` = the directory of the pane the session is created from (or `--working-directory`); an absolute path is used as written. A relative value that is not a policy is an error; a configured directory that does not exist warns and the session falls back to `$HOME`, then to the pane's directory. Needs a new session. |
+| `working_directory` | string | `"home"` | `"home"`, `"current"`, `"inherit"`, `""`, or an absolute path | Directory a new session starts in, in this precedence: an absolute path is used as written and outranks everything; otherwise a pane created from another pane — a new tab or the floating terminal — starts in that pane's live directory, so a `cd` in the parent is inherited; otherwise the policy applies: `home`/`""` = `$HOME`, `current`/`inherit` = the directory of the pane the session is created from (or `--working-directory`). A relative value that is not a policy is an error; a configured directory that does not exist warns and the session falls back to `$HOME`, then to the pane's directory. Needs a new session. |
 | `confirm_on_close` | bool | `true` | `true`, `false` | Asks before closing a pane or tab whose child is still running, and before quitting with live sessions. Read at the moment of the action, so it applies live. |
 | `copy_on_select` | bool | `false` | `true`, `false` | Copies the selection to the system clipboard (the same one `copy` fills) as soon as a mouse selection ends. Applies live. |
 | `open_urls_on_click` | bool | `true` | `true`, `false` | Enables Ctrl+click on a detected `http`/`https` URL, which opens it with `xdg-open`; a plain click never opens anything. Applies live. |
@@ -221,6 +221,7 @@ Typography. Every key here applies live.
 | `line_height` | float | `1.15` | 0.8–3.0; outside is an error | Row height as a multiple of `size`, rounded to whole pixels. |
 | `letter_spacing` | float | `0.0` | −5–20; outside is an error | Extra tracking between shaped clusters, in pixels. Unlike `size`, it is **not** multiplied by the display scale. |
 | `ligatures` | bool | `false` | `true`, `false` | Enables the font's `liga` and `calt` features. Off, both are explicitly disabled so a cell never depends on a glyph substitution. |
+| `integer_cell_width` | bool | `false` | `true`, `false` | Makes the cell advance a whole number of pixels by rasterising the font at the slightly larger size whose advance rounds to that width, so the grid and the shaper agree. On, block glyphs (`█ ▓ ▒ ░`) no longer antialias their edge against the pixel grid, which removes the dark seam between the steps of a gradient drawn with them. Off, the measured advance is used as is. Applies live. |
 | `fallbacks` | array of strings | `["JetBrains Mono", "Symbols Nerd Font", "Noto Color Emoji", "DejaVu Sans Mono", "monospace"]` | any strings | **Accepted but not read.** Missing glyphs are resolved by cosmic-text through the system font database; this list is never passed to the shaper. |
 
 ### `[appearance]`
@@ -380,7 +381,7 @@ created from it; there is no implicit default profile.
 | `shell` | string | `""` | `""`, `"auto"`, a program name or an absolute path | Shell override for this profile's sessions. Empty or `auto` uses `[terminal] shell`, and `args` below then applies to that shell instead. |
 | `args` | array of strings | `[]` | any strings | Arguments for the profile's shell. With an empty `shell` they are passed to the global shell (replacing `terminal.shell_args`). Ignored when `command` is set, which warns. |
 | `command` | array of strings | `[]` | a non-empty array is an argument vector: first element the program, the rest its arguments | Runs that vector directly instead of a shell; no shell interprets it. `sh -c` patterns warn. |
-| `working_directory` | string | unset | same values as `[terminal] working_directory` | Directory for this profile's sessions; unset falls back to `[terminal] working_directory`. |
+| `working_directory` | string | unset | same values as `[terminal] working_directory` | Directory for this profile's sessions; unset falls back to `[terminal] working_directory`. An explicit path here also outranks the directory a pane inherits from its parent. |
 | `env` | table of strings | `{}` | any string keys and values | Extra environment variables for this profile's sessions, merged after the inherited environment and after the variables AstraTerm sets (`TERM`, `COLORTERM`, `ASTRATERM`, `ASTRATERM_VERSION`), so a profile can override `TERM`. |
 | `startup_command` | string | unset | any string | Text typed into the PTY as keystrokes once the shell has started; never executed through `sh -c`. Useful for `nvim .`, `lazygit` or `ssh host`. |
 | `theme` | string | unset | any string | **Accepted but not applied.** Validated only for being a string; no code reads it. |
@@ -563,6 +564,7 @@ weight = 400                # 100-900 in steps of 100
 line_height = 1.2           # row height as a multiple of size (0.8-3.0)
 letter_spacing = 0.0        # extra tracking in pixels (-5 to 20)
 ligatures = false           # enable the font's liga/calt features
+integer_cell_width = false  # stretch the font so a cell is a whole pixel wide
 fallbacks = ["JetBrains Mono", "Noto Color Emoji", "monospace"]  # accepted; not read
 
 [appearance]
@@ -701,6 +703,20 @@ The units are not uniform across the file:
 
 Copying a config from another terminal is the most common reason a font or a
 padding value "looks wrong".
+
+### Whole-pixel cells
+
+`font.integer_cell_width = true` stretches the font so the cell advance is a
+whole pixel. Rounding the grid width alone would not do: the grid would step 11
+pixels per column while the shaper still advanced 10.8, and every row would drift
+away from the grid again. Instead the font is measured, scaled by
+`round(advance) / advance`, and measured again, and the shaping metrics come from
+that second measurement.
+
+The visible cost is the size. With the shipped default config the advance rises
+from 7.8 px to 8 px, which is the same font at about 13.33 instead of 13, so text
+is very slightly larger and slightly fewer columns fit: a 2490 px pane goes from
+319 columns to 311. The row height is rounded, so it usually does not change.
 
 ## See also
 

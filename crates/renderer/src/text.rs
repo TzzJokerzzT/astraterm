@@ -37,8 +37,7 @@ impl TextStyle {
     /// Builds a style from configuration and measures its cell metrics.
     pub fn new(font: &FontConfig, scale: f32, font_system: &mut FontSystem) -> Self {
         let scale = scale.max(0.1);
-        let metrics = Metrics::new(font.size * scale, (font.size * font.line_height) * scale);
-        let cell = measure_cell(font_system, font, scale);
+        let (metrics, cell) = measure_style(font_system, font, scale);
         Self {
             family: font.family.clone(),
             weight: Weight(font.weight),
@@ -357,6 +356,39 @@ pub fn font_features(ligatures: bool) -> FontFeatures {
     features
 }
 
+/// Shaping metrics and cell metrics for a font configuration.
+///
+/// With `integer_cell_width` off this is the historical measurement, untouched.
+///
+/// With it on, the grid width is rounded to a whole pixel *and the font is stretched
+/// to match*: rounding the grid alone would leave the shaper advancing the fractional
+/// width, and every row would walk away from the grid again, which is the drift
+/// [`crate::paint`] anchors rows to prevent. The font is therefore measured, scaled by
+/// `target / advance`, and measured again at the adjusted size; both the shaping
+/// metrics and the cell come from that second measurement, with the cell width set to
+/// the target exactly. The stretch is why the option is opt-in: it enlarges the font
+/// and costs a column or two on a wide pane.
+fn measure_style(
+    font_system: &mut FontSystem,
+    font: &FontConfig,
+    scale: f32,
+) -> (Metrics, CellMetrics) {
+    let natural = measure_cell(font_system, font, scale);
+    if !font.integer_cell_width {
+        let metrics = Metrics::new(font.size * scale, (font.size * font.line_height) * scale);
+        return (metrics, natural);
+    }
+    // `measure_cell` never reports less than one pixel, so the factor is finite.
+    let target = natural.width.round().max(1.0);
+    let mut cell = measure_cell(font_system, font, scale * (target / natural.width));
+    cell.width = target;
+    // `cell.baseline` is the adjusted font size, and `Renderer::cell_metrics()` along
+    // with the app's grid computation read the baseline as the size, so the shaping
+    // metrics take their size from it too.
+    let metrics = Metrics::new(cell.baseline, cell.baseline * font.line_height);
+    (metrics, cell)
+}
+
 /// Measures the cell advance, line height and baseline for a font configuration.
 ///
 /// Falls back to a conservative fixed cell when the font cannot be measured, so a
@@ -398,6 +430,7 @@ fn style_key(font: &FontConfig, scale: f32) -> u64 {
     font.line_height.to_bits().hash(&mut hasher);
     font.letter_spacing.to_bits().hash(&mut hasher);
     font.ligatures.hash(&mut hasher);
+    font.integer_cell_width.hash(&mut hasher);
     scale.to_bits().hash(&mut hasher);
     hasher.finish()
 }
@@ -557,6 +590,83 @@ mod tests {
     /// The shipped default font, whose advances the renderer measures in production.
     fn mono_font() -> FontConfig {
         FontConfig::default()
+    }
+
+    /// The shipped default font with whole-pixel cells requested.
+    fn integer_width_font() -> FontConfig {
+        FontConfig {
+            integer_cell_width: true,
+            ..mono_font()
+        }
+    }
+
+    #[test]
+    fn integer_cell_width_lands_the_cell_on_a_whole_pixel() {
+        let mut system = FontSystem::new();
+        let style = TextStyle::new(&integer_width_font(), 1.0, &mut system);
+        assert_eq!(
+            style.cell.width.fract(),
+            0.0,
+            "the toggle exists so a block glyph's edge lands on a pixel boundary, not at {}",
+            style.cell.width
+        );
+        assert!(style.cell.width >= 1.0);
+        // The grid reads the baseline as the font size, so shaping and the grid must
+        // still agree on it after the font is stretched.
+        assert_eq!(style.cell.baseline, style.metrics.font_size);
+    }
+
+    #[test]
+    fn integer_cell_width_keeps_the_shaped_advance_on_the_grid() {
+        let mut system = FontSystem::new();
+        let style = TextStyle::new(&integer_width_font(), 1.0, &mut system);
+        let mut cache = RowCache::new();
+        let scene = scene_with(11, "MMMMMMMMMM");
+        cache.update(&mut system, &style, &scene);
+        let buffer = &cache
+            .rows
+            .get(&11)
+            .expect("the row was shaped into the cache")
+            .buffer;
+        let run = buffer.layout_runs().next().expect("one shaped run");
+        // Ten ASCII cells: the grid advances `cell.width` per column, so the painted
+        // run has to advance exactly that much or the grid and the glyphs drift apart.
+        let advance = run.line_w / 10.0;
+        assert!(
+            (advance - style.cell.width).abs() <= 0.01,
+            "shaped advance {advance} against cell width {}",
+            style.cell.width
+        );
+    }
+
+    #[test]
+    fn without_the_option_the_cell_width_is_the_measured_one() {
+        let mut system = FontSystem::new();
+        let font = mono_font();
+        assert!(!font.integer_cell_width, "the option is off by default");
+        let style = TextStyle::new(&font, 1.0, &mut system);
+        let measured = measure_cell(&mut system, &font, 1.0);
+        assert_eq!(
+            style.cell, measured,
+            "off, the cell is exactly what measure_cell reports"
+        );
+        assert_eq!(style.metrics.font_size, font.size);
+        assert_eq!(
+            style.metrics.line_height,
+            font.size * font.line_height,
+            "off, the row height formula is unchanged"
+        );
+    }
+
+    #[test]
+    fn the_style_key_tracks_the_integer_cell_width_choice() {
+        let mut system = FontSystem::new();
+        let off = TextStyle::new(&mono_font(), 1.0, &mut system);
+        let on = TextStyle::new(&integer_width_font(), 1.0, &mut system);
+        assert_ne!(
+            off.key, on.key,
+            "toggling the option has to invalidate shaped rows"
+        );
     }
 
     #[test]

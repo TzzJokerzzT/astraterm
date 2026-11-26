@@ -182,6 +182,17 @@ pub struct FontConfig {
     /// Opt-in ligatures (`liga`/`calt`); off by default because the grid assumes
     /// the shaper can lay a row out without glyph substitution.
     pub ligatures: bool,
+    /// Keep the cell advance a whole number of pixels by stretching the font.
+    ///
+    /// A block glyph (`█ ▓ ▒ ░`) drawn at a fractional advance antialiases its edge
+    /// against the pixel grid instead of against the neighbouring colour, which puts
+    /// a dark seam between the steps of a gradient. On, the font is rasterised at the
+    /// size whose advance rounds to a whole pixel, and both the grid and the shaper are
+    /// built from that size, so a rounded width can never drift away from the shaped
+    /// one. The cost is the stretch: the font is a fraction larger, so a wide pane fits
+    /// a few columns fewer. Off, the measured advance is used exactly as it comes out
+    /// of the shaper.
+    pub integer_cell_width: bool,
     /// Additional families used when a glyph is missing from `family`.
     pub fallbacks: Vec<String>,
 }
@@ -195,6 +206,7 @@ impl Default for FontConfig {
             line_height: 1.15,
             letter_spacing: 0.0,
             ligatures: false,
+            integer_cell_width: false,
             fallbacks: vec![
                 "JetBrains Mono".to_owned(),
                 "Symbols Nerd Font".to_owned(),
@@ -534,6 +546,44 @@ mod tests {
                 "{policy:?} with a focused window"
             );
         }
+    }
+
+    #[test]
+    fn integer_cell_width_defaults_off_and_parses_when_asked() {
+        assert!(
+            !FontConfig::default().integer_cell_width,
+            "whole-pixel cells stretch the font, so they are opt-in"
+        );
+        assert!(!Config::default().font.integer_cell_width);
+
+        let config: Config = toml::from_str("[font]\ninteger_cell_width = true\n").unwrap();
+        assert!(config.font.integer_cell_width);
+
+        // Absent key and absent table both keep the default.
+        let config: Config = toml::from_str("[font]\nsize = 12.0\n").unwrap();
+        assert!(!config.font.integer_cell_width);
+        let config: Config = toml::from_str("[terminal]\nimages = true\n").unwrap();
+        assert!(!config.font.integer_cell_width);
+    }
+
+    #[test]
+    fn an_unknown_sibling_of_integer_cell_width_is_still_reported() {
+        let text = "[font]\ninteger_cell_width = true\ninteger_cell_hight = true\n";
+        let outcome = crate::loader::parse_str(text, "test").unwrap();
+        assert!(outcome.config.font.integer_cell_width);
+        assert!(
+            outcome
+                .issues
+                .iter()
+                .any(|issue| issue.field.contains("integer_cell_hight")),
+            "an unknown key still warns: {:?}",
+            outcome.issues
+        );
+        assert!(
+            outcome.validation().is_valid(),
+            "an unknown key stays a warning: {:?}",
+            outcome.issues
+        );
     }
 
     #[test]

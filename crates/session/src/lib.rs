@@ -11,5 +11,5 @@
 pub mod lifecycle;
 pub mod manager;
 
-pub use lifecycle::{SessionSpec, resolve_shell, session_spec};
+pub use lifecycle::{SessionSpec, resolve_shell, session_spec, session_spec_inheriting};
 pub use manager::{PumpReport, Session, SessionError, SessionManager};

@@ -6,6 +6,7 @@
 //! the configuration-watcher debounce.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -112,6 +113,15 @@ fn reload_feedback(outcome: &ReloadOutcome) -> Option<String> {
             None => "config error".to_owned(),
         }),
     }
+}
+
+/// Directory a pane created from another pane starts in.
+///
+/// The live value wins: `Pane::cwd` is written once when the pane is created and is
+/// never refreshed, while `Session::cwd` follows the child's own process. `recorded`
+/// is the fallback for a pane whose session is already gone.
+fn parent_directory(recorded: Option<PathBuf>, live: Option<PathBuf>) -> Option<PathBuf> {
+    live.or(recorded)
 }
 
 /// Events the application sends itself from other threads.
@@ -1284,30 +1294,60 @@ impl Application {
         });
     }
 
+    /// Live working directory of `pane`, falling back to the directory recorded
+    /// when the pane was created.
+    ///
+    /// `Session::cwd` is refreshed from `/proc/<pid>/cwd`, while `Pane::cwd` is
+    /// written once at creation: only the live value says where the user is now.
+    fn parent_live_cwd(&self, pane: Option<PaneId>, recorded: Option<PathBuf>) -> Option<PathBuf> {
+        let live = pane
+            .and_then(|pane| self.sessions.for_pane(pane))
+            .and_then(|session| session.cwd.clone());
+        parent_directory(recorded, live)
+    }
+
     fn open_tab(
         &mut self,
         window_id: WinitWindowId,
         profile: Option<ProfileId>,
     ) -> anyhow::Result<()> {
         let config = self.config.config().clone();
-        let Some((cols, rows, cell)) = self.windows.get(&window_id).map(|ui| {
-            let (cols, rows) = ui.grid_size(ui.terminal_rect());
-            (
-                cols,
-                rows,
+        let Some((cols, rows, cell, parent, recorded_cwd)) =
+            self.windows.get(&window_id).map(|ui| {
+                let (cols, rows) = ui.grid_size(ui.terminal_rect());
+                let parent = ui.focused_pane();
+                let recorded_cwd = parent
+                    .and_then(|pane| ui.panes.get(&pane))
+                    .and_then(|meta| meta.cwd.clone());
                 (
-                    ui.metrics.width.round().max(1.0) as u16,
-                    ui.metrics.height.max(1) as u16,
-                ),
-            )
-        }) else {
+                    cols,
+                    rows,
+                    (
+                        ui.metrics.width.round().max(1.0) as u16,
+                        ui.metrics.height.max(1) as u16,
+                    ),
+                    parent,
+                    recorded_cwd,
+                )
+            })
+        else {
             return Ok(());
         };
 
+        // A new tab starts where the pane it is opened from is now, not where that
+        // pane was created (S3, S4).
+        let live_cwd = self.parent_live_cwd(parent, recorded_cwd);
         let profile_ref =
             profile.and_then(|id| config.profiles.get(id.raw().saturating_sub(1) as usize));
-        let spec =
-            astraterm_session::session_spec(&config, profile_ref, profile, None, cols, rows, cell);
+        let spec = astraterm_session::session_spec_inheriting(
+            &config,
+            profile_ref,
+            profile,
+            live_cwd,
+            cols,
+            rows,
+            cell,
+        );
         let pane = PaneId::next();
         let session = self.sessions.create(pane, &spec, cols, rows)?;
 
@@ -1457,37 +1497,42 @@ impl Application {
     /// the size of the window, so it starts at the size it is drawn at.
     fn open_floating(&mut self, window_id: WinitWindowId) -> anyhow::Result<()> {
         let config = self.config.config().clone();
-        let Some((cols, rows, cell, cwd, profile_id)) = self.windows.get(&window_id).map(|ui| {
-            let (cols, rows) = ui.grid_size(crate::chrome::float_rect(ui.terminal_rect()));
-            let mosaic = ui.mosaic_pane();
-            let cwd = mosaic
-                .and_then(|pane| ui.panes.get(&pane))
-                .and_then(|meta| meta.cwd.clone());
-            let profile_id = mosaic
-                .and_then(|pane| ui.panes.get(&pane))
-                .and_then(|meta| meta.profile);
-            (
-                cols,
-                rows,
+        let Some((cols, rows, cell, mosaic, recorded_cwd, profile_id)) =
+            self.windows.get(&window_id).map(|ui| {
+                let (cols, rows) = ui.grid_size(crate::chrome::float_rect(ui.terminal_rect()));
+                let mosaic = ui.mosaic_pane();
+                let recorded_cwd = mosaic
+                    .and_then(|pane| ui.panes.get(&pane))
+                    .and_then(|meta| meta.cwd.clone());
+                let profile_id = mosaic
+                    .and_then(|pane| ui.panes.get(&pane))
+                    .and_then(|meta| meta.profile);
                 (
-                    ui.metrics.width.round().max(1.0) as u16,
-                    ui.metrics.height.max(1) as u16,
-                ),
-                cwd,
-                profile_id,
-            )
-        }) else {
+                    cols,
+                    rows,
+                    (
+                        ui.metrics.width.round().max(1.0) as u16,
+                        ui.metrics.height.max(1) as u16,
+                    ),
+                    mosaic,
+                    recorded_cwd,
+                    profile_id,
+                )
+            })
+        else {
             return Ok(());
         };
 
+        // The floating terminal opens where the pane behind it is now (S1, S4).
+        let live_cwd = self.parent_live_cwd(mosaic, recorded_cwd);
         let profile_ref =
             profile_id.and_then(|id| config.profiles.get(id.raw().saturating_sub(1) as usize));
         let pane = PaneId::next();
-        let spec = astraterm_session::session_spec(
+        let spec = astraterm_session::session_spec_inheriting(
             &config,
             profile_ref,
             profile_id,
-            cwd.clone(),
+            live_cwd,
             cols,
             rows,
             cell,
@@ -1497,7 +1542,7 @@ impl Application {
         // The metadata and the binding keep the floating session in the window's
         // lifecycle: closing or destroying the window closes it like any other pane.
         let mut meta = Pane::new(pane);
-        meta.cwd = cwd;
+        meta.cwd = spec.pty.cwd.clone();
         meta.profile = profile_id;
         if let Some(label) = spec.label.clone() {
             meta.title = label;
@@ -3203,6 +3248,39 @@ mod feedback_tests {
             "config reloaded",
             now + FEEDBACK_MIN_INTERVAL
         ));
+    }
+}
+
+#[cfg(test)]
+mod parent_directory_tests {
+    use std::path::PathBuf;
+
+    use super::parent_directory;
+
+    #[test]
+    fn the_live_directory_wins_over_the_one_recorded_at_creation() {
+        // `Pane::cwd` is a creation-time snapshot; a shell that ran `cd` only shows
+        // up in `Session::cwd`. A child pane must inherit the live value (S1, S3).
+        assert_eq!(
+            parent_directory(
+                Some(PathBuf::from("/started/here")),
+                Some(PathBuf::from("/moved/here"))
+            ),
+            Some(PathBuf::from("/moved/here"))
+        );
+    }
+
+    #[test]
+    fn a_pane_without_a_live_session_falls_back_to_the_recorded_directory() {
+        assert_eq!(
+            parent_directory(Some(PathBuf::from("/started/here")), None),
+            Some(PathBuf::from("/started/here"))
+        );
+    }
+
+    #[test]
+    fn a_window_with_no_parent_pane_leaves_the_choice_to_the_policy() {
+        assert_eq!(parent_directory(None, None), None);
     }
 }
 
