@@ -1731,11 +1731,12 @@ impl Application {
         else {
             return;
         };
-        let copied = self.clipboard.set(ClipboardSelection::Clipboard, &text);
-        let message = if copied {
-            format!("copied {} character(s)", text.chars().count())
-        } else {
-            "clipboard is unavailable (install wl-clipboard or xclip)".to_owned()
+        let message = match self.clipboard.set(ClipboardSelection::Clipboard, &text) {
+            Ok(()) => format!("copied {} character(s)", text.chars().count()),
+            // The platform distinguishes a missing helper from a helper that ran and
+            // failed, so a broken TMPDIR no longer sends anyone to install what they
+            // already have.
+            Err(error) => error,
         };
         self.with_window(window_id, |ui| ui.set_status(message));
     }
@@ -1753,9 +1754,7 @@ impl Application {
         let clipboard = self.clipboard.clone();
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            let result = clipboard.get(ClipboardSelection::Clipboard).ok_or_else(|| {
-                "clipboard is unavailable (install wl-clipboard or xclip)".to_owned()
-            });
+            let result = clipboard.get(ClipboardSelection::Clipboard);
             let _ = proxy.send_event(UserEvent::PasteReady {
                 window: window_id,
                 pane,
