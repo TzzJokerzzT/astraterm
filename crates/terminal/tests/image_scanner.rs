@@ -35,6 +35,45 @@ fn split_at(bytes: &[u8], cut: usize) -> Vec<&[u8]> {
     vec![&bytes[..cut], &bytes[cut..]]
 }
 
+// 0. A malformed OSC must not blind the scanner.
+//
+// `ESC ] 9 BEL` is a notification introducer missing its `;`, so the BEL that
+// ends it lands inside the candidate prefix. A scanner that waits for another
+// terminator after flushing it stops recognising images and notifications until
+// some later sequence happens to end.
+#[test]
+fn a_bel_terminated_malformed_osc_does_not_blind_the_scanner() {
+    let mut stream = b"\x1b]9\x07".to_vec();
+    stream.extend_from_slice(b"\x1b_Gf=100;aGk=\x1b\\");
+
+    let output = scan_chunks(&[&stream]);
+
+    assert_eq!(
+        output.messages.len(),
+        1,
+        "the image after the malformed OSC is still captured"
+    );
+    assert_eq!(
+        &output.passthrough[..4],
+        b"\x1b]9\x07",
+        "the malformed OSC reaches the parser verbatim"
+    );
+}
+
+#[test]
+fn an_st_terminated_malformed_osc_does_not_blind_the_scanner() {
+    let mut stream = b"\x1b]9\x1b\\".to_vec();
+    stream.extend_from_slice(b"\x1b_Gf=100;aGk=\x1b\\");
+
+    let output = scan_chunks(&[&stream]);
+
+    assert_eq!(
+        output.messages.len(),
+        1,
+        "the image after an ST-terminated malformed OSC is still captured"
+    );
+}
+
 /// A stream with no image sequence in it, but with plenty of real escape codes,
 /// including the ones that share an introducer with the protocols we own.
 const CORPUS: &[u8] =

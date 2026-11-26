@@ -318,7 +318,18 @@ impl ImageScanner {
             // the candidate prefix and stream the rest through verbatim.
             out.passthrough.extend_from_slice(&[ESC, OSC_INTRO]);
             out.passthrough.append(&mut self.scratch);
-            self.state = State::Foreign { osc: true };
+            // The byte that ruled the prefix out may have been the terminator
+            // itself: `ESC ] 9 BEL` is a foreign OSC that is already over, and
+            // `ESC ] 9 ESC \` opens its own ST. Waiting for another terminator
+            // would hide every sequence that follows.
+            self.state = match bytes[pos] {
+                BEL | CAN | SUB => State::Ground,
+                ESC => {
+                    self.esc_pending = true;
+                    State::Foreign { osc: true }
+                }
+                _ => State::Foreign { osc: true },
+            };
         }
         pos + 1
     }
