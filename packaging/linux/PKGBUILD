@@ -12,7 +12,7 @@
 # (`git verify-tag v$pkgver`), which is what the release actually depends on.
 
 pkgname=astraterm
-pkgver=1.1.4
+pkgver=1.1.5
 pkgrel=1
 pkgdesc="Fast native terminal emulator with a built-in tab and split multiplexer"
 arch=('x86_64' 'aarch64')

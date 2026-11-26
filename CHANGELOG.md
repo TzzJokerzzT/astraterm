@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.5] - 2026-11-26
+
+### Fixed
+
+- A kitty image sent as a single chunk that spells out `m=0` is decoded again.
+  It was refused as a malformed final chunk, which the previous decoder accepted.
+- A chunk that continues a transfer no longer evicts a sibling. With four
+  transfers in flight, a valid continuation used to drop another image.
+- The compatibility table names the tests that exist, and the feature document no
+  longer lists the resize work as pending.
+
 ## [1.1.4] - 2026-11-26
 
 ### Fixed
