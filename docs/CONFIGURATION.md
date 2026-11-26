@@ -9,12 +9,13 @@ Sections below:
 
 - [Files and paths](#files-and-paths) — where files live, and which file wins.
 - [Recipes](#recipes) — opacity, blur, status bar, right-hand tabs, themes.
-- [Option reference](#option-reference) — every option, with description and purpose.
-- [Keyboard actions](#keys) — the whole key map.
-- [Profiles](#profiles) — named launch presets.
+- [Option reference](#option-reference) — every option, field by field: type,
+  default, accepted values and effect.
+- [Keyboard actions](#keyboard-actions) — the whole key map.
+- [Profiles](#profiles) — named launch presets (in the option reference).
 - [Validation](#validation) · [Save policy](#save-policy) · [What applies live](#what-applies-live)
-- [Example configuration](#example-configuration) — complete and valid.
-- [Options accepted but not applied](#options-accepted-but-not-applied)
+- [Complete example](#complete-example) — a valid file that sets every section.
+- [Gotchas](#gotchas) — inert keys, clamps, dependent defaults and units.
 
 ## Files and paths
 
@@ -39,8 +40,10 @@ Sections below:
 3. `[[profiles]]` overrides, applied only to sessions created from that profile:
    `shell`, `args`, `command`, `working_directory`, `env`, `startup_command`,
    `label`, and (validated but not applied today) `theme` and `font_size`.
-4. Command-line flags for the first window: `--working-directory`, `--profile`,
-   `--command`, `--title` and `--config`.
+4. Command-line flags: `--config` picks the file; `--working-directory`,
+   `--profile`, `--command` and `--title` apply to windows that start a fresh
+   workspace (the first window, or one opened with `new-window`), not to a
+   restored layout and not to tabs opened later with `new-tab`.
 
 Saving from the panel always writes the *merged* result, so anything you set in
 the TOML survives a panel save even if the panel never showed it.
@@ -120,8 +123,9 @@ The bar keeps session information (title, directory, grid size, `ALT`/`SEL`,
 search indicator) on the left and shows `CPU 12% · RAM 61% · 15:13` on the right.
 CPU and memory come from `/proc/stat` and `/proc/meminfo`, sampled **once per
 second and only while the bar is visible** — hidden means no timer at all.
-`clock_format` is strftime-like (`%H %M %S %d %m %Y %b %a`; anything else is
-literal) and uses your timezone and locale.
+`clock_format` is a `strftime` format string evaluated by the C library in your
+timezone and locale, so the usual specifiers (`%H %M %S %d %m %Y %b %a`, also
+`%I %p`, …) work and other text is literal.
 
 ### Tabs on the right (Warp style)
 
@@ -155,92 +159,114 @@ panel and nothing is written.
 
 ## Option reference
 
-Types are the Rust types in `crates/config/src/schema.rs`; TOML maps them to
-bool, integer, float, string, array and table. "Panel" names the settings row that
-edits the option, when there is one.
+Every key the loader accepts, grouped by TOML table. The columns are the same for
+every table:
 
-### `[window]` — the application window
+- **Key** — the TOML key as written in the file.
+- **Type** — the TOML type of the value (the loader maps it to the Rust type in
+  `crates/config/src/schema.rs`): bool, integer, float, string, array of strings
+  or table. A value of the wrong TOML type is a parse error, not a warning.
+- **Default** — the built-in default, in TOML syntax, used when the key or its
+  whole table is absent.
+- **Accepted values** — what is accepted. Ranges and rules come from
+  `crates/config/src/validation.rs`: **error** means the configuration does not
+  validate (it still loads and runs, but a panel save is refused), **warning**
+  means it loads and is reported without blocking anything.
+- **Effect** — what the value does in the running application, and whether it
+  applies live or needs a new session/window.
 
-| Option | Default | What it does | When you would change it | Panel |
+A key that is present but not listed here is reported as a warning with its
+dotted path and the text "unknown setting; it has no effect".
+
+### `[window]`
+
+The application window.
+
+| Key | Type | Default | Accepted values | Effect |
 |---|---|---|---|---|
-| `width` | `1280` | Initial window width in logical pixels (200–16384). | Your monitor is wider than the default, or you want a compact window. Read when a window is created. | Window width |
-| `height` | `800` | Initial window height in logical pixels (120–16384). | Same as `width`. Read when a window is created. | Window height |
-| `opacity` | `1.0` | Alpha of the painted background (0.1–1.0), applied live. Text stays opaque. | You want the wallpaper or the windows behind to show through. Pair it with compositor blur. | Window opacity |
-| `startup_maximized` | `false` | Asks the compositor to open the window maximized. | You always work maximized. Read when a window is created. | Start maximized |
-| `show_window_controls` | `true` | Lets the compositor draw client-side decorations (title bar, close button). | You prefer server-side decorations or a bare window, or your compositor draws its own. Read when a window is created. | — |
-| `remember_geometry` | `true` | Accepted but not applied today: the last size is stored in `workspace.toml`, and restore recreates tabs/splits without re-applying geometry. | You expected the window to reopen at its old size. | Remember window geometry |
+| `width` | integer | `1280` | 200–16384; outside is an error | Width of a new window in logical pixels (multiplied by the display scale). Read in `create_window`, so a window has to be created; the compositor may still pick another size. |
+| `height` | integer | `800` | 120–16384; outside is an error | Height of a new window in logical pixels. Read when a window is created. |
+| `opacity` | float | `1.0` | 0.1–1.0; outside is an error, below 0.5 warns | Alpha of the painted terminal background. Only the background is translucent: glyphs, cell backgrounds, borders, tab strip and status bar stay opaque. Clamped to 0.1–1.0 when painted, so an out-of-range value still paints. Applies live. |
+| `startup_maximized` | bool | `false` | `true`, `false` | Asks the compositor to map the new window maximized. Read when a window is created. |
+| `show_window_controls` | bool | `true` | `true`, `false` | Requests window decorations (title bar, close button), drawn by the compositor or window manager. Read when a window is created. |
+| `remember_geometry` | bool | `true` | `true`, `false` | **Accepted but not applied.** No code reads it. The last window size is written into `workspace.toml`, but restore creates the window from `width`/`height` below and ignores the saved size. |
 
-### `[terminal]` — shell, emulation and session behaviour
+### `[terminal]`
 
-| Option | Default | What it does | When you would change it | Panel |
+The shell, emulation and session behaviour.
+
+| Key | Type | Default | Accepted values | Effect |
 |---|---|---|---|---|
-| `shell` | `"auto"` | Program to run. `auto` resolves `$SHELL` and falls back to `/bin/sh`; an absolute path must exist. | You want zsh/fish/nu regardless of `$SHELL`, or a specific binary. Needs a new session. | Shell |
-| `shell_args` | `[]` | Argument vector passed to the shell (for example `["-l"]` for a login shell). Never interpreted by a shell. | You want a login shell, a custom rc file, or a `--norc` start. Needs a new session. | — |
-| `term` | `"xterm-256color"` | `$TERM` advertised to applications. Values outside the widely-available list warn, because remote hosts may lack the terminfo entry. | Only when you know the target has the entry installed (it breaks `nvim`, `less` and remote shells otherwise). Needs a new session. | `$TERM` |
-| `images` | `false` | Decodes and draws images sent by the running program (kitty graphics, iTerm2 `OSC 1337`, sixel), anchored to the grid. Off, the sequences are captured and discarded. | You preview images inline (`yazi`, `chafa`, notebooks) and accept that the terminal parses attacker-controlled image data. Needs a new session. | — |
-| `kitty_keyboard` | `true` | Advertises the Kitty keyboard protocol: `CSI ? u` is answered with the active flags and `CSI = u` (set), `CSI > u` (push) and `CSI < u` (pop) are honoured, so applications can ask for unambiguous encodings, alternate keys, associated text and key release/repeat events. Off, applications fall back to the xterm encodings. | An application misbehaves once it detects the protocol, or you want the historical xterm-only encoding everywhere. Needs a new session. | — |
-| `scrollback_lines` | `10000` | Lines of history kept per session; bounded memory. | Long build logs or long agent sessions. Higher values cost memory per pane. Needs a new session. | Scrollback lines |
-| `working_directory` | `"home"` | Directory a new session starts in: `home`, `current`/`inherit` (the parent pane's directory), or an absolute path. | You always start in a project directory, or want new splits to follow the current one. Needs a new session. | Working directory |
-| `confirm_on_close` | `true` | Asks before closing a tab/pane with a live child, and before quitting with live sessions. | You trust yourself with `Ctrl+Shift+W` and want it instant. | Confirm before closing |
-| `copy_on_select` | `false` | Copies to the clipboard as soon as a mouse selection ends. | You live in a copy/paste workflow and dislike `Ctrl+Shift+C`. | Copy on select |
-| `open_urls_on_click` | `true` | Enables Ctrl+click on an `http(s)` URL to open it with `xdg-open`. A click is always required; nothing opens on its own. | You want to disable URL opening entirely (for example on shared screens). | Open URLs on click |
-| `word_delimiters` | `" /\\()\"'-.,:;<>~!@#$%^&*\|+=[]{}~?"` | Accepted but not applied today: double-click word selection uses the terminal core's rules. | You expected to tune double-click selection. | Word delimiters |
+| `shell` | string | `"auto"` | `"auto"`, a program name, or an absolute path; empty is an error, and a value containing `/` must exist on disk | Program started for a new session. `auto` uses `$SHELL` when it is set and exists, otherwise `/bin/sh`; a name without `/` is looked up in `PATH`. Needs a new session. |
+| `shell_args` | array of strings | `[]` | any strings | Arguments passed after the shell program name, one argv element each, never interpreted by a shell. A profile's `args` replace them for that profile's sessions. Needs a new session. |
+| `term` | string | `"xterm-256color"` | non-empty and whitespace-free (otherwise an error); anything outside the widely available list warns: `xterm-256color`, `xterm`, `screen-256color`, `screen`, `tmux-256color`, `linux`, `vt100`, `alacritty`, `foot` | Value of `$TERM` for the child. Needs a new session. |
+| `kitty_keyboard` | bool | `true` | `true`, `false` | Advertises and honours the Kitty keyboard protocol: `CSI ? u` is answered with the active flags, `CSI = u` / `CSI > u` / `CSI < u` set, push and pop them, and keys are encoded in the kitty form while flags are active. Off, keys use the xterm encodings. Needs a new session. |
+| `images` | bool | `false` | `true`, `false` | Decodes and draws images sent as kitty graphics, iTerm2 `OSC 1337` or sixel, anchored to the grid. Off, the sequences are still captured by the scanner but dropped without being decoded. Read on every output pump, so it applies live; turning it off drops already-decoded images. |
+| `scrollback_lines` | integer | `10000` | 100–1,000,000; outside is an error | History lines kept per session (bounded memory per pane). Fixed when the session is created. |
+| `working_directory` | string | `"home"` | `"home"`, `"current"`, `"inherit"`, `""`, or an absolute path | Directory a new session starts in. `home`/`""` = `$HOME`; `current`/`inherit` = the directory of the pane the session is created from (or `--working-directory`); an absolute path is used as written. A relative value that is not a policy is an error; a configured directory that does not exist warns and the session falls back to `$HOME`, then to the pane's directory. Needs a new session. |
+| `confirm_on_close` | bool | `true` | `true`, `false` | Asks before closing a pane or tab whose child is still running, and before quitting with live sessions. Read at the moment of the action, so it applies live. |
+| `copy_on_select` | bool | `false` | `true`, `false` | Copies the selection to the system clipboard (the same one `copy` fills) as soon as a mouse selection ends. Applies live. |
+| `open_urls_on_click` | bool | `true` | `true`, `false` | Enables Ctrl+click on a detected `http`/`https` URL, which opens it with `xdg-open`; a plain click never opens anything. Applies live. |
+| `word_delimiters` | string | `" /\\()\"'-.,:;<>~!@#$%^&*\|+=[]{}~?"` | any string | **Accepted but not applied.** Double-click word selection uses the terminal core's own rules; no code reads this value. |
 
-### `[font]` — typography
+### `[font]`
 
-| Option | Default | What it does | When you would change it | Panel |
+Typography. Every key here applies live.
+
+| Key | Type | Default | Accepted values | Effect |
 |---|---|---|---|---|
-| `family` | `"JetBrainsMono Nerd Font"` | Primary font family. When it is not installed, glyphs are resolved through the system fallback (the renderer reports `monospace`). | Your font of choice, or Nerd Font glyphs look wrong. Applies live. | Font family |
-| `size` | `13.0` | Font size in logical points, multiplied by the display scale. | Denser output or better readability, especially on HiDPI. Applies live (`Ctrl+=`/`Ctrl+-` exist too). | Font size |
-| `weight` | `400` | Font weight, 100–900 in steps of 100. | You want a heavier or lighter face (variable fonts). Applies live. | Font weight |
-| `line_height` | `1.15` | Multiplier applied to the font size to get the row height. | More air between lines, or more rows on screen. Applies live. | Line height |
-| `letter_spacing` | `0.0` | Extra tracking in logical pixels (−5 to 20). | Wide fonts that feel cramped, or a tighter grid. Applies live. | Letter spacing |
-| `ligatures` | `false` | Enables the font's `liga` and `calt` features. Off, they are explicitly disabled so the grid never depends on a glyph substitution. | You use a font with programming ligatures (`!=`, `->`, `=>`) and want them drawn. Applies live. | — |
-| `fallbacks` | see below | Accepted but not read today: cosmic-text resolves missing glyphs through the system font database. | You expected to control the fallback chain. | — |
+| `family` | string | `"JetBrainsMono Nerd Font"` | non-blank (blank is an error) | Primary font family handed to the shaper. If the family is not installed, cosmic-text resolves the request through the system font database (the same mechanism that supplies missing glyphs). Applies live. |
+| `size` | float | `13.0` | 4–96; outside is an error | Font size in **logical pixels**, not points, multiplied by the display scale factor to get physical pixels. The row height is `size * line_height`. A zoom set with `increase-font-size`/`decrease-font-size` is stored in `preferences.toml` and overrides this value until `reset-font-size`. |
+| `weight` | integer | `400` | 100–900 in steps of 100; anything else is an error | Weight requested from the shaper; bold cells still use weight 700. |
+| `line_height` | float | `1.15` | 0.8–3.0; outside is an error | Row height as a multiple of `size`, rounded to whole pixels. |
+| `letter_spacing` | float | `0.0` | −5–20; outside is an error | Extra tracking between shaped clusters, in pixels. Unlike `size`, it is **not** multiplied by the display scale. |
+| `ligatures` | bool | `false` | `true`, `false` | Enables the font's `liga` and `calt` features. Off, both are explicitly disabled so a cell never depends on a glyph substitution. |
+| `fallbacks` | array of strings | `["JetBrains Mono", "Symbols Nerd Font", "Noto Color Emoji", "DejaVu Sans Mono", "monospace"]` | any strings | **Accepted but not read.** Missing glyphs are resolved by cosmic-text through the system font database; this list is never passed to the shaper. |
 
-Default `fallbacks`: `["JetBrains Mono", "Symbols Nerd Font", "Noto Color Emoji",
-"DejaVu Sans Mono", "monospace"]`.
+### `[appearance]`
 
-### `[appearance]` — colours, chrome and cursor
+Colours, chrome and cursor.
 
-| Option | Default | What it does | When you would change it | Panel |
+| Key | Type | Default | Accepted values | Effect |
 |---|---|---|---|---|
-| `theme` | `"midnight"` | Active palette. Built-ins are `midnight` (dark) and `dawn` (light); a user theme in the themes directory wins on a name clash. An unknown name warns and falls back to `midnight`. | You want a different palette, including ones you create in the panel. Applies live. | Theme |
-| `background_blur` | `false` | Documentation flag for compositor blur; no request is made. Warns while `opacity >= 1.0`, where blur could not be visible anyway. | You are noting that you enabled blur in the compositor. See [Recipes](#blur-behind-the-window). | Background blur |
-| `padding_x` | `12` | Horizontal inner padding of every pane, in logical pixels (>512 error, >64 warns). | Tighter or more generous breathing room around the grid. Applies live. | Horizontal padding |
-| `padding_y` | `10` | Vertical inner padding of every pane (same limits). | Same as `padding_x`. Applies live. | Vertical padding |
-| `cursor` | `"block"` | Cursor shape: `block`, `beam`, `underline`, `hollow`. | Your preference, or to match the shape applications ask for. Applies live. | Cursor shape |
-| `cursor_blink` | `true` | Blinks the cursor (two toggles per 530 ms). | You dislike blinking, or want to save the idle redraws. `low_power_mode` also disables it. | Cursor blinks |
-| `style` | `"minimal-dark"` | Stored only, for forward compatibility. | Nothing today; kept so a future style set can read it. | — |
-| `show_status_bar` | `false` | Shows the bottom bar with session info on the left and CPU/RAM/clock on the right. | You want system readings while you work. `Ctrl+Shift+S` toggles it. Applies live. | Status bar |
-| `status_bar_cpu` | `true` | CPU segment of the bar, from `/proc/stat`. | Hide it on a shared machine or if you do not care about CPU. | Status bar: CPU |
-| `status_bar_ram` | `true` | RAM segment, from `/proc/meminfo`. | Memory pressure matters more to you, or you want it gone. | Status bar: RAM |
-| `status_bar_clock` | `true` | Clock segment, in your timezone and locale. | You already have a clock in the bar/compositor. | Status bar: clock |
-| `clock_format` | `"%H:%M"` | strftime-like format for that segment (`%H %M %S %d %m %Y %b %a`; other text is literal). Non-empty, ≤64 characters. | You want seconds, a date, or 12-hour time (`%I:%M %p`). | Clock format |
-| `show_window_controls` | `false` | Accepted but unused: `[window] show_window_controls` is the one that is applied. | You edited the wrong one. | — |
-| `accent_color` | `"#8B9CFF"` | Validated but not applied today: the renderer uses the theme's `accent` colour. Very dark values warn. | You want the accent changed → edit it in the theme editor instead. | Accent colour |
-| `tab_bar_position` | `"top"` | Where the tabs sit: `top`, `right` (vertical Warp-style strip), `bottom` or `hidden`. | Screen real estate: right-side tabs suit wide/ultrawide monitors, hidden suits `Alt+1…9` users. Applies live. | Tab bar position |
-| `tab_strip_width` | `180` | Width of the vertical strip in logical pixels, 120–480. Only used when the tabs are on the right. | Titles are being truncated, or the strip is stealing too much width. | Tab strip width |
-| `compact_tabs` | `false` | Smaller tab labels with less padding. | Many tabs in one window. Applies live. | Compact tabs |
-| `divider_thickness` | `1` | Thickness of the line between splits, in device pixels (1–12). | You want the layout to read more clearly. Applies live. | Divider thickness |
-| `pane_gap` | `2` | Gap between panes as a whole, in device pixels (≤24). | A more spacious tiling look. Applies live. | Pane gap |
+| `theme` | string | `"midnight"` | any built-in or user theme name, matched case-insensitively; a name that resolves to nothing warns and falls back to `midnight` | Active palette. Built-ins are `midnight` (dark) and `dawn` (light); user themes come from `~/.config/astraterm/themes/*.toml`. Built-ins resolve first, so a user theme reusing the name `midnight` or `dawn` is listed in the panel but the built-in palette is the one painted. Applies live. |
+| `background_blur` | bool | `false` | `true`, `false` | **Accepted but not applied.** Blur is a compositor rule and no request is sent. Validation warns while `[window] opacity >= 1.0`, where blur could not be visible anyway. |
+| `padding_x` | integer | `12` | 0–512; above 512 is an error, above 64 warns | Horizontal inner padding of every pane, in logical pixels (scaled by the display scale). Both padding keys report under the field name `appearance.padding_x`. Applies live. |
+| `padding_y` | integer | `10` | 0–512; above 512 is an error, above 64 warns | Vertical inner padding of every pane, same rules as `padding_x`. Applies live. |
+| `cursor` | string | `"block"` | `"block"`, `"beam"`, `"underline"`, `"hollow"` (lowercase exactly; anything else is a parse error) | Shape painted at the cursor of the focused pane; it overrides a shape the running program requests (`DECSCUSR`). `hollow` is an outlined block. Applies live. |
+| `cursor_blink` | bool | `true` | `true`, `false` | Toggles the cursor every 530 ms. Disabled while `[performance] low_power_mode` is on and while a panel or overlay is open. Applies live. |
+| `style` | string | `"minimal-dark"` | any string | **Accepted but not applied.** Stored only, for forward compatibility; no code reads it. |
+| `show_status_bar` | bool | `false` | `true`, `false`; warns when it is on and all three `status_bar_*` keys are `false` | Shows the bottom bar: title, directory, grid size, `ALT`/`SEL`, search state and transient messages on the left; the enabled segments on the right. `toggle-status-bar` flips it and persists the result. Applies live. |
+| `status_bar_cpu` | bool | `true` | `true`, `false` | Adds `CPU nn%` from `/proc/stat`. Sampled once per second and only while the bar is visible. Applies live. |
+| `status_bar_ram` | bool | `true` | `true`, `false` | Adds `RAM nn%` from `/proc/meminfo`, with the same sampling. Applies live. |
+| `status_bar_clock` | bool | `true` | `true`, `false` | Adds the clock segment (see `clock_format`). Applies live. |
+| `clock_format` | string | `"%H:%M"` | non-empty and at most 64 characters (otherwise an error) | Format string for the clock segment, evaluated by the C library `strftime` in your timezone and locale: the standard specifiers (`%H`, `%M`, `%S`, `%d`, `%m`, `%Y`, `%b`, `%a`, `%I`, `%p`, …) work and other text is literal. At runtime an empty, NUL-containing or longer-than-63-byte format falls back to `%H:%M`. Applies live. |
+| `show_window_controls` | bool | `false` | `true`, `false` | **Accepted but not applied.** `[window] show_window_controls` is the key the window reads; this one only exists in the model. |
+| `accent_color` | string | `"#8B9CFF"` | `#RGB` or `#RRGGBB` (3 or 6 hex digits, `#` optional); unparsable is an error, relative luminance below 0.05 warns | **Validated but not applied.** The renderer paints the theme's `accent`; change the accent in the theme editor instead. |
+| `tab_bar_position` | string | `"top"` | `"top"`, `"right"`, `"bottom"`, `"hidden"` (lowercase exactly; anything else is a parse error) | Where the tab strip is drawn. `right` is a vertical Warp-style strip whose width is `tab_strip_width`. Applies live. |
+| `tab_strip_width` | integer | `180` | 120–480; outside is an error | Width of the vertical tab strip in logical pixels (scaled), used only when `tab_bar_position = "right"`. Also clamped to the window width minus 160 device pixels so the terminal keeps a usable area. Applies live. |
+| `compact_tabs` | bool | `false` | `true`, `false` | Smaller tab labels with less padding and no profile hint. Applies live. |
+| `divider_thickness` | integer | `1` | 1–12; outside is an error | Thickness of the line between two splits, in **device** pixels (not scaled by the display scale factor). Applied as `max(1)`. Applies live. |
+| `pane_gap` | integer | `2` | 0–24; above 24 is an error | Gap reserved around each pane, in **device** pixels (not scaled). Applies live. |
 
-### `[workspace]` — what happens on start and when a shell exits
+### `[workspace]`
 
-| Option | Default | What it does | When you would change it | Panel |
+What happens on start and when a shell exits.
+
+| Key | Type | Default | Accepted values | Effect |
 |---|---|---|---|---|
-| `restore_on_startup` | `true` | Recreates the tabs, split tree and each pane's working directory from `workspace.toml`. Processes are never restored: every pane starts a fresh shell. | You prefer a single clean tab on start. Read when the window is created. | Restore layout on startup |
-| `close_pane_when_shell_exits` | `true` | Closing a pane when its child exits. With `false`, the pane keeps its final screen until you close it. | You want to read a crashed command's output without losing the pane. | Close pane when shell exits |
+| `restore_on_startup` | bool | `true` | `true`, `false` | Recreates the tabs, split tree, per-pane working directory and profile from `workspace.toml`; every pane starts a fresh shell (processes are never restored). A missing or invalid file, or `false`, starts with one fresh tab. Read when a window is created. |
+| `close_pane_when_shell_exits` | bool | `true` | `true`, `false` | With `true`, a pane whose child exits is removed and its tab closes when it was the tab's only pane — except the very last pane of the window, which stays on screen with its final output. With `false` every pane keeps its final screen until you close it. Read when the child exits, so it applies live. |
 
 ### `[performance]`
 
-| Option | Default | What it does | When you would change it | Panel |
+| Key | Type | Default | Accepted values | Effect |
 |---|---|---|---|---|
-| `gpu_acceleration` | `true` | Accepted but not applied today: the GPU renderer is always attempted and the app reports a startup failure instead of silently degrading. | You expected a software fallback. | GPU acceleration |
-| `low_power_mode` | `false` | Asks for the low-power GPU adapter on new windows and disables cursor blinking. | Battery use, or a fan that never stops. | Low power mode |
-| `max_fps_when_idle` | `1` | Accepted but not applied today: there is no idle redraw loop to cap. | You expected to throttle idle redraws. | Max idle FPS |
+| `gpu_acceleration` | bool | `true` | `true`, `false` | **Accepted but not applied.** The GPU renderer is always attempted; a failure is reported as a startup error instead of silently degrading. |
+| `low_power_mode` | bool | `false` | `true`, `false` | Requests the low-power GPU adapter (`wgpu` `PowerPreference::LowPower`) for a new window and disables cursor blinking. The adapter choice is fixed when the window is created; the blink part applies live. |
+| `max_fps_when_idle` | integer | `1` | 0–240; above 240 is an error | **Accepted but not applied.** The schema documents `0` as "unlimited on demand", but there is no idle redraw loop, so no code reads it. |
 
-### `[notifications]` — desktop notifications from programs
+### `[notifications]`
 
 Programs ask for a notification with `OSC 9;<body>` or
 `OSC 777;notify;<title>;<body>` (the sequences used by `notify-send` wrappers,
@@ -248,13 +274,12 @@ tmux, `llvm` builds and most "tell me when this finishes" scripts). AstraTerm
 consumes both before the VT parser, shows the text in the status bar, and — under
 the policy below — files a desktop notification through `notify-send`.
 
-| Option | Default | What it does | When you would change it | Panel |
+| Key | Type | Default | Accepted values | Effect |
 |---|---|---|---|---|
-| `on` | `"unfocused"` | When to notify: `unfocused` only while the window showing that session does not have focus, `always` even while you are looking at it, `never` for the status-bar message alone. | `always` for long builds you watch anyway; `never` when a polling script would flood the desktop. | — |
+| `on` | string | `"unfocused"` | `"unfocused"`, `"always"`, `"never"` (lowercase exactly; anything else is a parse error) | When a desktop notification is filed, for `OSC 9`/`OSC 777` and for AstraTerm's own save/reload notices. `unfocused` files one only while the window showing that session does not have focus; `always` files it even while you watch; `never` only shows the status-bar message. It also gates the window attention hint. Read per notification, so it applies live. |
 
-The policy is read per notification, so it applies live. It also gates the window
-attention hint (the compositor's "urgent" mark): with `never` nothing is raised,
-not even the hint.
+The policy also gates the window attention hint (the compositor's "urgent" mark):
+with `never` nothing is raised, not even the hint.
 
 AstraTerm's own save and reload notices use the same policy. A successful panel
 save reports `settings saved` (or `theme saved` from **Save theme as…**), and a
@@ -279,26 +304,88 @@ on = "unfocused"
 
 ### `[keys]`
 
-`[keys]` maps an **action name** to one or more chords. See
-[Keyboard actions](#keys-1) for every action, its default chord and what it does.
-An unknown action name, an unparsable chord or an unknown modifier is an error;
-two actions sharing a chord is a warning, and the alphabetically first action
-keeps it.
+A table that maps an **action name** to one or more chords.
 
-### `[[profiles]]` — named launch presets
-
-| Field | Default | What it does | When you would change it | Panel |
+| Key | Type | Default | Accepted values | Effect |
 |---|---|---|---|---|
-| `name` | required | Identifier used by `--profile <name>` and by the panel; must be unique and non-empty. | Always. | Profiles (TOML only) |
-| `shell` | `""` | Shell override; empty or `auto` uses `terminal.shell`. | A profile with a different shell. | — |
-| `args` | `[]` | Arguments for that shell, as a vector. | Login shell, custom rc file. | — |
-| `command` | `[]` | Alternative to a shell: an **argument vector** executed directly (for example `["ssh", "production"]`). No shell interprets it. | SSH hosts, one-shot tools, TUIs. | — |
-| `working_directory` | unset | Per-profile directory (same values as `terminal.working_directory`). | Project-specific panes. | — |
-| `env` | `{}` | Extra environment variables layered over the inherited environment. | `PROJECT=…`, `SSH_AUTH_SOCK=…`, per-profile secrets-free context. | — |
-| `startup_command` | unset | Text typed into the shell once it starts (not executed through `sh -c`). | `nvim .`, `lazygit`, `ssh host`. | — |
-| `label` | unset | Label shown in the tab strip until the application sets a title. | Distinguish `ssh production` from `ssh staging`. | — |
-| `theme` | unset | Validated but not applied today. | You expected per-profile themes. | — |
-| `font_size` | unset | Validated but not applied today. | You expected per-profile font sizes. | — |
+| any action name from the list below | string | the chord in the list below | one chord, or several separated by `\|`; `""` or `"none"` unbinds the action | Replaces the chord(s) bound to that action. An unknown action name, an unknown modifier, an unknown key, or a value that contains no chord at all is an error; two actions claiming the same chord is a warning, and the alphabetically first action keeps it. The keymap is rebuilt on every reload and panel save, so this applies live. |
+
+The value must be a string — an array of chords is a parse error. Action names are
+case-sensitive, and a `[keys]` table is **merged** with the defaults: every action
+you do not mention keeps its default chord, so `[keys]` holds only your changes.
+`""` and `"none"` (case-insensitive) are the exception: they remove the binding
+instead of adding one.
+
+Chord syntax: modifiers `ctrl` (`control`), `alt` (`option`, `opt`), `shift` and
+`super` (`meta`, `cmd`, `logo`, `win`) in any order, then the key. A key is one
+character (`t`, `1`, `=`, `,`, `+`), a named key — `escape`/`esc`,
+`enter`/`return`, `tab`, `backspace`/`bs`, `delete`/`del`, `insert`/`ins`,
+`home`, `end`, `pageup`/`pgup`/`prior`, `pagedown`/`pgdn`/`next`,
+`up`/`arrowup`, `down`/`arrowdown`, `left`/`arrowleft`, `right`/`arrowright`,
+`f1`–`f24` — or one of the spelled-out punctuation keys `space`, `comma`,
+`period`/`dot`, `minus`, `plus`, `equal`, `slash`, `backslash`, `semicolon`,
+`apostrophe`/`quote`, `bracketleft`, `bracketright`, `backtick`/`grave`. A
+trailing `+` means the plus key itself (`ctrl+` = `ctrl+plus`). `|` separates
+alternative chords for one action:
+
+```toml
+[keys]
+increase-font-size = "ctrl+=|ctrl+plus"   # either chord triggers the action
+rename-tab = "none"                       # an empty value or "none" unbinds it
+```
+
+Every accepted action name with its default chord (48 in total):
+
+| Action | Default chord | Action | Default chord |
+|---|---|---|---|
+| `new-tab` | `ctrl+shift+t` | `equalize-splits` | `ctrl+shift+0` |
+| `close-tab` | `ctrl+shift+alt+w` | `toggle-zoom` | `ctrl+shift+z` |
+| `rename-tab` | `ctrl+shift+r` | `increase-font-size` | `ctrl+=\|ctrl+plus` |
+| `next-tab` | `ctrl+pagedown` | `decrease-font-size` | `ctrl+minus` |
+| `previous-tab` | `ctrl+pageup` | `reset-font-size` | `ctrl+0` |
+| `move-tab-left` | `ctrl+shift+alt+left` | `search` | `ctrl+shift+f` |
+| `move-tab-right` | `ctrl+shift+alt+right` | `search-next` | `ctrl+g` |
+| `tab-1` | `alt+1` | `search-previous` | `ctrl+shift+g` |
+| `tab-2` | `alt+2` | `copy` | `ctrl+shift+c` |
+| `tab-3` | `alt+3` | `paste` | `ctrl+shift+v` |
+| `tab-4` | `alt+4` | `scroll-page-up` | `shift+pageup` |
+| `tab-5` | `alt+5` | `scroll-page-down` | `shift+pagedown` |
+| `tab-6` | `alt+6` | `scroll-to-top` | `ctrl+shift+home` |
+| `tab-7` | `alt+7` | `scroll-to-bottom` | `ctrl+shift+end` |
+| `tab-8` | `alt+8` | `open-settings` | `ctrl+comma` |
+| `tab-9` | `alt+9` | `reload-config` | `ctrl+shift+comma` |
+| `new-split-horizontal` | `ctrl+shift+d` | `toggle-status-bar` | `ctrl+shift+s` |
+| `new-split-vertical` | `ctrl+shift+e` | `new-window` | `ctrl+shift+n` |
+| `close-pane` | `ctrl+shift+w` | `toggle-floating` | `ctrl+shift+grave` |
+| `focus-left` | `alt+left` | `send-literal-next` | `ctrl+shift+enter` |
+| `focus-right` | `alt+right` | `quit` | `ctrl+shift+q` |
+| `focus-up` | `alt+up` | | |
+| `focus-down` | `alt+down` | | |
+| `resize-left` | `ctrl+alt+left` | | |
+| `resize-right` | `ctrl+alt+right` | | |
+| `resize-up` | `ctrl+alt+up` | | |
+| `resize-down` | `ctrl+alt+down` | | |
+
+What each action does is in [Keyboard actions](#keyboard-actions).
+
+### `[[profiles]]`
+
+An array of tables: one `[[profiles]]` block per named launch preset. A profile
+is used when it is named with `--profile <name>` or when a restored pane was
+created from it; there is no implicit default profile.
+
+| Key | Type | Default | Accepted values | Effect |
+|---|---|---|---|---|
+| `name` | string | `""` — which validation rejects, so it is effectively required | non-blank and unique (compared case-insensitively) | Identifier used by `--profile <name>`, by the panel and in the saved workspace. |
+| `shell` | string | `""` | `""`, `"auto"`, a program name or an absolute path | Shell override for this profile's sessions. Empty or `auto` uses `[terminal] shell`, and `args` below then applies to that shell instead. |
+| `args` | array of strings | `[]` | any strings | Arguments for the profile's shell. With an empty `shell` they are passed to the global shell (replacing `terminal.shell_args`). Ignored when `command` is set, which warns. |
+| `command` | array of strings | `[]` | a non-empty array is an argument vector: first element the program, the rest its arguments | Runs that vector directly instead of a shell; no shell interprets it. `sh -c` patterns warn. |
+| `working_directory` | string | unset | same values as `[terminal] working_directory` | Directory for this profile's sessions; unset falls back to `[terminal] working_directory`. |
+| `env` | table of strings | `{}` | any string keys and values | Extra environment variables for this profile's sessions, merged after the inherited environment and after the variables AstraTerm sets (`TERM`, `COLORTERM`, `ASTRATERM`, `ASTRATERM_VERSION`), so a profile can override `TERM`. |
+| `startup_command` | string | unset | any string | Text typed into the PTY as keystrokes once the shell has started; never executed through `sh -c`. Useful for `nvim .`, `lazygit` or `ssh host`. |
+| `theme` | string | unset | any string | **Accepted but not applied.** Validated only for being a string; no code reads it. |
+| `font_size` | float | unset | 4–96; outside is an error | **Accepted but not applied.** Validated, then ignored. |
+| `label` | string | unset | any string | Tab title shown until the program sets a title, for example the SSH host alias. |
 
 ## Keyboard actions
 
@@ -350,7 +437,8 @@ Chord syntax: modifiers `ctrl`, `alt`, `shift`, `super` (`meta`, `cmd`, `logo`,
 `win` are synonyms), then the key. `comma`, `period`, `minus`, `plus`, `space`,
 `equal`, `slash`, `backslash`, `semicolon`, `apostrophe`, `bracketleft`,
 `bracketright` and `backtick` name punctuation; `arrowleft`/`left`, `pageup`/`pgup`
-and friends are synonyms. Several chords share one action with `|`:
+and friends are synonyms. Several chords share one action with `|`. The complete
+grammar, including every alias, is in [`[keys]`](#keys):
 
 ```toml
 [keys]
@@ -363,16 +451,18 @@ rename-tab = "none"            # an empty value or `none` unbinds the action
 `astraterm_config::validation::validate` is pure: it takes a `Config` plus the
 known theme names and returns `ValidationReport { issues }`. Severity is
 `Warning` or `Error`; `is_valid()` means "no error". The same rules run for TOML
-input and for panel edits. Errors block persistence; warnings do not.
+input and for panel edits. Errors block persistence; warnings do not. A file with
+errors is still loaded and used — the errors are logged and the panel refuses to
+save until they are fixed.
 
 | Field | Error | Warning |
 |---|---|---|
 | `window.width` / `window.height` | outside 200–16384 / 120–16384 | — |
 | `window.opacity` | outside 0.1–1.0 | < 0.5 |
-| `terminal.term` | empty or whitespace | not in the allowlist |
+| `terminal.term` | empty, whitespace | not in the allowlist |
 | `terminal.scrollback_lines` | outside 100–1,000,000 | — |
-| `terminal.shell` | empty; absolute path missing | — |
-| `terminal.working_directory` | unknown policy; relative path; missing directory | absolute path that does not exist |
+| `terminal.shell` | empty; a value containing `/` that does not exist | — |
+| `terminal.working_directory` | unknown policy; relative path that is not a policy | an absolute path that is not an existing directory (reported as the field `working_directory`) |
 | `font.size` / `line_height` / `letter_spacing` | outside 4–96 / 0.8–3.0 / −5–20 | — |
 | `font.weight` | not 100–900 in steps of 100 | — |
 | `font.family` | empty | — |
@@ -428,183 +518,189 @@ grids and refreshes titles.
 Live without a restart: theme and palette, cursor shape/blink, padding, pane gap,
 divider thickness, tab bar position, strip width, compact tabs, status bar and its
 segments, clock format, font family/size/weight/line height/letter spacing,
-opacity, all keybindings, `confirm_on_close`, `copy_on_select`,
-`open_urls_on_click`, `close_pane_when_shell_exits`, `low_power_mode`,
-`notifications.on`.
+opacity, `terminal.images`, all keybindings, `confirm_on_close`, `copy_on_select`,
+`open_urls_on_click`, `close_pane_when_shell_exits`, `notifications.on`.
 
 Requires a new session or window (`Field::requires_restart()`):
 `terminal.term`, `terminal.scrollback_lines`, `terminal.working_directory`,
 `terminal.shell`, `window.width`, `window.height`, `window.startup_maximized`,
 `performance.gpu_acceleration`. `terminal.shell_args` and every `[[profiles]]`
 field apply when a session is created, and `workspace.restore_on_startup` is read
-when the next window appears.
+when the next window appears. `performance.low_power_mode` picks the GPU adapter
+when a window is created and stops the cursor blink live.
 
-## Example configuration
+## Complete example
 
-Complete and valid against this document, with the full default `[keys]` table so
-you can see the exact names and chords to edit.
+Valid against this document, setting at least one key from every table. Every key
+has a one-line comment; keys that are absent keep their defaults.
 
 ```toml
 [window]
-width = 1440
-height = 900
-opacity = 0.92
-startup_maximized = false
-show_window_controls = true
-remember_geometry = true
+width = 1440                # initial width, logical pixels (200-16384)
+height = 900                # initial height, logical pixels (120-16384)
+opacity = 0.92              # 0.1-1.0; only the background becomes translucent
+startup_maximized = false   # ask the compositor to open maximized
+show_window_controls = true # let the compositor draw the decorations
+remember_geometry = true    # accepted; restore does not re-apply the size
 
 [terminal]
-shell = "auto"
-shell_args = []
-term = "xterm-256color"
-kitty_keyboard = true
-scrollback_lines = 20000
-working_directory = "home"
-confirm_on_close = true
-copy_on_select = false
-open_urls_on_click = true
-word_delimiters = " /\\()\"'-.,:;<>~!@#$%^&*|+=[]{}~?"
+shell = "auto"              # "auto" = $SHELL when it exists, else /bin/sh
+shell_args = ["-l"]         # login shell; never interpreted by a shell
+term = "xterm-256color"     # $TERM; values outside the allowlist warn
+kitty_keyboard = true       # advertise the Kitty keyboard protocol
+images = false              # decode images from terminal output (opt-in)
+scrollback_lines = 20000    # history lines per session (100-1000000)
+working_directory = "home"  # "home", "current"/"inherit" or an absolute path
+confirm_on_close = true     # ask before closing a pane with a live child
+copy_on_select = false      # copy as soon as a mouse selection ends
+open_urls_on_click = true   # Ctrl+click on a URL opens it with xdg-open
+word_delimiters = " /\\()\"'-.,:;<>~!@#$%^&*|+=[]{}~?"  # accepted; not applied
 
 [font]
-family = "JetBrainsMono Nerd Font"
-size = 13.5
-weight = 400
-line_height = 1.2
-letter_spacing = 0.0
-fallbacks = [
-    "JetBrains Mono",
-    "Symbols Nerd Font",
-    "Noto Color Emoji",
-    "DejaVu Sans Mono",
-    "monospace",
-]
+family = "JetBrainsMono Nerd Font"  # primary font family
+size = 13.5                 # logical pixels, not points (4-96)
+weight = 400                # 100-900 in steps of 100
+line_height = 1.2           # row height as a multiple of size (0.8-3.0)
+letter_spacing = 0.0        # extra tracking in pixels (-5 to 20)
+ligatures = false           # enable the font's liga/calt features
+fallbacks = ["JetBrains Mono", "Noto Color Emoji", "monospace"]  # accepted; not read
 
 [appearance]
-theme = "midnight"
-background_blur = false
-padding_x = 12
-padding_y = 10
-cursor = "block"
-cursor_blink = true
-style = "minimal-dark"
-show_status_bar = true
-status_bar_cpu = true
-status_bar_ram = true
-status_bar_clock = true
-clock_format = "%H:%M"
-show_window_controls = false
-accent_color = "#8B9CFF"
-tab_bar_position = "top"
-tab_strip_width = 180
-compact_tabs = false
-divider_thickness = 1
-pane_gap = 2
+theme = "midnight"          # built-in or user theme, case-insensitive
+background_blur = false     # accepted; blur is a compositor rule
+padding_x = 12              # horizontal pane padding, logical pixels (max 512)
+padding_y = 10              # vertical pane padding, logical pixels (max 512)
+cursor = "block"            # block | beam | underline | hollow
+cursor_blink = true         # 530 ms toggle; off in low-power mode
+style = "minimal-dark"      # accepted; stored only
+show_status_bar = true      # bottom bar with session info and readings
+status_bar_cpu = true       # CPU segment from /proc/stat
+status_bar_ram = true       # RAM segment from /proc/meminfo
+status_bar_clock = true     # clock segment
+clock_format = "%H:%M"      # strftime format, at most 64 characters
+show_window_controls = false # accepted; [window] is the applied key
+accent_color = "#8B9CFF"    # validated; the theme's accent is what paints
+tab_bar_position = "top"    # top | right | bottom | hidden
+tab_strip_width = 200       # right strip width, logical pixels (120-480)
+compact_tabs = false        # smaller tab labels with less padding
+divider_thickness = 1       # split divider, device pixels (1-12)
+pane_gap = 2                # gap around each pane, device pixels (0-24)
 
 [workspace]
-restore_on_startup = true
-close_pane_when_shell_exits = true
+restore_on_startup = true           # rebuild tabs/splits from workspace.toml
+close_pane_when_shell_exits = true  # close a pane when its child exits
 
 [performance]
-gpu_acceleration = true
-low_power_mode = false
-max_fps_when_idle = 1
+gpu_acceleration = true     # accepted; the GPU renderer is always attempted
+low_power_mode = false      # low-power adapter plus no cursor blink
+max_fps_when_idle = 1       # accepted; there is no idle redraw loop
 
 [notifications]
-on = "unfocused"
+on = "unfocused"            # unfocused | always | never
 
 [keys]
-close-pane = "ctrl+shift+w"
-close-tab = "ctrl+shift+alt+w"
-copy = "ctrl+shift+c"
-decrease-font-size = "ctrl+minus"
-equalize-splits = "ctrl+shift+0"
-focus-down = "alt+down"
-focus-left = "alt+left"
-focus-right = "alt+right"
-focus-up = "alt+up"
-increase-font-size = "ctrl+=|ctrl+plus"
-new-split-horizontal = "ctrl+shift+d"
-new-split-vertical = "ctrl+shift+e"
-new-tab = "ctrl+shift+t"
-new-window = "ctrl+shift+n"
-next-tab = "ctrl+pagedown"
-open-settings = "ctrl+comma"
-paste = "ctrl+shift+v"
-previous-tab = "ctrl+pageup"
-quit = "ctrl+shift+q"
-reload-config = "ctrl+shift+comma"
-rename-tab = "ctrl+shift+r"
-move-tab-left = "ctrl+shift+alt+left"
-move-tab-right = "ctrl+shift+alt+right"
-reset-font-size = "ctrl+0"
-resize-down = "ctrl+alt+down"
-resize-left = "ctrl+alt+left"
-resize-right = "ctrl+alt+right"
-resize-up = "ctrl+alt+up"
-scroll-page-down = "shift+pagedown"
-scroll-page-up = "shift+pageup"
-scroll-to-bottom = "ctrl+shift+end"
-scroll-to-top = "ctrl+shift+home"
-search = "ctrl+shift+f"
-search-next = "ctrl+g"
-search-previous = "ctrl+shift+g"
-send-literal-next = "ctrl+shift+enter"
-tab-1 = "alt+1"
-tab-2 = "alt+2"
-tab-3 = "alt+3"
-tab-4 = "alt+4"
-tab-5 = "alt+5"
-tab-6 = "alt+6"
-tab-7 = "alt+7"
-tab-8 = "alt+8"
-tab-9 = "alt+9"
-toggle-floating = "ctrl+shift+grave"
-toggle-status-bar = "ctrl+shift+s"
-toggle-zoom = "ctrl+shift+z"
+# Only the bindings that differ from the defaults; every other action keeps its
+# default chord because the table is merged with the built-in defaults.
+close-tab = "ctrl+shift+alt+w"                      # chord for one action
+rename-tab = "ctrl+shift+r"                         # another chord
+decrease-font-size = "ctrl+minus|ctrl+shift+minus"  # `|` separates alternatives
+toggle-floating = "none"                            # empty or "none" unbinds
 
-# A login shell in the home directory, inheriting the global terminal settings.
 [[profiles]]
-name = "work"
-shell = "/bin/zsh"
-args = ["-l"]
-working_directory = "home"
-label = "work"
+name = "work"                    # identifier used by --profile work
+shell = "/bin/zsh"               # overrides [terminal] shell
+args = ["-l"]                    # arguments for that shell
+working_directory = "home"       # same values as terminal.working_directory
+env = { EDITOR = "nvim" }        # extra environment for this profile
+startup_command = "nvim ."       # typed into the shell after it starts
+label = "work"                   # tab title until the program sets one
 
-# Runs the system OpenSSH client directly. No shell interprets the vector, and no
-# keys or passwords are stored here (see docs/SECURITY.md).
 [[profiles]]
-name = "production"
-command = ["ssh", "production"]
-label = "prod"
-
-# A shell with extra environment and one command typed after startup.
-[[profiles]]
-name = "dev"
-working_directory = "/tmp"
-env = { EDITOR = "nvim", RUST_BACKTRACE = "1" }
-startup_command = "nvim ."
-# Accepted and validated, but not applied to sessions today:
-theme = "dawn"
-font_size = 14.0
+name = "prod"                    # a second profile
+command = ["ssh", "production"]  # argv run directly, no shell involved
+label = "prod"                   # tab title
+theme = "dawn"                   # accepted; not applied
+font_size = 14.0                 # accepted; not applied
 ```
 
-## Options accepted but not applied
+## Gotchas
 
-Setting these is harmless and validated, but today nothing reads them; they are
-listed so nobody expects an effect:
+### Accepted but not applied
 
-| Field | Current status |
+These keys parse, load and validate (mostly), and change nothing:
+
+| Key | What happens instead |
 |---|---|
-| `window.remember_geometry` | size is stored in `workspace.toml`, restore does not re-apply it |
+| `window.remember_geometry` | no code reads it; the size saved in `workspace.toml` is ignored on restore |
 | `terminal.word_delimiters` | double-click selection uses the terminal core's rules |
+| `font.fallbacks` | cosmic-text resolves missing glyphs through the system font database |
+| `appearance.background_blur` | documentation only; no compositor request is sent |
 | `appearance.style` | stored only |
-| `appearance.accent_color` | validated; the renderer uses the theme's `accent` |
-| `appearance.show_window_controls` | `[window] show_window_controls` is the applied one |
-| `appearance.background_blur` | documentation only; blur is a compositor rule |
-| `font.fallbacks` | cosmic-text resolves fallbacks through the system database |
-| `performance.gpu_acceleration` | the GPU renderer is always attempted |
+| `appearance.show_window_controls` | `[window] show_window_controls` is the one the window reads |
+| `appearance.accent_color` | validated; the theme's `accent` is what paints |
+| `performance.gpu_acceleration` | the GPU renderer is always attempted; a failure is an error, not a fallback |
 | `performance.max_fps_when_idle` | there is no idle redraw loop to cap |
-| `profiles[].theme`, `profiles[].font_size` | validated, not applied |
+| `profiles[].theme`, `profiles[].font_size` | validated (`font_size` 4–96), then ignored |
+
+### Values that are clamped
+
+- `[window] opacity` is clamped to 0.1–1.0 when the frame is painted, so an
+  out-of-range value paints the nearest valid one (and is a validation error).
+- `[appearance] tab_strip_width` is clamped to the window width minus 160 device
+  pixels while the tabs are on the right, so a 480-pixel strip cannot squeeze the
+  terminal to nothing in a small window.
+- `[appearance] divider_thickness` is applied as `max(1)`, so `0` paints a 1 px
+  divider (and is a validation error).
+- `[font] size` set by the zoom keys is clamped to 4–96 by the runtime preference
+  and, while set, overrides `font.size` until `reset-font-size`; a non-finite
+  stored value is discarded.
+- Text padding is scaled and then subtracted from the pane rectangle
+  saturating, so a 512-pixel padding on a small window leaves zero columns rather
+  than a panic.
+
+### Defaults that depend on other settings
+
+- `[keys]` is merged with the built-in defaults: a table that renames one action
+  keeps every other default chord, so you never copy the whole list. `""` and
+  `"none"` are the exception — they remove a binding.
+- `terminal.working_directory = "current"` / `"inherit"` resolve against the pane
+  the session is created from, so the effective directory depends on where you
+  are when the tab or split opens. `--working-directory` supplies that directory
+  for windows that start a fresh workspace; with the default `home` policy it is
+  not used.
+- A profile's `shell` and `args` interact: an empty or `auto` `shell` means
+  `[terminal] shell`, and the profile's `args` then replace `terminal.shell_args`.
+  Setting `command` ignores both and warns if `args` is also set.
+- `appearance.tab_strip_width` only means anything when
+  `tab_bar_position = "right"`.
+- `appearance.status_bar_cpu`, `status_bar_ram` and `status_bar_clock` only mean
+  anything while `show_status_bar = true`.
+- `appearance.background_blur` warns based on `window.opacity`, because blur
+  cannot show through an opaque window.
+- An unknown `appearance.theme` falls back to `midnight`, whatever name you wrote.
+- `performance.low_power_mode` disables the cursor blink regardless of
+  `appearance.cursor_blink`.
+- `notifications.on = "never"` also suppresses the window attention hint.
+
+### Pixels, not points
+
+`[font] size` is in **logical pixels**, not points: the renderer multiplies it by
+the display scale factor and hands pixels to cosmic-text. Most other terminals
+write font sizes in points (1 pt = 1/72 inch ≈ 1.333 px at 96 dpi), so a config
+that says `size = 11` in a point-based terminal is roughly `size = 14.7` here.
+On a 2× HiDPI display `size = 13` becomes 26 physical pixels.
+
+The units are not uniform across the file:
+
+- `width`, `height`, `padding_x`, `padding_y`, `tab_strip_width` and `font.size`
+  are logical pixels and are multiplied by the display scale.
+- `divider_thickness` and `pane_gap` are **device** pixels and are used as
+  written, so they look thinner on a HiDPI display.
+- `letter_spacing` is in pixels and is not scaled either.
+- `font.line_height` is a multiplier, not a length.
+
+Copying a config from another terminal is the most common reason a font or a
+padding value "looks wrong".
 
 ## See also
 
