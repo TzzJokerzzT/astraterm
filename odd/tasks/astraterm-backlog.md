@@ -9,7 +9,7 @@ con specs `S#` y slices, como se hizo con `astraterm-terminal-capabilities.md`.
 
 ## Estado actual
 
-Rama `main`. **529 tests**, `cargo clippy --workspace --all-targets` sin advertencias,
+Rama `main`. **639 tests**, `cargo clippy --workspace --all-targets` sin advertencias,
 `cargo fmt --check` limpio.
 
 Versión publicada: **1.0.0** — tag `v1.0.0` (que apunta al commit `3806289`) y release
@@ -49,7 +49,15 @@ Ya implementado y cerrado:
 | Glifos anchos y de fallback anclados a la rejilla     | `2cc3feb`                       |
 | Anclaje por medición del clúster, no por lista blanca | `4f96b50`                       |
 | Winsize del PTY igual a la rejilla pintada            | `1bcff2c`                       |
-| `zerowidth` en `CellSnapshot` (clústeres de emoji)    | pendiente de commit             |
+| `zerowidth` en `CellSnapshot` (clústeres de emoji)    | `eaeccdd`                       |
+| Candidatos del IME junto al cursor (B3)                | `78c2ec4`                       |
+| Fuzzing del escáner y resync en el límite (B4)         | `78c2ec4`                       |
+| Hyperlinks OSC 8 clicables (B6)                        | `f49a155`                       |
+| Portapapeles nativo con pegado de imagen               | `f9b0025`                       |
+| Recorrido por clústeres sin asignación por celda (B19) | `f49a155`                       |
+| Triviales de revisión (R4-004, comentarios, L7)        | pendiente de commit             |
+| Copy-on-select a la selección primaria (B7)            | pendiente de commit             |
+| Passthrough del PTY sin copia por lectura (B15)        | pendiente de commit, parcial     |
 
 De la lista de mejoras B1–B18 de este documento, **solo las notificaciones OSC 9/777
 y el kitty por chunks están hechas**. Todo lo demás sigue pendiente.
@@ -339,6 +347,42 @@ flag. Coste S, riesgo de romper atajos si se hace mal.
 - **Coste**: S.
 - **Verificación**: `cargo test -p astraterm-renderer` en un entorno sin la fuente configurada; el
   test debe saltar, no fallar.
+
+
+### B21. Coste por celda de los datos que viajan con ella
+
+- **Por qué**: dos hallazgos de revisión con la misma forma. Cada celda de un span
+  OSC 8 clona la URI completa en su propio `Box<str>`, así que enlazar una pantalla
+  a una URI larga cuesta celdas × longitud; y el camino rápido `plain_cell` del
+  renderer duplica a mano el orden de decisión de `cluster_at` (spacer, oculto,
+  joiner, indicador regional), de modo que si uno cambia y el otro no, el pintado
+  se desalinea en silencio.
+- **Dónde**: `crates/terminal/src/engine.rs` (interning de la URI por fila o por
+  run) y `crates/renderer/src/paint.rs` (`plain_cell` frente a `cluster_at`).
+- **Qué**: internar el destino OSC 8 para que una fila enlazada lo guarde una vez;
+  y hacer que la decisión de continuación viva en un único sitio que ambos caminos
+  consulten.
+- **Coste**: S.
+- **Verificación**: una fila con la misma URI en todas las celdas tiene un solo
+  destino en memoria; y un test que compare la agrupación de `plain_cell` con la de
+  `cluster_at` sobre las mismas filas.
+
+### B22. Caches que se vacían enteras y memoria retenida
+
+- **Por qué**: B19 arregló la caché de avances, pero `RowCache` sigue vaciándose por
+  completo al llegar a 4096 filas formadas, con el mismo efecto en pantallas muy
+  altas; el techo de clústeres no es configurable; y con `copy_on_select` apagado
+  cada selección todavía construye el texto completo antes de comprobar la opción
+  (`selection_text`), que fue justo lo que se sacó del hilo de UI en el portapapeles.
+- **Dónde**: `crates/renderer/src/text.rs` (`RowCache`, `MAX_CACHED_CLUSTERS`) y
+  `crates/app/src/app.rs` (camino de la selección).
+- **Qué**: desalojo por antigüedad en `RowCache` como en la caché de clústeres;
+  comprobar `copy_on_select` antes de construir el texto; y decidir si los techos se
+  exponen en configuración.
+- **Coste**: S.
+- **Verificación**: una pantalla de más filas distintas que el techo no vuelve a
+  formar todo cada frame; y con la opción apagada, seleccionar en un scrollback
+  grande no asigna.
 
 ---
 

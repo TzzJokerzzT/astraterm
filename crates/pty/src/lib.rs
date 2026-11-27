@@ -10,6 +10,9 @@
 //!   control rather than silent data loss.
 //! * **No orphan processes.** A waiter thread reports the exit status, and the
 //!   handle can always be asked to terminate the child.
+//! * **No copy on the read path.** The read buffer is moved to the consumer and handed
+//!   back through a recycling channel, so a chunk is neither copied into a right-sized
+//!   `Vec` nor reallocated per read (see [`OutputChunk`]).
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -55,8 +58,13 @@ pub fn read_child_state(pid: u32) -> Option<ChildState> {
     let line = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parse_proc_stat(&line)
 }
-/// Bounded output queue depth, in chunks (about 2 MiB per session).
+/// Bounded output queue depth, in chunks. A chunk carries a recycled buffer of at most
+/// [`READ_CHUNK`] bytes, so a full queue is at most about 2 MiB per session.
 const OUTPUT_QUEUE: usize = 64;
+/// Slots for read buffers the consumer handed back. The steady-state flow (one buffer
+/// per queued chunk plus the one being read) always has room, so a buffer is only freed
+/// when a consumer holds many chunks at once.
+const RECYCLE_QUEUE: usize = OUTPUT_QUEUE + 2;
 /// Bounded input queue depth, in messages.
 const INPUT_QUEUE: usize = 1024;
 /// Grace period between closing the PTY and killing a surviving child.
@@ -126,6 +134,70 @@ enum Input {
     Shutdown,
 }
 
+/// One chunk of output read from the PTY master.
+///
+/// The reader thread moves the buffer it read into to the consumer instead of copying
+/// the bytes into a right-sized `Vec`, and the consumer hands that buffer back through
+/// a recycling channel when the chunk is dropped. A read therefore costs neither a byte
+/// copy nor an allocation in steady state.
+///
+/// The chunk keeps the whole buffer and records how many of its bytes are valid, so a
+/// recycled buffer needs neither truncation nor re-zeroing before the next read. Only
+/// the valid prefix is ever exposed.
+pub struct OutputChunk {
+    buffer: Vec<u8>,
+    len: usize,
+    recycle: Option<Sender<Vec<u8>>>,
+}
+
+impl OutputChunk {
+    fn new(buffer: Vec<u8>, len: usize, recycle: Sender<Vec<u8>>) -> Self {
+        Self {
+            buffer,
+            len,
+            recycle: Some(recycle),
+        }
+    }
+
+    /// The bytes read from the PTY, in the order they arrived.
+    pub fn as_slice(&self) -> &[u8] {
+        self.buffer.get(..self.len).unwrap_or(&[])
+    }
+}
+
+impl std::ops::Deref for OutputChunk {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for OutputChunk {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl std::fmt::Debug for OutputChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutputChunk")
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl Drop for OutputChunk {
+    fn drop(&mut self) {
+        // Non-blocking on purpose: the read path must never wait on the consumer. A
+        // full recycle queue, or a reader that has already gone, only means the buffer
+        // is freed instead of reused.
+        if let Some(recycle) = self.recycle.take() {
+            let _ = recycle.try_send(std::mem::take(&mut self.buffer));
+        }
+    }
+}
+
 /// A live PTY-backed session handle.
 ///
 /// Dropping the handle asks the writer thread to close the PTY, which terminates
@@ -133,7 +205,7 @@ enum Input {
 /// fallback so shutdown is deterministic.
 pub struct PtyHandle {
     input: Sender<Input>,
-    output: Receiver<Vec<u8>>,
+    output: Receiver<OutputChunk>,
     exit: Receiver<ExitReason>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     child_pid: Option<u32>,
@@ -206,7 +278,10 @@ impl PtyHandle {
     }
 
     /// Pops one chunk of output without blocking.
-    pub fn try_recv_output(&self) -> Option<Vec<u8>> {
+    ///
+    /// Dropping the chunk hands its buffer back to the reader thread, so a consumer
+    /// that keeps a chunk delays that reuse but never loses a byte.
+    pub fn try_recv_output(&self) -> Option<OutputChunk> {
         self.output.try_recv().ok()
     }
 
@@ -407,7 +482,9 @@ pub fn spawn_with_waker(spec: &PtySpec, waker: Option<Waker>) -> Result<PtyHandl
         .map_err(|error| PtyError::Attach(error.to_string()))?;
     let master = pair.master;
 
-    let (output_tx, output_rx) = bounded::<Vec<u8>>(OUTPUT_QUEUE);
+    let (output_tx, output_rx) = bounded::<OutputChunk>(OUTPUT_QUEUE);
+    // Buffers the consumer has finished with, sent back here to be read into again.
+    let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(RECYCLE_QUEUE);
     let (input_tx, input_rx) = bounded::<Input>(INPUT_QUEUE);
     let (exit_tx, exit_rx) = bounded::<ExitReason>(4);
 
@@ -417,13 +494,27 @@ pub fn spawn_with_waker(spec: &PtySpec, waker: Option<Waker>) -> Result<PtyHandl
     std::thread::Builder::new()
         .name("astraterm-pty-read".to_owned())
         .spawn(move || {
+            // The reader owns one buffer to read into; when the consumer drops a chunk
+            // it hands that buffer back, so the same allocations cycle. The first
+            // buffer is allocated once, not per read.
             let mut buffer = vec![0u8; READ_CHUNK];
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(read) => {
+                        // A buffer the consumer returned, or a fresh one while every
+                        // buffer is still queued. Swapping is a pointer move: no byte
+                        // read above is copied.
+                        let next = match recycle_rx.try_recv() {
+                            Ok(next) if next.len() == READ_CHUNK => next,
+                            _ => vec![0u8; READ_CHUNK],
+                        };
+                        let filled = std::mem::replace(&mut buffer, next);
                         // Blocking send: this is the deliberate backpressure point.
-                        if output_tx.send(buffer[..read].to_vec()).is_err() {
+                        if output_tx
+                            .send(OutputChunk::new(filled, read, recycle_tx.clone()))
+                            .is_err()
+                        {
                             break;
                         }
                         if let Some(waker) = read_waker.as_ref() {
@@ -543,6 +634,23 @@ mod tests {
             "timed out waiting for `{needle}`; collected: {:?}",
             String::from_utf8_lossy(&collected)
         );
+    }
+
+    /// A child that writes a known byte sequence with no control characters, so
+    /// nothing the line discipline can rewrite stands between the child and us.
+    fn ordered_output_spec(last: u32) -> PtySpec {
+        PtySpec {
+            program: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), format!("seq 1 {last} | tr -d '\\n'")],
+            ..PtySpec::default()
+        }
+    }
+
+    fn expected_ordered_output(last: u32) -> Vec<u8> {
+        (1..=last)
+            .map(|number| number.to_string())
+            .collect::<String>()
+            .into_bytes()
     }
 
     fn wait_for_exit(handle: &mut PtyHandle) -> ExitReason {
@@ -789,6 +897,93 @@ mod tests {
             "shutdown must not hang"
         );
         assert!(!handle.is_running());
+    }
+
+    #[test]
+    fn output_bytes_arrive_identically_and_in_order() {
+        // Pins the read path: what the child wrote must reach the consumer byte for
+        // byte and in order, and no chunk may exceed a single read.
+        let spec = ordered_output_spec(60_000);
+        let expected = expected_ordered_output(60_000);
+        assert!(
+            expected.len() > READ_CHUNK_BYTES * 4,
+            "the sequence must span several reads, got {} bytes",
+            expected.len()
+        );
+        let mut handle = spawn(&spec).unwrap();
+
+        let mut received = Vec::new();
+        let mut chunks = 0usize;
+        let mut exit = None;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            while let Some(chunk) = handle.try_recv_output() {
+                chunks += 1;
+                assert!(
+                    chunk.len() <= READ_CHUNK_BYTES,
+                    "a chunk of {} bytes exceeds one read",
+                    chunk.len()
+                );
+                received.extend_from_slice(&chunk);
+            }
+            if exit.is_none() {
+                exit = handle.try_recv_exit();
+            }
+            if exit.is_some() && received.len() >= expected.len() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(chunks > 1, "the output must span several chunks");
+        assert_eq!(
+            received.len(),
+            expected.len(),
+            "the child wrote {} bytes, the consumer saw {}",
+            expected.len(),
+            received.len()
+        );
+        assert!(
+            received == expected,
+            "the bytes do not match the child's output"
+        );
+    }
+
+    #[test]
+    fn every_byte_survives_while_the_consumer_holds_the_chunks() {
+        // A consumer that keeps every chunk must still see a complete, ordered
+        // stream: no chunk may be mutated after it has been handed over.
+        let spec = ordered_output_spec(20_000);
+        let expected = expected_ordered_output(20_000);
+        let mut handle = spawn(&spec).unwrap();
+
+        let mut held = Vec::new();
+        let mut bytes = 0usize;
+        let mut exit = None;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            while let Some(chunk) = handle.try_recv_output() {
+                bytes += chunk.len();
+                held.push(chunk);
+            }
+            if exit.is_none() {
+                exit = handle.try_recv_exit();
+            }
+            if exit.is_some() && bytes >= expected.len() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let mut received = Vec::new();
+        for chunk in &held {
+            received.extend_from_slice(chunk);
+        }
+        assert_eq!(received.len(), expected.len(), "bytes were lost or added");
+        assert!(
+            received == expected,
+            "the held chunks do not match the child's output"
+        );
     }
 
     #[test]

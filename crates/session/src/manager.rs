@@ -247,7 +247,9 @@ impl Session {
             };
             chunks += 1;
             processed += chunk.len();
-            self.engine.process(&chunk);
+            // Borrow the chunk's buffer for the parse; it goes back to the reader when
+            // the chunk is dropped at the end of this iteration.
+            self.engine.process(chunk.as_slice());
             self.dirty = true;
         }
         // Saturating: a chunk may overshoot the budget by at most one read, and the
@@ -868,6 +870,50 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(passes > 1, "a 2 MB flood must be split across pump passes");
+    }
+
+    #[test]
+    fn passthrough_accounting_is_unchanged_by_the_pump() {
+        // The pump hands each chunk straight to the engine, so the reported byte count
+        // is the child's exact output and the input path keeps counting nothing.
+        let total = 1_000_000usize;
+        let mut manager = SessionManager::new();
+        let id = manager
+            .create(
+                PaneId::next(),
+                &spec(
+                    "/bin/sh",
+                    &["-c", &format!("head -c {total} /dev/zero | tr '\\0' 'y'")],
+                ),
+                80,
+                24,
+            )
+            .unwrap();
+        let mut reported = 0usize;
+        let mut passes = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            let report = manager.pump();
+            passes += 1;
+            reported += report.bytes_processed;
+            // The typed input path is untouched by the output change and must keep
+            // reporting no drops.
+            manager.write(id, b"");
+            if reported >= total && manager.iter().all(|session| session.exit.is_some()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            reported, total,
+            "the pump must report exactly the bytes the child wrote"
+        );
+        assert!(passes > 1, "a 1 MB flood must span several pump passes");
+        assert_eq!(
+            manager.get(id).unwrap().input_drops,
+            0,
+            "no input may be counted as dropped"
+        );
     }
 
     #[test]
