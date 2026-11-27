@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-26
+
+Minor release: the remaining backlog that has functional value, plus the idle budget
+that never did anything.
+
+### Added
+
+- **Shell integration (`OSC 133`).** The engine records the prompt and command marks a
+  shell emits, and the status bar shows whether a command is running and the exit code
+  of the last one. Two new bindings jump between prompts: `ctrl+shift+up` and
+  `ctrl+shift+down`, both remappable in `[keys]`.
+- **Click granularity and rectangular selection.** Double click selects a word using
+  `terminal.word_delimiters`, triple click the line, and Alt+drag selects a rectangle
+  whose copy keeps the rectangle's padding.
+- **The IME composition is drawn** at the cursor and cleared on commit, instead of being
+  invisible until it is committed.
+- **`[terminal] bell`** chooses `"visual"` (the default: the status message and a border
+  flash), `"none"`, or `"audible"`, which rings through a worker thread and degrades to
+  the visual path when no sound backend exists.
+
+### Changed
+
+- `performance.max_fps_when_idle` is finally read: it caps redraws while nothing happens,
+  `0` meaning no cap, and it can never delay a frame caused by output, input or a resize.
+- `word_delimiters` and `max_fps_when_idle` are no longer listed as accepted-but-unapplied.
+
+### Performance
+
+- **Only the damaged rows are repainted.** The renderer composes into a retained canvas,
+  repaints the bands that changed and blits them into the frame; an unchanged frame draws
+  and presents nothing. Measured on a 480x135-cell screen: one changed line redraws 1.6 %
+  of the characters (2 of 135 bands), damage tracking costs 87 us against 2.2 ms of scene
+  composition.
+- `RowCache` evicts its oldest rows instead of clearing itself, with a bound that fits a 4K
+  screen; `RowCache` and the cluster cache no longer collapse on large screens.
+- An `OSC 8` destination is stored once per run instead of being cloned into every cell.
+- With `copy_on_select` disabled no selection text is built at all.
+
+### Fixed
+
+- Ligatures that span several cells no longer shift the rest of the row: each piece lands
+  on its columns while the substitution still shapes as one glyph.
+- Sixel `HLS` palettes are decoded with the same fidelity as RGB and grayscale, and a
+  malformed palette is refused instead of failing the whole image.
+- Text before a sequence introducer that straddled a read boundary was lost; the scanner
+  now carries it across reads.
+
 ## [1.2.3] - 2026-11-26
 
 ### Added

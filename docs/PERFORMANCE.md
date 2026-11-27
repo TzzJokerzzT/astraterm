@@ -172,9 +172,10 @@ Metrics and how to obtain them:
 - **No backpressure feedback in the UI.** A full input queue increments
   `Session::input_drops`; nothing surfaces it today, so a dropped keystroke is not
   visible to the user.
-- **No idle FPS cap.** `performance.max_fps_when_idle` is accepted and validated
-  but there is no idle redraw loop to cap; redraws are driven by events and the
-  blink timer.
+- **The idle redraw budget is a cap, not a scheduler.** `performance.max_fps_when_idle`
+  bounds how often a redraw may happen while nothing is happening, `0` meaning no cap;
+  it can never delay a redraw caused by output, input or a resize, which request their
+  frame directly.
 - **Search cost is linear in the visible screen.** The interactive search scans
   every visible row and character per keystroke (`find_in_snapshot`); the
   buffer-wide API (`crates/terminal/src/search.rs`) scans line by line and is not
