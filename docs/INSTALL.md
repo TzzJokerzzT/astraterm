@@ -27,8 +27,12 @@ In order, on every run:
    downloads or installs a toolchain on its own. It also checks that `cc` and
    `pkg-config` are present, because crates with C dependencies (`fontconfig`,
    `freetype`, `wayland`) need them.
-3. **Font.** Checks that the default family `JetBrainsMono Nerd Font` is visible
-   to fontconfig and prints the per-distribution way to install it. It never
+3. **Font.** Asks fontconfig for the default family `JetBrainsMono Nerd Font`
+   instead of assuming the distribution provides it, and only when it is
+   genuinely missing offers to install the distribution's font package. If you
+   decline that offer, it detects a family this machine already has — another
+   Nerd Font first, then whatever fontconfig answers for `monospace` — and
+   offers to create `~/.config/astraterm/config.toml` with it. It never
    downloads font files.
 4. **Desktop integration.** Checks `notify-send` (libnotify). It is a runtime
    feature — save and reload notifications are lost without it — so a missing
@@ -48,7 +52,7 @@ if the checkout is not at that release; see
 |---|---|
 | *(none)* | Check, ask before installing packages, build |
 | `--dry-run` | Print every command that would change the system or the tree and execute none of them |
-| `--yes`, `-y` | Do not ask for confirmation before installing packages (`sudo` still asks for your password) |
+| `--yes`, `-y` | Do not ask for confirmation before installing packages, and accept the font offer and the fallback configuration offer without prompting (`sudo` still asks for your password) |
 | `--install` | After a successful build, install the binary, desktop entry and icons for the current user |
 | `--no-build` | Skip `cargo build --release --locked` |
 | `--version <tag>` | Build a specific release (`v1.0.0`, or `1.0.0`). The tag must exist, `HEAD` must be exactly at it and the working tree must be clean; the script stops with code `4` otherwise and never changes your checkout |
@@ -58,7 +62,8 @@ if the checkout is not at that release; see
 
 `--dry-run` prints each mutating step prefixed with `would run:` and executes
 nothing: no packages, no build, no files copied. Read-only probes still run —
-`command -v`, `cat /etc/os-release`, `cargo --version`, `fc-list : family` — so
+`command -v`, `cat /etc/os-release`, `cargo --version`, `fc-list : family`,
+`fc-match`, `pacman -T` — so
 the printed plan matches the machine you are on. Use it to review the exact
 `pacman`/`apt-get`/`dnf` command before letting the script touch the system.
 
@@ -126,10 +131,11 @@ Preview it first with `--dry-run --version v1.0.0`, which uses no network.
 | other | The exit status of the command that failed (`cargo`, `pacman`, `apt-get`, `dnf`) |
 
 The script refuses to run as root: compile as your own user, and let it ask
-`sudo` for the package step only. It never writes to
-`~/.config/astraterm/config.toml` or to the themes directory, never enables
-third-party repositories (such as the Nerd Fonts COPR), and never installs
-anything from the network apart from distribution packages.
+`sudo` for the package step only. It never overwrites an existing
+`~/.config/astraterm/config.toml` — it only offers to create one when there is
+none — and never writes to the themes directory, never enables third-party
+repositories (such as the Nerd Fonts COPR), and never installs anything from the
+network apart from distribution packages.
 
 ## Requirements
 
@@ -149,7 +155,7 @@ Vulkan or OpenGL driver for wgpu.
 | Vulkan loader | `vulkan-icd-loader` | `libvulkan1` | `vulkan-loader` |
 | Notifications | `libnotify` | `libnotify-bin` | `libnotify` |
 | VCS | `git` | `git` | `git` |
-| Font | `ttf-jetbrains-mono-nerd` | see [Font](#font) | see [Font](#font) |
+| Font | `ttf-jetbrains-mono-nerd`, offered only when missing | see [Font](#font) | see [Font](#font) |
 
 On a vendor GPU driver (NVIDIA, AMD proprietary) the distribution's own Vulkan
 driver package replaces `mesa`; keep exactly one ICD for the GPU you use. Check
@@ -161,12 +167,34 @@ vulkaninfo --summary    # or: ls /usr/share/vulkan/icd.d/
 
 ## Font
 
-The default family is `JetBrainsMono Nerd Font`. If it is missing, AstraTerm
-falls back to `JetBrains Mono`, `Symbols Nerd Font`, `Noto Color Emoji`,
-`DejaVu Sans Mono` and finally `monospace`, so it always renders — but the
-powerline and icon glyphs used by modern prompts will be missing.
+The default family is `JetBrainsMono Nerd Font`. The setup script does not put
+it in the dependency list: it asks fontconfig whether the family is there and
+only offers the package when it is missing. That distinction is what makes a
+fresh install work on a distribution that ships the family through another
+package.
 
-- **Arch:** `sudo pacman -S ttf-jetbrains-mono-nerd`
+Omarchy is the case to know: it installs `ttf-jetbrains-mono-nerd-basic`, which
+*provides* `ttf-jetbrains-mono-nerd` and *conflicts* with it. `pacman -S
+--needed ttf-jetbrains-mono-nerd` resolves on the package name and not on what is
+already provided, so asking for it by name would offer to remove the font the
+distribution ships. The script probes `pacman -T` for the capability and leaves
+`pacman` alone when an installed package already provides it.
+
+When the family is missing and you decline the package — or your distribution
+packages no Nerd Font — the script detects a family this machine already has:
+another installed Nerd Font first, so the prompt icons keep working, then
+whatever fontconfig answers for `monospace`. It then offers to create
+`~/.config/astraterm/config.toml` with `[font] family` set to that family. An
+existing configuration is never modified; the script prints the exact lines to
+add instead, so the choice stays yours.
+
+Without the family AstraTerm still renders: cosmic-text resolves a missing
+family through the system font database and `monospace` is the last resort, so
+the grid never disappears — but the powerline and icon glyphs that modern
+prompts use will be missing.
+
+- **Arch:** `sudo pacman -S ttf-jetbrains-mono-nerd` — the script offers exactly
+  this command, and skips it when another package already provides the family.
 - **Debian/Ubuntu:** `sudo apt install fonts-jetbrains-mono` provides the
   *JetBrains Mono* fallback. For the Nerd Font variant, download it from
   <https://www.nerdfonts.com/font-downloads>, unpack it into
@@ -244,7 +272,7 @@ in the real checksums before publishing a package.
 | `error: do not run this script as root` | Run it as your user; it calls `sudo` itself for package installation |
 | Build fails in `fontconfig-sys` / `freetype-sys` | `pkg-config` or the `-dev` packages are missing |
 | Build fails in `wayland-sys` / `xkbcommon` | Install the Wayland and libxkbcommon development packages |
-| Window opens but the text is boxes | No usable font: install a Nerd Font or set `[font] family` |
+| Window opens but the text is boxes | No usable font: re-run `./scripts/setup.sh` and accept the font offer, or set `[font] family` to an installed family |
 | `failed to create surface` / no adapter | No Vulkan ICD or OpenGL driver for this GPU; install `mesa` (or the vendor driver) and check `vulkaninfo` |
 | Clipboard does nothing | The session offers no clipboard: neither the Wayland data-control protocol nor an X11 display is available |
 | No save/reload notification | `libnotify` / `notify-send` is missing |

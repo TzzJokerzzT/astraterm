@@ -7,16 +7,26 @@
 #      prints the exact dependency set for that distribution;
 #   2. checks the Rust toolchain (1.85+, edition 2024) and refuses to continue
 #      instead of downloading a toolchain behind your back;
-#   3. checks the default font family (JetBrainsMono Nerd Font) and the optional
-#      desktop notifications (`notify-send`); the clipboard is linked in;
-#   4. builds with `cargo build --release --locked`;
-#   5. with `--install`, runs `packaging/linux/install.sh` to put the binary,
+#   3. checks the font: the default family (JetBrainsMono Nerd Font) is asked of
+#      fontconfig, never assumed from the distribution. When it is missing the
+#      script offers the distribution's own font package, and when that offer is
+#      declined it offers to create ~/.config/astraterm/config.toml with a
+#      family this machine already has. The Nerd Font is deliberately absent
+#      from the dependency list: on a distribution that ships the family through
+#      another package (Omarchy ships ttf-jetbrains-mono-nerd-basic, which
+#      provides and conflicts with ttf-jetbrains-mono-nerd), installing it by
+#      name would offer to remove the distribution's own package;
+#   4. checks the optional desktop notifications (`notify-send`); the clipboard
+#      is linked into the binary;
+#   5. builds with `cargo build --release --locked`;
+#   6. with `--install`, runs `packaging/linux/install.sh` to put the binary,
 #      the desktop entry and the icons in your XDG directories.
 #
-# It never writes to ~/.config/astraterm, never runs the build as root, never
-# installs a Rust toolchain on its own, and never downloads fonts or other
-# files from the network. Every step is a check plus an idempotent command, so
-# running it again on a prepared machine changes nothing.
+# It never overwrites an existing ~/.config/astraterm/config.toml (it only
+# offers to create one when there is none), never runs the build as root, never
+# installs a Rust toolchain on its own, never adds a third-party repository and
+# never downloads files from the network. Every step is a check plus an
+# idempotent command, so running it again on a prepared machine changes nothing.
 #
 # Usage:
 #   ./scripts/setup.sh [--dry-run] [--yes] [--install] [--no-build] [--version <tag>]
@@ -51,6 +61,10 @@ set -euo pipefail
 
 readonly MIN_RUST_MINOR=85
 readonly DEFAULT_FONT_FAMILY="JetBrainsMono Nerd Font"
+# The package that carries the default family in the distributions that package
+# it at all. Only ever installed after an explicit offer: see
+# offer_nerd_font_install.
+readonly NERD_FONT_PACKAGE="ttf-jetbrains-mono-nerd"
 
 readonly EXIT_OK=0
 readonly EXIT_USAGE=2
@@ -78,8 +92,11 @@ Usage:
 Options:
   --dry-run        print every command that would change the system or the tree and
                    execute none of them. Read-only probes (command -v, cargo
-                   --version, fc-list) still run so the plan matches this machine.
-  --yes, -y        do not ask for confirmation before installing packages
+                   --version, fc-list, pacman -T) still run so the plan matches
+                   this machine.
+  --yes, -y        do not ask for confirmation before installing packages, and
+                   accept the font offer and the fallback configuration offer
+                   without prompting
   --install        after a successful build, install the binary for the current user
                    with packaging/linux/install.sh
   --no-build       skip the release build
@@ -92,7 +109,8 @@ Options:
 Exit codes: 0 success, 2 usage error or root, 3 Rust toolchain missing or
             older than 1.85, 4 the --version tag is missing, HEAD is not at it,
             or the working tree has changes; a failing command exits with its
-            own status. Declining the package installation is not a failure.
+            own status. Declining the package installation, the font offer or the
+            fallback configuration is not a failure.
 
 Documentation: docs/INSTALL.md
 EOF
@@ -430,12 +448,17 @@ install_system_packages() {
     case $manager in
     pacman)
         # build tools, Wayland/X11 + font/Vulkan runtime libraries, desktop
-        # notifications, git, and the default Nerd Font family. The clipboard
-        # needs no package: it is linked into the binary (arboard).
+        # notifications and git. The clipboard needs no package: it is linked
+        # into the binary (arboard). The Nerd Font is *not* here on purpose:
+        # `pacman -S --needed ttf-jetbrains-mono-nerd` matches on the package
+        # name, not on what an installed package provides, and Omarchy's
+        # ttf-jetbrains-mono-nerd-basic provides that name while conflicting
+        # with it, so this list would offer to remove the distribution's own
+        # font. The font step below asks fontconfig whether the family exists
+        # and only then offers the package.
         packages=(
             base-devel wayland libxkbcommon fontconfig freetype2 mesa
             vulkan-icd-loader libx11 libnotify git
-            ttf-jetbrains-mono-nerd
         )
         install_cmd=(pacman -S --needed)
         # `--yes` has to mean non-interactive end to end: pacman asks for its own
@@ -445,7 +468,7 @@ install_system_packages() {
         fi
         ;;
     apt)
-        # Debian and Ubuntu. The Nerd Font is not packaged here; the font check
+        # Debian and Ubuntu. The Nerd Font is not packaged here; the font step
         # below points at the closest packaged family and at a manual install.
         packages=(
             build-essential pkg-config git libwayland-dev libxkbcommon-dev
@@ -547,51 +570,238 @@ check_toolchain() {
 }
 
 font_hint() {
-    local family=$1
-    info "AstraTerm defaults to $DEFAULT_FONT_FAMILY and falls back to JetBrains Mono,"
-    info "Symbols Nerd Font, Noto Color Emoji, DejaVu Sans Mono and finally monospace."
-    info "install a Nerd Font with one of:"
-    case $family in
+    local distro=$1
+    case $distro in
     arch)
-        info "  sudo pacman -S ttf-jetbrains-mono-nerd"
+        info "  sudo pacman -S $NERD_FONT_PACKAGE"
+        info "  (a distribution that already ships the family through another package,"
+        info "  such as Omarchy's ttf-jetbrains-mono-nerd-basic, needs nothing)"
         ;;
     debian)
-        info "  sudo apt install fonts-jetbrains-mono     # JetBrains Mono, the fallback family"
-        info "  or download a Nerd Font from https://www.nerdfonts.com/font-downloads"
-        info "  and unpack it into ~/.local/share/fonts, then run: fc-cache -f"
+        info "  Debian and Ubuntu package JetBrains Mono, the fallback family, without"
+        info "  the patched Nerd glyphs; there is no package for the Nerd Font itself:"
+        info "  sudo apt install fonts-jetbrains-mono"
+        info "  and for the icons, download a Nerd Font from https://www.nerdfonts.com/font-downloads,"
+        info "  unpack it into ~/.local/share/fonts and run: fc-cache -f"
         ;;
     fedora)
-        info "  sudo dnf install jetbrains-mono-fonts      # JetBrains Mono, the fallback family"
-        info "  or enable the Nerd Fonts copr: atim/nerd-fonts"
+        info "  Fedora packages JetBrains Mono, the fallback family, without the patched"
+        info "  Nerd glyphs: sudo dnf install jetbrains-mono-fonts"
+        info "  for the icons, either enable the atim/nerd-fonts copr yourself (this"
+        info "  script adds no repositories) or unpack a Nerd Font release into"
+        info "  ~/.local/share/fonts and run: fc-cache -f"
         ;;
     *)
         info "  install $DEFAULT_FONT_FAMILY with your package manager, or unpack a"
         info "  Nerd Font release into ~/.local/share/fonts and run: fc-cache -f"
         ;;
     esac
-    info "any monospaced font works today if you set [font] family in config.toml"
+}
+
+font_aliases() {
+    # One family name per line from every face fontconfig knows. `fc-list` prints
+    # the aliases of a face comma-separated ("JetBrainsMono Nerd Font,JetBrainsMono
+    # NF"), so they are split and trimmed before anything is compared.
+    fc-list : family 2>/dev/null | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true
+}
+
+family_installed() {
+    # Exact, case-insensitive match against one alias. A substring test would call
+    # "JetBrainsMono Nerd Font Mono" a match for "JetBrainsMono Nerd Font" and
+    # report the default as present when only its sibling is.
+    local wanted=${1,,} alias
+    while IFS= read -r alias; do
+        [ -n "$alias" ] || continue
+        if [ "${alias,,}" = "$wanted" ]; then
+            return 0
+        fi
+    done < <(font_aliases)
+    return 1
+}
+
+detect_fallback_family() {
+    # The family this machine can actually render. A different installed Nerd Font
+    # keeps the prompts' icons working, so it wins over a plain monospaced family.
+    local aliases family=""
+    aliases=$(font_aliases)
+
+    if [ -n "$aliases" ]; then
+        family=$(printf '%s\n' "$aliases" | grep -i -m1 'mono.*nerd font' || true)
+        if [ -z "$family" ]; then
+            family=$(printf '%s\n' "$aliases" | grep -i -m1 'nerd font' || true)
+        fi
+    fi
+    if [ -z "$family" ]; then
+        # Whatever fontconfig answers for the generic alias, then the alias itself
+        # as a last resort: cosmic-text resolves "monospace" through the database.
+        family=$(fc-match -f '%{family[0]}' monospace 2>/dev/null || true)
+    fi
+    if [ -z "$family" ]; then
+        family="monospace"
+    fi
+    printf '%s' "$family"
+}
+
+nerd_capability_satisfied() {
+    # `pacman -T` prints only the requirements that are *not* satisfied, so an
+    # empty answer means an installed package already provides the capability.
+    # Omarchy's ttf-jetbrains-mono-nerd-basic is exactly that: it provides
+    # ttf-jetbrains-mono-nerd and conflicts with the packaged one, so asking
+    # pacman for the package by name would offer to remove the font the
+    # distribution ships.
+    command -v pacman >/dev/null 2>&1 || return 1
+    local missing
+    missing=$(pacman -T "$NERD_FONT_PACKAGE" 2>/dev/null || true)
+    [ -z "$missing" ]
+}
+
+font_config_path() {
+    printf '%s/astraterm/config.toml' "${XDG_CONFIG_HOME:-$HOME/.config}"
+}
+
+offer_nerd_font_install() {
+    # Returns 0 when the default family ends up visible to fontconfig, 1 when it
+    # has to stay missing.
+    local distro=$1 sudo_cmd
+    local -a cmd=()
+
+    case $distro in
+    arch)
+        if nerd_capability_satisfied; then
+            info "an installed package already provides $NERD_FONT_PACKAGE"
+            info "(Omarchy's ttf-jetbrains-mono-nerd-basic provides it and conflicts"
+            info "with the packaged one), so pacman is left alone."
+            return 1
+        fi
+        sudo_cmd=$(sudo_prefix)
+        if [ -z "$sudo_cmd" ]; then
+            warn "sudo is not installed, so the font has to be installed by hand."
+            font_hint "$distro"
+            return 1
+        fi
+        cmd=("$sudo_cmd" pacman -S --needed)
+        # `--yes` has to mean non-interactive end to end here too: pacman asks its
+        # own transaction confirmation, which would block a scripted or CI run.
+        if [ "$assume_yes" -eq 1 ]; then
+            cmd+=(--noconfirm)
+        fi
+        cmd+=("$NERD_FONT_PACKAGE")
+        ;;
+    *)
+        # apt and dnf at most package the plain JetBrains Mono family, which does
+        # not carry the Nerd glyphs, and the Nerd Font itself only comes from a
+        # third-party repository. This script adds none, so there is nothing to
+        # offer: say what to do instead of pretending a package would fix it.
+        info "this distribution has no packaged $DEFAULT_FONT_FAMILY:"
+        font_hint "$distro"
+        return 1
+        ;;
+    esac
+
+    if [ "$dry_run" -eq 1 ]; then
+        printf '  would ask: install %s with %s? [Y/n]\n' "$NERD_FONT_PACKAGE" "${cmd[1]}"
+        printf '  would run:'
+        printf ' %q' "${cmd[@]}"
+        printf '\n'
+        info "declining it falls through to the family this machine already has"
+        return 1
+    fi
+
+    if ! confirm "install $NERD_FONT_PACKAGE with ${cmd[1]}?"; then
+        info "skipped the font installation"
+        return 1
+    fi
+
+    if ! run "${cmd[@]}"; then
+        warn "the font installation failed (see the output above)."
+        return 1
+    fi
+    if family_installed "$DEFAULT_FONT_FAMILY"; then
+        ok "$DEFAULT_FONT_FAMILY found"
+    else
+        warn "the package is installed but $DEFAULT_FONT_FAMILY is not visible to fontconfig yet."
+        info "log out and back in (or run: fc-cache -f) and re-run this script."
+    fi
+    return 0
+}
+
+offer_fallback_config() {
+    # The family is only half the story: the grid and the shaper are built from
+    # the family the configuration names, so a machine without the default has to
+    # be told about the one it has. An existing configuration is never touched.
+    local family=${1//\"/} path
+    path=$(font_config_path)
+
+    if [ -e "$path" ]; then
+        info "your configuration already exists and is never modified:"
+        info "  $path"
+        info "to use it, set this there:"
+        info "  [font]"
+        info "  family = \"$family\""
+        return 0
+    fi
+
+    if [ "$dry_run" -eq 1 ]; then
+        printf '  would ask: create %s with font.family = "%s"? [Y/n]\n' "$path" "$family"
+        return 0
+    fi
+
+    if ! confirm "create $path with font.family = \"$family\"?"; then
+        info "left the default in place: set [font] family in $path when you want it"
+        return 0
+    fi
+
+    # A file with one section is a valid configuration: every other key of
+    # FontConfig keeps its default through #[serde(default)].
+    local dir=${path%/*}
+    if ! mkdir -p -- "$dir" 2>/dev/null; then
+        warn "could not create $dir"
+        info "set it yourself in some config.toml: [font] family = \"$family\""
+        return 0
+    fi
+    if ! {
+        printf '# Written by scripts/setup.sh: %s was not installed, so this file\n' \
+            "$DEFAULT_FONT_FAMILY"
+        printf '# names a family this machine already has. Every other key keeps its\n'
+        printf '# default; see docs/CONFIGURATION.md for the rest.\n'
+        printf '[font]\nfamily = "%s"\n' "$family"
+    } >"$path" 2>/dev/null; then
+        warn "could not write $path"
+        info "set it yourself: [font] family = \"$family\""
+        return 0
+    fi
+    ok "$path"
+    info "restart AstraTerm to use it"
 }
 
 check_font() {
-    local family=$1
+    local distro=$1 fallback
     step "Font"
 
     if ! command -v fc-list >/dev/null 2>&1; then
         warn "fontconfig (fc-list) is not installed, so the font cannot be checked."
-        font_hint "$family"
+        font_hint "$distro"
         return 0
     fi
 
-    # `grep -q` would close the pipe early and, with `pipefail`, make this test
-    # fail on a machine that does have the font. Collect first, then match.
-    local families
-    families=$(fc-list : family 2>/dev/null || true)
-    if [[ $families == *"$DEFAULT_FONT_FAMILY"* ]]; then
+    if family_installed "$DEFAULT_FONT_FAMILY"; then
         ok "$DEFAULT_FONT_FAMILY found"
-    else
-        warn "$DEFAULT_FONT_FAMILY not found: text falls back to another family and glyphs may be missing."
-        font_hint "$family"
+        return 0
     fi
+
+    warn "$DEFAULT_FONT_FAMILY not found: text falls back to another family and glyphs may be missing."
+
+    if offer_nerd_font_install "$distro"; then
+        return 0
+    fi
+
+    fallback=$(detect_fallback_family)
+    info "family already installed on this machine: $fallback"
+    case ${fallback,,} in
+    *"nerd font"*) ;;
+    *) info "it has no Nerd glyphs, so prompt icons can still be missing" ;;
+    esac
+    offer_fallback_config "$fallback"
 }
 
 check_desktop_tools() {

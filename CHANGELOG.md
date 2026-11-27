@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The font step in `scripts/setup.sh` is interactive.** When `JetBrainsMono Nerd
+  Font` is not visible to fontconfig the script offers the distribution's font
+  package; declining it makes the script detect a family the machine already has
+  — another installed Nerd Font first, then whatever fontconfig answers for
+  `monospace` — and offer to create `~/.config/astraterm/config.toml` with
+  `[font] family` set to it. An existing configuration is never modified: the
+  script prints the lines to add instead.
+- `scripts/tests/version-check.sh` now covers the font step with a stubbed
+  `fc-list`/`fc-match` and an `XDG_CONFIG_HOME` pointing into the fixture, so the
+  cases are decided by the fixture and never by the fonts of the machine that runs
+  them.
+
+### Fixed
+
+- **`scripts/setup.sh` no longer fights the distribution over the Nerd Font.** The
+  font package sat in the dependency list, so `pacman -S --needed
+  ttf-jetbrains-mono-nerd` ran even on a machine that already had the family.
+  `--needed` compares package names, not what an installed package provides, and
+  Omarchy ships `ttf-jetbrains-mono-nerd-basic`, which provides
+  `ttf-jetbrains-mono-nerd` while conflicting with it — so a fresh Omarchy install
+  was offered the removal of the font the distribution installs. The package is
+  now offered only when fontconfig cannot see the family and `pacman -T` shows no
+  installed package already provides it.
+
 ## [1.3.0] - 2026-11-26
 
 Minor release: the remaining backlog that has functional value, plus the idle budget

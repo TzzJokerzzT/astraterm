@@ -63,9 +63,11 @@ What running the binary needs:
 - Linux with Wayland or X11.
 - GPU drivers for wgpu (Vulkan or OpenGL), and the Vulkan loader when Vulkan is
   the backend. Mesa covers most systems.
-- A font: the default family is `JetBrainsMono Nerd Font`, falling back to
-  `JetBrains Mono`, `Symbols Nerd Font`, `Noto Color Emoji`, `DejaVu Sans Mono`
-  and finally `monospace`.
+- A font: the default family is `JetBrainsMono Nerd Font`. `scripts/setup.sh`
+  checks it with fontconfig, offers the package when it is missing and, if you
+  decline, writes the family your machine already has; without it AstraTerm
+  falls back to `JetBrains Mono`, `Symbols Nerd Font`, `Noto Color Emoji`,
+  `DejaVu Sans Mono` and finally `monospace`.
 - Optionally `notify-send` (libnotify) for desktop notifications: the save and
   reload notices, and `OSC 9`/`OSC 777` requests from applications. Without it a
   single warning is logged and the terminal still shows notifications in the
@@ -82,15 +84,23 @@ System packages:
 ```sh
 # Arch Linux
 sudo pacman -S --needed base-devel wayland libxkbcommon fontconfig freetype2 mesa \
-    vulkan-icd-loader libx11 libnotify git ttf-jetbrains-mono-nerd
+    vulkan-icd-loader libx11 libnotify git
+# plus a Nerd Font, which the bootstrap script offers only when fontconfig cannot
+# see one: sudo pacman -S ttf-jetbrains-mono-nerd
 # Debian / Ubuntu
 sudo apt install build-essential pkg-config git libwayland-dev libxkbcommon-dev \
     libfontconfig1-dev libfreetype6-dev mesa-vulkan-drivers libgl1-mesa-dri libvulkan1 \
     libx11-dev libnotify-bin
 ```
 
-The bootstrap script installs the same set for the detected distribution, checks
-the toolchain and the font without downloading anything, and builds the binary:
+The bootstrap script installs the same set for the detected distribution, asks
+fontconfig for the default family instead of assuming it, and only then offers
+the font package — which is what keeps distributions that ship the family
+through another package (Omarchy's `ttf-jetbrains-mono-nerd-basic` provides it
+and conflicts with it) out of a `pacman` conflict. Declining that offer makes the
+script detect a family the machine already has and create
+`~/.config/astraterm/config.toml` with it. Nothing is downloaded from the
+network, and the binary is built from the tree:
 
 ```sh
 ./scripts/setup.sh            # asks before installing packages, then builds
@@ -262,7 +272,7 @@ Files in this repository:
 | `packaging/desktop/astraterm.desktop` | freedesktop desktop entry (`Exec=astraterm %U`, `Icon=astraterm`, `StartupWMClass=astraterm`) |
 | `packaging/linux/PKGBUILD` | Arch Linux package: builds with `cargo build --release --locked`, installs the binary, desktop entry, icon and `/etc/astraterm/config.toml` |
 | `packaging/linux/install.sh` | POSIX `sh` installer for a portable build into the user's XDG directories (no root) |
-| `scripts/setup.sh` | idempotent bootstrap: system dependencies, toolchain and font checks, release build, optional install — see [docs/INSTALL.md](docs/INSTALL.md) |
+| `scripts/setup.sh` | idempotent bootstrap: system dependencies, toolchain, an interactive font step, release build, optional install — see [docs/INSTALL.md](docs/INSTALL.md) |
 | `packaging/linux/uninstall.sh` | removes exactly the files `install.sh` created |
 | `packaging/linux/config.toml` | the system-wide default configuration installed to `/etc/astraterm/config.toml` |
 | `assets/icons/logo.png` | the AstraTerm logo; every icon size is generated from it |

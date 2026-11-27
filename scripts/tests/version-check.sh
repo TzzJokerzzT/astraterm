@@ -1,20 +1,28 @@
 #!/usr/bin/env bash
-# Repeatable checks for the `--version` paths of scripts/setup.sh.
+# Repeatable checks for the `--version` paths and the font step of
+# scripts/setup.sh.
 #
 # Every case builds a throwaway git repository in `mktemp -d` with a stub
 # `Cargo.toml` and a copy of `scripts/setup.sh`, then runs that copy. Nothing is
 # compiled, no network is used (the fixtures have no remote at all) and the real
 # checkout is never touched: the script only reads the real one to copy it.
 #
+# The font cases replace `fc-list`/`fc-match` inside the fixture with stubs, so
+# the step is decided by the fixture and never by the fonts of the machine
+# running the tests. `XDG_CONFIG_HOME` points into the fixture too: the fallback
+# configuration this script may create can never land in the real `~/.config`.
+#
 # Usage:
 #   ./scripts/tests/version-check.sh
 #
 # Exit codes: 0 every case passed, 1 at least one failed.
 #
-# The cases run with `--dry-run --no-build`, so the only things that execute
-# outside the version check are read-only probes (`cargo --version`, `fc-list`,
-# `command -v`); the successful case therefore needs cargo on PATH to reach
-# exit 0, exactly like a real run would.
+# The version cases run with `--dry-run --no-build`, so the only things that
+# execute outside the version check are read-only probes (`cargo --version`,
+# `fc-list`, `command -v`); the successful case therefore needs cargo on PATH to
+# reach exit 0, exactly like a real run would. The font case that has to write a
+# file uses `--yes` (never asks, so it cannot block on a tty) together with stub
+# `sudo` and `pacman` commands that only print their arguments.
 
 set -uo pipefail
 # Not `set -e`: a failing check is the expected outcome of most cases.
@@ -93,7 +101,10 @@ fixture_checkout() {
 }
 
 # invoke <repo> <setup-args>...: runs the fixture's copy of setup.sh, capturing
-# both streams and the exit code. The caller's git environment must not leak in.
+# both streams and the exit code. The caller's git environment must not leak in,
+# the fixture's `bin/` (when a case created one) decides which fontconfig and
+# package commands the copy sees, and `XDG_CONFIG_HOME` keeps any configuration
+# the font step writes inside the fixture.
 invoke() {
     local repo=$1
     shift
@@ -101,9 +112,72 @@ invoke() {
         cd "$repo" || exit 1
         env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
             GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= \
+            XDG_CONFIG_HOME="$repo/config" \
+            PATH="$repo/bin:$PATH" \
             "$repo/scripts/setup.sh" "$@" 2>&1
     )
     last_code=$?
+}
+
+# font_stub <repo> [family-line]...: installs an `fc-list` that reports exactly
+# these family lines and an `fc-match` that answers with the last of them, so a
+# case decides what the font step sees instead of inheriting the fonts of the
+# machine that runs the tests. A line may carry comma-separated aliases, the way
+# `fc-list` prints them.
+font_stub() {
+    local repo=$1
+    shift
+    local family
+    mkdir -p "$repo/bin"
+    assert_inside_tmp "$repo/bin"
+    {
+        printf '#!/bin/sh\n'
+        for family in "$@"; do
+            printf "printf '%%s\\\\n' '%s'\n" "$family"
+        done
+        printf 'exit 0\n'
+    } >"$repo/bin/fc-list"
+    {
+        printf '#!/bin/sh\n'
+        if [ "$#" -gt 0 ]; then
+            printf "printf '%%s' '%s'\n" "$family"
+        else
+            printf "printf '%%s' 'monospace'\n"
+        fi
+        printf 'exit 0\n'
+    } >"$repo/bin/fc-match"
+    chmod +x "$repo/bin/fc-list" "$repo/bin/fc-match"
+}
+
+# noop_stub <repo>: `sudo` and `pacman` that only report their arguments. The
+# package step therefore succeeds without touching the machine, and `pacman -T`
+# answers "satisfied" — the Omarchy case, where an installed package already
+# provides the Nerd Font and nothing may be installed.
+noop_stub() {
+    local repo=$1
+    mkdir -p "$repo/bin"
+    assert_inside_tmp "$repo/bin"
+    printf '#!/bin/sh\necho "(stub sudo) $*"\nexit 0\n' >"$repo/bin/sudo"
+    printf '#!/bin/sh\nexit 0\n' >"$repo/bin/pacman"
+    chmod +x "$repo/bin/sudo" "$repo/bin/pacman"
+}
+
+# install_stub <repo>: the same `sudo`, and a `pacman` whose `-T` reports the
+# capability as missing, so the font step really offers the package. Nothing is
+# executed: `sudo` only echoes the command line it was given.
+install_stub() {
+    local repo=$1
+    mkdir -p "$repo/bin"
+    assert_inside_tmp "$repo/bin"
+    printf '#!/bin/sh\necho "(stub sudo) $*"\nexit 0\n' >"$repo/bin/sudo"
+    {
+        printf '#!/bin/sh\n'
+        printf 'case "$1" in\n'
+        printf -- '-T) printf "%%s\\n" "ttf-jetbrains-mono-nerd"; exit 1 ;;\n'
+        printf 'esac\n'
+        printf 'exit 0\n'
+    } >"$repo/bin/pacman"
+    chmod +x "$repo/bin/sudo" "$repo/bin/pacman"
 }
 
 # expect <case-name> <expected-code> [pattern]...
@@ -151,6 +225,61 @@ expect() {
         printf '        %s\n' "$line"
     done <<<"$last_output"
     printf '        --------------\n'
+}
+
+# expect_no_file <case-name> <path>: a dry run wrote nothing where nothing should be.
+expect_no_file() {
+    local name=$1 path=$2
+    total=$((total + 1))
+    if [ -e "$path" ]; then
+        failed=$((failed + 1))
+        printf 'FAIL  %s (file exists: %s)\n' "$name" "$path"
+        return 1
+    fi
+    passed=$((passed + 1))
+    printf 'PASS  %s (not written)\n' "$name"
+}
+
+# expect_file <case-name> <path> [line]...: the file exists and holds each line;
+# a line prefixed with `!` must not appear.
+expect_file() {
+    local name=$1 path=$2
+    shift 2
+    local -a problems=()
+    local line problem
+
+    total=$((total + 1))
+    if [ ! -f "$path" ]; then
+        failed=$((failed + 1))
+        printf 'FAIL  %s (no file at %s)\n' "$name" "$path"
+        return 1
+    fi
+    for line in "$@"; do
+        case $line in
+        "!"*)
+            if grep -qxF -- "${line#!}" "$path"; then
+                problems+=("file must not contain '${line#!}'")
+            fi
+            ;;
+        *)
+            if ! grep -qxF -- "$line" "$path"; then
+                problems+=("file must contain '$line'")
+            fi
+            ;;
+        esac
+    done
+
+    if [ ${#problems[@]} -eq 0 ]; then
+        passed=$((passed + 1))
+        printf 'PASS  %s\n' "$name"
+        return 0
+    fi
+    failed=$((failed + 1))
+    printf 'FAIL  %s\n' "$name"
+    for problem in "${problems[@]}"; do
+        printf '        - %s\n' "$problem"
+    done
+    return 1
 }
 
 main() {
@@ -275,6 +404,78 @@ main() {
     invoke "$repo" --dry-run --no-build --version 2.0.0
     expect "--version without the leading v" 0 \
         "the working tree is exactly v2.0.0 and clean"
+
+    # 12. The default family is reported and nothing is offered: the font step is
+    #     decided by fontconfig, never by the distribution. A machine that already
+    #     has the family is never asked to install a package for it, which is what
+    #     keeps Omarchy's ttf-jetbrains-mono-nerd-basic out of a pacman conflict.
+    repo=$(make_repo font-present)
+    font_stub "$repo" \
+        'JetBrainsMono Nerd Font,JetBrainsMono NF' \
+        'JetBrainsMono Nerd Font Mono,JetBrainsMono NFM'
+    invoke "$repo" --dry-run --no-build
+    expect "font present: reported, nothing offered" 0 \
+        "ok: JetBrainsMono Nerd Font found" \
+        "!would ask: create" \
+        "!would ask: install" \
+        "!not found: text falls back"
+
+    # 13. The sibling family is not the default one: the alias match has to be
+    #     exact where a substring test over `fc-list` would have called it present.
+    repo=$(make_repo font-sibling-only)
+    font_stub "$repo" 'JetBrainsMono Nerd Font Mono,JetBrainsMono NFM'
+    invoke "$repo" --dry-run --no-build
+    expect "only the Mono sibling installed" 0 \
+        "JetBrainsMono Nerd Font not found" \
+        "family already installed on this machine: JetBrainsMono Nerd Font Mono" \
+        "would ask: create"
+    expect_no_file "a dry run writes no configuration" \
+        "$repo/config/astraterm/config.toml"
+
+    # 14. No font at all: the fallback is what fontconfig answers for the generic
+    #     monospace alias, and the icon warning is spelled out.
+    repo=$(make_repo font-none)
+    font_stub "$repo"
+    invoke "$repo" --dry-run --no-build
+    expect "no font at all: monospace fallback" 0 \
+        "JetBrainsMono Nerd Font not found" \
+        "family already installed on this machine: monospace" \
+        "it has no Nerd glyphs, so prompt icons can still be missing" \
+        "would ask: create"
+
+    # 15. --yes accepts the fallback configuration, and the file it writes is the
+    #     one the fixture's XDG_CONFIG_HOME names: the real ~/.config is never a
+    #     candidate here.
+    repo=$(make_repo font-fallback-config)
+    font_stub "$repo"
+    noop_stub "$repo"
+    invoke "$repo" --yes --no-build
+    expect "the fallback configuration is created" 0 \
+        "ok: $repo/config/astraterm/config.toml"
+    expect_file "the written configuration names the installed family" \
+        "$repo/config/astraterm/config.toml" \
+        "[font]" \
+        'family = "monospace"'
+
+    # 16. An existing configuration is never modified, whatever the font step
+    #     would have offered.
+    printf '[font]\nfamily = "Mine"\n' >"$repo/config/astraterm/config.toml"
+    invoke "$repo" --yes --no-build
+    expect "an existing configuration is left alone" 0 \
+        "your configuration already exists and is never modified"
+    expect_file "the existing family survives" \
+        "$repo/config/astraterm/config.toml" \
+        'family = "Mine"' \
+        '!family = "monospace"'
+
+    # 17. `--yes` stays non-interactive end to end: once the script's own question
+    #     is auto-accepted, pacman's own transaction confirmation must not appear.
+    repo=$(make_repo font-install-noconfirm)
+    font_stub "$repo"
+    install_stub "$repo"
+    invoke "$repo" --yes --no-build
+    expect "--yes installs the font package without pacman prompting" 0 \
+        "(stub sudo) pacman -S --needed --noconfirm ttf-jetbrains-mono-nerd"
 
     printf '\n%d checks: %d passed, %d failed\n' "$total" "$passed" "$failed"
     if [ "$failed" -ne 0 ]; then
