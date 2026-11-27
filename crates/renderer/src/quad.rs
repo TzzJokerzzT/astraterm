@@ -4,6 +4,8 @@
 //! borders, tab strip, overlays — is drawn as instanced rectangles by this single
 //! pipeline, in one draw call per frame.
 
+use std::ops::Range;
+
 use wgpu::{
     BindGroupLayout, BlendState, Buffer, BufferDescriptor, BufferUsages, ColorTargetState,
     ColorWrites, Device, FragmentState, MultisampleState, PipelineLayoutDescriptor, PrimitiveState,
@@ -100,8 +102,32 @@ pub struct QuadPipeline {
 
 impl QuadPipeline {
     pub fn new(device: &Device, format: TextureFormat) -> Self {
+        Self::build(device, format, Some(BlendState::ALPHA_BLENDING), "astraterm-quad")
+    }
+
+    /// Pipeline that writes its rectangles verbatim, ignoring what is already there.
+    ///
+    /// Clearing one damaged strip of the retained canvas needs exactly that: the strip
+    /// is set to the scene's clear colour, not blended onto what it held before.
+    pub fn new_replace(device: &Device, format: TextureFormat) -> Self {
+        Self::build(
+            device,
+            format,
+            Some(BlendState::REPLACE),
+            "astraterm-quad-replace",
+        )
+    }
+
+    fn build(
+        device: &Device,
+        format: TextureFormat,
+        blend: Option<BlendState>,
+        name: &str,
+    ) -> Self {
+        let pipeline_label = format!("{name}-pipeline");
+        let shader_label = format!("{name}-shader");
         let shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("astraterm-quad-shader"),
+            label: Some(&shader_label),
             source: ShaderSource::Wgsl(SHADER.into()),
         });
 
@@ -142,7 +168,7 @@ impl QuadPipeline {
         });
 
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("astraterm-quad-pipeline"),
+            label: Some(&pipeline_label),
             layout: Some(&layout),
             vertex: VertexState {
                 module: &shader,
@@ -171,7 +197,7 @@ impl QuadPipeline {
                 compilation_options: Default::default(),
                 targets: &[Some(ColorTargetState {
                     format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
+                    blend,
                     write_mask: ColorWrites::ALL,
                 })],
             }),
@@ -237,13 +263,18 @@ impl QuadPipeline {
 
     /// Draws the uploaded rectangles.
     pub fn draw(&self, pass: &mut RenderPass<'_>) {
-        if self.count == 0 {
+        self.draw_slice(pass, 0..self.count);
+    }
+
+    /// Draws `range` of the uploaded rectangles.
+    pub fn draw_slice(&self, pass: &mut RenderPass<'_>, range: Range<u32>) {
+        if self.count == 0 || range.is_empty() {
             return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.instances.slice(..));
-        pass.draw(0..6, 0..self.count);
+        pass.draw(0..6, range);
     }
 
     /// Layout of the quad bind group, exposed for pipeline composition.

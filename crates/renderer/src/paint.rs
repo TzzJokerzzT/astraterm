@@ -41,6 +41,14 @@ pub struct TextItem {
     pub position: (f32, f32),
     pub spans: Vec<Span>,
     pub clip: Rect,
+    /// Whether the text is a terminal row, one byte per grid column.
+    ///
+    /// Only such an item can be re-placed on the columns its text covers, which is how
+    /// a substitution the shaper makes across cells is kept from moving the rest of
+    /// the row (S3): a byte offset is a column offset exactly here, and nowhere else.
+    /// Labels, the cursor cell and anything else without a grid carry `false`, so they
+    /// are never split and never shifted.
+    pub on_grid: bool,
 }
 
 impl TextItem {
@@ -62,7 +70,13 @@ impl TextItem {
                 italic: false,
             }],
             clip,
+            on_grid: false,
         }
+    }
+
+    /// Bytes of text across every span.
+    pub fn text_len(&self) -> usize {
+        self.spans.iter().map(|span| span.text.len()).sum()
     }
 
     /// Combined text content, used for cache hashing.
@@ -70,6 +84,7 @@ impl TextItem {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.spans.len().hash(&mut hasher);
+        self.on_grid.hash(&mut hasher);
         for span in &self.spans {
             span.text.hash(&mut hasher);
             span.bold.hash(&mut hasher);
@@ -540,6 +555,37 @@ struct Cluster<'a> {
     anchored: bool,
 }
 
+/// Whether `cell` continues the cluster whose text so far is `text`, which already
+/// holds `indicators` regional indicators.
+///
+/// This is the only place the continuation cases are ordered. [`cluster_at`] asks it
+/// while it absorbs cells into a cluster, and [`plain_cell`] asks it about the cell
+/// after a plain ASCII base, so the shortcut cannot drift away from the measured path
+/// (B21): a change to the order of the spacer, hidden, joiner and regional-indicator
+/// cases reaches both walks or neither.
+fn continues_cluster(cell: &CellSnapshot, text: &str, indicators: usize) -> bool {
+    if cell.wide_spacer {
+        // A spacer belongs to the wide cell before it, as it always did.
+        true
+    } else if cell.flags.hidden {
+        // A hidden cell neither continues a cluster nor contributes an indicator:
+        // absorbing it would append its space to the cluster, and absorbing the
+        // visible cell after it would paint that cell in the hidden cell's style
+        // (S10).
+        false
+    } else if text.ends_with('\u{200D}') {
+        // The cell before ended with a zero-width joiner, so this cell is the next
+        // member of the same sequence whatever its codepoint is.
+        true
+    } else if regional_indicator(cell.ch) {
+        // A cluster holds at most one regional-indicator pair, so the third
+        // indicator starts the next cluster instead of joining this one.
+        indicators == 1
+    } else {
+        cluster_continuation(cell.ch)
+    }
+}
+
 /// Whether the cell at `column` is a plain one-column cluster in the primary face.
 ///
 /// Such a cell paints one printable ASCII character from the primary font, carries no
@@ -567,15 +613,13 @@ fn plain_cell(
     {
         return false;
     }
-    // A cluster stands alone only when the next cell starts a new one. The order of
-    // these cases is the one [`cluster_at`] applies: a spacer continues whatever it
-    // follows even when it is hidden, a hidden cell never continues anything, and an
-    // ASCII base never ends with a joiner and never starts a regional-indicator pair.
+    // A cluster stands alone only when the next cell starts a new one, which is the
+    // same decision [`cluster_at`] makes. The stand-in cluster so far is empty and
+    // holds no indicator because the plain base is one printable ASCII character: it
+    // can neither end with a joiner nor start a regional-indicator pair.
     match row.cells.get(column + 1) {
         None => true,
-        Some(next) if next.wide_spacer => false,
-        Some(next) if next.flags.hidden => true,
-        Some(next) => !cluster_continuation(next.ch),
+        Some(next) => !continues_cluster(next, "", 0),
     }
 }
 
@@ -609,33 +653,12 @@ fn cluster_at<'a>(
     let base = &row.cells[column];
     text.clear();
     push_cell_text(text, base, solid_shades);
-    // A cluster holds at most one regional-indicator pair, so the third indicator
-    // starts the next cluster instead of joining this one. A hidden cell is not a
-    // half of anything: it paints a space, so it must not seed the count either.
+    // A hidden cell is not a half of anything: it paints a space, so it must not seed
+    // the indicator count.
     let mut indicators = usize::from(!base.flags.hidden && regional_indicator(base.ch));
     let mut end = column + 1;
     while let Some(cell) = row.cells.get(end) {
-        let continues = if cell.wide_spacer {
-            // A spacer belongs to the wide cell before it, as it always did.
-            true
-        } else if cell.flags.hidden {
-            // A hidden cell neither continues a cluster nor contributes an
-            // indicator: absorbing it would append its space to the cluster, and
-            // absorbing the visible cell after it would paint that cell in the
-            // hidden cell's style (S10).
-            false
-        } else if text.ends_with('\u{200D}') {
-            // The cell before ended with a zero-width joiner, so this cell is the
-            // next member of the same sequence whatever its codepoint is: a ZWJ
-            // emoji is stored as one wide cell per member, with the joiner kept as
-            // zero-width data of the cell before it.
-            true
-        } else if regional_indicator(cell.ch) {
-            indicators == 1
-        } else {
-            cluster_continuation(cell.ch)
-        };
-        if !continues {
+        if !continues_cluster(cell, text.as_str(), indicators) {
             break;
         }
         if !cell.wide_spacer {
@@ -802,6 +825,7 @@ fn row_text_item(
                 y,
                 clip,
                 cell_width,
+                cluster.column,
             );
             items.push(anchored_item(
                 row_id, origin_x, y, &cluster, theme, clip, cell_width,
@@ -828,12 +852,18 @@ fn row_text_item(
         y,
         clip,
         cell_width,
+        column,
     );
     items
 }
 
 /// Closes the clean run being accumulated into one item positioned at its first
 /// column, if the run has any text.
+///
+/// `end_column` is the first column after the run, so the item can record whether its
+/// text is one byte per column: only then can the shaper's columns be recovered from
+/// its byte offsets, which is what lets a substitution that spans cells be re-placed on
+/// the grid (S3).
 #[allow(clippy::too_many_arguments)]
 fn flush_clean_run(
     items: &mut Vec<TextItem>,
@@ -846,7 +876,14 @@ fn flush_clean_run(
     y: i32,
     clip: Rect,
     cell_width: f32,
+    end_column: usize,
 ) {
+    // A grid run has one byte per column when every column contributed exactly one ASCII
+    // character: a wide cell contributes fewer bytes than columns, a zero-width
+    // continuation more. Only then is a byte offset a column offset.
+    let on_grid = start
+        .map(|start| text.len() == end_column.saturating_sub(start) && text.is_ascii())
+        .unwrap_or(false);
     if let Some((color, bold, italic)) = style.take()
         && !text.is_empty()
     {
@@ -865,6 +902,7 @@ fn flush_clean_run(
             position: (origin_x as f32 + column as f32 * cell_width, y as f32),
             spans: std::mem::take(spans),
             clip,
+            on_grid,
         });
     }
 }
@@ -883,10 +921,8 @@ fn anchored_item(
     cell_width: f32,
 ) -> TextItem {
     let (color, bold, italic) = cell_style(cluster.base, theme);
-    let background = cell_column_clip(
-        origin_x,
-        y,
-        cluster.column,
+    let background = column_clip(
+        origin_x + (cluster.column as f32 * cell_width) as i32,
         cluster.columns,
         cell_width,
         clip,
@@ -904,28 +940,23 @@ fn anchored_item(
             italic,
         }],
         clip: background,
+        // A cluster owns its columns when its text has one ASCII byte per column; a wide
+        // glyph is painted from its own segment and nothing follows it inside it.
+        on_grid: cluster.text.len() == cluster.columns && cluster.text.is_ascii(),
     }
 }
 
-/// Rectangle covering `columns` grid columns from `column`, plus one cell of
-/// slack, intersected with the row clip.
+/// Rectangle covering `columns` grid columns from `x`, plus one cell of slack,
+/// intersected with the row clip.
 ///
 /// The slack keeps a glyph the model under-reserved from being cut in half: a
 /// fallback emoji can advance up to two cells in a slot the grid gave one, and
 /// scissoring it to that slot alone would show half a glyph. One spare cell
 /// bounds the bleed without letting an over-wide glyph reach the next visible
 /// character, whose own segment is positioned independently of this clip.
-fn cell_column_clip(
-    origin_x: i32,
-    y: i32,
-    column: usize,
-    columns: usize,
-    cell_width: f32,
-    clip: Rect,
-) -> Rect {
-    let x = origin_x + (column as f32 * cell_width) as i32;
+pub(crate) fn column_clip(x: i32, columns: usize, cell_width: f32, clip: Rect) -> Rect {
     let width = ((columns + 1) as f32 * cell_width).ceil().max(1.0) as u32;
-    let rect = Rect::new(x, y, width, clip.height);
+    let rect = Rect::new(x, clip.y, width, clip.height);
     let left = rect.x.max(clip.x);
     let top = rect.y.max(clip.y);
     let right = rect.right().min(clip.right());
@@ -1089,6 +1120,7 @@ fn paint_cursor(
                         italic,
                     }],
                     clip: Rect::new(x, y, width, height),
+                    on_grid: false,
                 });
             }
         }
@@ -1233,7 +1265,7 @@ mod tests {
     use astraterm_terminal::engine::{CursorShape, EngineOptions};
     use cosmic_text::FontSystem;
 
-    use crate::text::{ClusterMeasurer, ClusterWidths, TextStyle};
+    use crate::text::{ClusterMeasurer, ClusterWidths, RowCache, TextStyle};
 
     /// The font the tests measure with, plus its advance cache.
     ///
@@ -2042,6 +2074,222 @@ mod tests {
         (0..cells)
             .map(|index| char::from(b'!' + (index % 94) as u8))
             .collect()
+    }
+
+    /// The fixture font the ligature tests shape with.
+    ///
+    /// Monospace, one column per printable ASCII character, and `->` substitutes one
+    /// glyph that advances 1000 units where the two cells it stands for advance 1200
+    /// (`src/testdata/README.md` records how it was built).
+    fn ligature_style(system: &mut FontSystem, ligatures: bool) -> TextStyle {
+        system
+            .db_mut()
+            .load_font_data(include_bytes!("testdata/grid_ligature.ttf").to_vec());
+        TextStyle::new(
+            &FontConfig {
+                family: "AstraGrid Test".to_owned(),
+                size: 13.0,
+                ligatures,
+                ..Default::default()
+            },
+            1.0,
+            system,
+        )
+    }
+
+    /// Shapes one row through the row walk and returns what the glyph cache will paint:
+    /// `(first byte, end byte, x)` per glyph, plus the cell width it was placed with.
+    fn painted_glyphs(text: &str, ligatures: bool) -> (Vec<(usize, usize, f32)>, f32) {
+        let mut system = FontSystem::new();
+        let style = ligature_style(&mut system, ligatures);
+        let cell_width = style.cell.width;
+        let snapshot = snapshot(text, 8, 1);
+        let mut widths = ClusterWidths::new();
+        let items = {
+            let mut measure = ClusterMeasurer::new(&mut system, &style, &mut widths);
+            row_text_item(
+                0,
+                0,
+                0,
+                &snapshot.lines[0],
+                &theme(),
+                Rect::new(0, 0, 400, 20),
+                cell_width,
+                &mut measure,
+                false,
+            )
+        };
+        let mut scene = Scene::default();
+        for item in items {
+            scene.push_text(item);
+        }
+        let mut cache = RowCache::new();
+        cache.update(&mut system, &style, &scene);
+        let mut glyphs = Vec::new();
+        for item in &scene.texts {
+            glyphs.extend(cache.glyph_positions(item.id));
+        }
+        glyphs.sort_by_key(|glyph| glyph.0);
+        (glyphs, cell_width)
+    }
+
+    #[test]
+    fn a_ligature_that_spans_cells_keeps_the_cells_after_it_on_the_grid() {
+        // S3: the fixture replaces `->` with one glyph advancing 1000 units where the
+        // two cells it stands for advance 1200, so a row shaped as a single run paints
+        // both `x` a tenth of a cell left of their columns.
+        let (glyphs, cell_width) = painted_glyphs("->xx", true);
+        // The row walk appends the blank cells of the row, so only the glyphs covering
+        // the four columns of interest are asserted on.
+        let glyphs: Vec<(usize, usize, f32)> = glyphs
+            .into_iter()
+            .filter(|glyph| glyph.0 < 4)
+            .collect();
+        assert_eq!(
+            glyphs.len(),
+            3,
+            "one glyph for the substitution plus two letters: {glyphs:?}"
+        );
+        assert_eq!(
+            (glyphs[0].0, glyphs[0].1),
+            (0, 2),
+            "the substitution still covers exactly the two columns it stands for"
+        );
+        for (start, end, x) in &glyphs {
+            let column = *start as f32 * cell_width;
+            assert!(
+                (x - column).abs() <= 0.01,
+                "the glyph covering bytes {start}..{end} is painted at {x}; its column \
+                 starts at {column}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_ligatures_off_the_row_is_shaped_exactly_as_before() {
+        // S3: nothing changes when the shaper is not asked for substitutions.
+        let (glyphs, cell_width) = painted_glyphs("->xx", false);
+        let glyphs: Vec<(usize, usize, f32)> = glyphs
+            .into_iter()
+            .filter(|glyph| glyph.0 < 4)
+            .collect();
+        assert_eq!(glyphs.len(), 4, "one glyph per character: {glyphs:?}");
+        for (start, _, x) in &glyphs {
+            assert!((x - *start as f32 * cell_width).abs() <= 0.01);
+        }
+    }
+
+    /// One cell with an explicit character.
+    fn cell(ch: char) -> CellSnapshot {
+        CellSnapshot {
+            ch,
+            ..Default::default()
+        }
+    }
+
+    /// One cell the program hid.
+    fn hidden(ch: char) -> CellSnapshot {
+        CellSnapshot {
+            ch,
+            flags: CellFlags {
+                hidden: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The text items one row produces, through the plain-cell shortcut or through the
+    /// measured cluster path.
+    ///
+    /// Both walks use the same font and the same metrics; only the gate that chooses
+    /// the shortcut differs, so identical items mean both put the cluster boundaries in
+    /// the same place.
+    fn row_segments(font: &mut TestFont, row: &RowSnapshot, plain_path: bool) -> Vec<TextItem> {
+        font.style.ascii_is_one_column = plain_path;
+        let (metrics, mut measure) = font.painter();
+        row_text_item(
+            0,
+            0,
+            0,
+            row,
+            &theme(),
+            Rect::new(0, 0, 400, 20),
+            metrics.width,
+            &mut measure,
+            false,
+        )
+    }
+
+    #[test]
+    fn both_row_walks_continue_a_cluster_in_the_same_place() {
+        // B21: the plain-cell shortcut and the measured path consult one continuation
+        // decision, so a row of awkward shapes segments identically whichever walk it
+        // takes. Every case of that decision appears here: a spacer, a hidden cell, a
+        // joiner, a regional indicator, a combining mark, a wide base and a modifier.
+        let rows = [
+            (
+                "a spacer after a plain cell",
+                row_of(vec![
+                    cell('a'),
+                    CellSnapshot {
+                        ch: ' ',
+                        wide_spacer: true,
+                        ..Default::default()
+                    },
+                ]),
+            ),
+            (
+                "a hidden cell after a plain cell",
+                row_of(vec![cell('a'), hidden('\u{1F1EA}')]),
+            ),
+            (
+                "a hidden indicator before a visible one",
+                row_of(vec![hidden('\u{1F1EA}'), cell('\u{1F1F8}')]),
+            ),
+            (
+                "a joiner after a plain cell",
+                row_of(vec![cell('a'), cell('\u{200D}'), cell('\u{1F469}')]),
+            ),
+            (
+                "a combining mark after a plain cell",
+                row_of(vec![cell('a'), cell('\u{0301}'), cell('b')]),
+            ),
+            (
+                "a regional indicator after a plain cell",
+                row_of(vec![cell('a'), cell('\u{1F1EA}'), cell('\u{1F1F8}')]),
+            ),
+            (
+                "a third regional indicator",
+                row_of(vec![
+                    cell('\u{1F1EA}'),
+                    cell('\u{1F1F8}'),
+                    cell('\u{1F1EB}'),
+                    cell('\u{1F1F7}'),
+                ]),
+            ),
+            (
+                "a wide base after a plain cell",
+                row_of(vec![cell('a'), cell('\u{4F60}'), cell('b')]),
+            ),
+            (
+                "an emoji with a skin-tone modifier",
+                row_of(vec![cell('\u{1F44D}'), cell('\u{1F3FD}'), cell('a')]),
+            ),
+            (
+                "a plain row",
+                row_of((0..8).map(|index| cell(char::from(b'a' + index))).collect()),
+            ),
+        ];
+        for (what, row) in rows {
+            let mut font = TestFont::new();
+            let plain = row_segments(&mut font, &row, true);
+            let measured = row_segments(&mut font, &row, false);
+            assert_eq!(
+                plain, measured,
+                "{what}: the shortcut and the measured path disagreed"
+            );
+        }
     }
 
     #[test]

@@ -18,7 +18,13 @@
 //!
 //! The renderer knows nothing about panes, tabs or sessions: it consumes a [`Scene`]
 //! that the application composes from snapshots.
+//!
+//! Frames accumulate in a retained canvas the size of the target: a frame repaints only
+//! the strips that changed since the last one ([`damage`]) and then copies the canvas
+//! into the frame, so an idle frame draws nothing at all and a one-line change redraws
+//! one line (S7).
 
+pub mod damage;
 pub mod paint;
 pub mod quad;
 pub mod text;
@@ -34,14 +40,17 @@ use astraterm_core::{CellMetrics, Rect, Size};
 use cosmic_text::FontSystem;
 use glyphon::{Cache, SwashCache, TextAtlas, TextRenderer, Viewport};
 use wgpu::{
-    CommandEncoderDescriptor, CompositeAlphaMode, Device, DeviceDescriptor, Instance,
-    InstanceDescriptor, LoadOp, MultisampleState, Operations, PresentMode, Queue,
-    RenderPassColorAttachment, RenderPassDescriptor, RequestAdapterOptions, StoreOp, Surface,
-    SurfaceColorSpace, SurfaceConfiguration, TextureFormat, TextureUsages, TextureViewDescriptor,
+    BindGroup, CommandEncoderDescriptor, CompositeAlphaMode, Device, DeviceDescriptor, Extent3d,
+    Instance, InstanceDescriptor, LoadOp, MultisampleState, Operations, PresentMode, Queue,
+    RenderPassColorAttachment, RenderPassDescriptor, RequestAdapterOptions, Sampler,
+    SamplerDescriptor, StoreOp, Surface, SurfaceColorSpace, SurfaceConfiguration, Texture,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
+    TextureViewDescriptor,
 };
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
+pub use damage::{Bands, Damage, Geometry};
 pub use paint::{ImageItem, ImagePixels, PaintOptions, Quad, Scene, Span, TextItem};
 pub use text::TextStyle;
 
@@ -160,9 +169,32 @@ pub struct Renderer {
     /// Measured cluster advances that decide which clusters are grid-anchored.
     widths: text::ClusterWidths,
     style: TextStyle,
+    /// What the last frame drew, so this one knows which strips changed (S7).
+    bands: Option<damage::Bands>,
+    /// Pixels of the composite the target shows, repainted strip by strip.
+    canvas: Option<Canvas>,
+    /// Copies the canvas into the frame, which is always done verbatim.
+    blit: texture::TexturePipeline,
+    blit_sampler: Sampler,
+    /// Writes one damaged strip to the canvas's clear colour.
+    clear_strips: quad::QuadPipeline,
+    /// Set by anything that invalidates the canvas without changing the scene (a font
+    /// change reshapes every glyph, a lost surface comes back empty).
+    force_full: bool,
     size: Size,
     window: Arc<Window>,
     transparent: bool,
+}
+
+/// The texture the frames accumulate in, and the view and bind group used to copy it.
+///
+/// The texture is kept because the view is borrowed from it: a bind group outliving the
+/// allocation it samples would be a use-after-free on the GPU.
+struct Canvas {
+    size: (u32, u32),
+    _texture: Texture,
+    view: TextureView,
+    bind_group: BindGroup,
 }
 
 impl Renderer {
@@ -269,6 +301,16 @@ impl Renderer {
         let initial_size = Size::new(config.width, config.height);
         let overlay_quads = quad::QuadPipeline::new(&device, format);
         let overlay_images = texture::TexturePipeline::new(&device, format);
+        let blit = texture::TexturePipeline::new_replace(&device, format);
+        // The canvas is copied one pixel per texel, so the sampler never interpolates;
+        // nearest filtering also keeps the copy exact on a fractional surface scale.
+        let blit_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("astraterm-blit-sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let clear_strips = quad::QuadPipeline::new_replace(&device, format);
 
         Ok(Self {
             instance,
@@ -291,6 +333,12 @@ impl Renderer {
             rows: text::RowCache::new(),
             widths: text::ClusterWidths::new(),
             style,
+            bands: None,
+            canvas: None,
+            blit,
+            blit_sampler,
+            clear_strips,
+            force_full: true,
             size: initial_size,
             window,
             transparent,
@@ -339,6 +387,8 @@ impl Renderer {
         self.config.height = size.height;
         self.size = Size::new(size.width, size.height);
         self.surface.configure(&self.device, &self.config);
+        // A reconfigured surface comes back empty, and the canvas no longer matches it.
+        self.force_full = true;
     }
 
     /// Applies a new font configuration (live font changes, no restart).
@@ -346,6 +396,9 @@ impl Renderer {
         self.style = TextStyle::new(font, self.style.scale, &mut self.font_system);
         self.rows.clear();
         self.widths.clear();
+        // Every glyph is reshaped and re-placed, and the scene itself does not change,
+        // so the strips cannot be diffed: the whole target is painted again.
+        self.force_full = true;
         self.window.request_redraw();
     }
 
@@ -354,6 +407,7 @@ impl Renderer {
         self.style = TextStyle::new(font, scale, &mut self.font_system);
         self.rows.clear();
         self.widths.clear();
+        self.force_full = true;
         self.window.request_redraw();
     }
 
@@ -364,12 +418,16 @@ impl Renderer {
 
     /// Draws one frame.
     ///
-    /// `scene` is the mosaic: it owns the whole target and clears it. `overlay`, when
-    /// present, is a second layer recorded into the same target with `LoadOp::Load`
-    /// straight after the mosaic's glyphs, scissored to [`Scene::clip`]. It carries
-    /// its own quad instances and its own glyph batch, which is the point: the
-    /// mosaic's text has already been painted, so the overlay's background covers
-    /// it instead of the other way round.
+    /// `scene` is the mosaic: it owns the whole target and its clear colour. `overlay`,
+    /// when present, is a second layer drawn over the mosaic, scissored to
+    /// [`Scene::clip`]. It carries its own quad instances and its own glyph batch, which
+    /// is the point: the mosaic's text has already been painted, so the overlay's
+    /// background covers it instead of the other way round.
+    ///
+    /// Only the strips that changed since the previous frame are rebuilt and drawn
+    /// (S7): the frame is composed into a retained canvas strip by strip, and the canvas
+    /// is then copied into the frame. A frame whose scene is unchanged acquires nothing,
+    /// draws nothing and presents nothing, leaving the previous frame on screen.
     ///
     /// When the surface is an sRGB target both layers' colours are converted to
     /// linear light first, so theme colours appear exactly as configured.
@@ -381,6 +439,51 @@ impl Renderer {
             for_target(overlay, &mut overlay_scratch, self.format, self.transparent)
         });
         let size = (self.config.width, self.config.height);
+
+        // Which strips this frame has to rebuild. The digest is over the composed scene,
+        // so a cursor blink, a selection, a search highlight or an image that moved is
+        // damage exactly like a changed row is.
+        let geometry = Geometry::new(size, self.style.cell.height, scene.clear);
+        let bands = Bands::record(scene, overlay, geometry);
+        let canvas_missing = self.canvas.as_ref().map(|canvas| canvas.size) != Some(size);
+        let damage = if self.force_full || canvas_missing {
+            Damage::everything(geometry)
+        } else {
+            damage::plan(self.bands.as_ref(), &bands)
+        };
+        self.force_full = false;
+        if damage.is_empty() {
+            // Nothing changed: the target already holds this frame, so no frame is
+            // acquired, nothing is drawn and nothing is presented.
+            self.bands = Some(bands);
+            return Ok(());
+        }
+        self.ensure_canvas(size);
+        if !damage.is_full() {
+            // One instance per damaged strip: the strip is set to the scene's clear
+            // colour, not blended onto whatever it held.
+            let strips: Vec<quad::Instance> = damage
+                .bands()
+                .iter()
+                .map(|band| {
+                    let rect = damage.band_rect(*band);
+                    quad::Instance {
+                        x: rect.x as f32,
+                        y: rect.y as f32,
+                        width: rect.width as f32,
+                        height: rect.height as f32,
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 1.0,
+                    }
+                    .with_color(scene.clear)
+                })
+                .collect();
+            self.clear_strips
+                .upload(&self.device, &self.queue, &strips, size);
+        }
+
         self.viewport.update(
             &self.queue,
             glyphon::Resolution {
@@ -389,11 +492,11 @@ impl Renderer {
             },
         );
 
-        let instances = quad_instances(scene);
+        let instances = quad_instances(scene, &damage);
         self.quads
             .upload(&self.device, &self.queue, &instances, size);
         if let Some(overlay) = overlay {
-            let instances = quad_instances(overlay);
+            let instances = quad_instances(overlay, &damage);
             self.overlay_quads
                 .upload(&self.device, &self.queue, &instances, size);
         }
@@ -452,12 +555,15 @@ impl Renderer {
             None => Vec::new(),
         };
 
+        // Only the items that reach a damaged strip are prepared: glyphon uploads every
+        // glyph it is handed and draws all of them, so handing it the whole screen for a
+        // one-line change would draw the whole screen.
         self.rows.update(&mut self.font_system, &self.style, scene);
         if let Some(overlay) = overlay {
             self.rows
                 .update(&mut self.font_system, &self.style, overlay);
         }
-        let areas = self.rows.areas(scene);
+        let areas = self.rows.areas_damaged(scene, &damage);
         self.text_renderer
             .prepare(
                 &self.device,
@@ -470,7 +576,7 @@ impl Renderer {
             )
             .map_err(|error| RendererError::Prepare(error.to_string()))?;
         if let Some(overlay) = overlay {
-            let areas = self.rows.areas(overlay);
+            let areas = self.rows.areas_damaged(overlay, &damage);
             self.overlay_text
                 .prepare(
                     &self.device,
@@ -492,6 +598,7 @@ impl Renderer {
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
+                self.force_full = true;
                 return Err(RendererError::SurfaceLost("surface is outdated".to_owned()));
             }
             wgpu::CurrentSurfaceTexture::Lost => {
@@ -500,24 +607,94 @@ impl Renderer {
                     .create_surface(self.window.clone())
                     .map_err(|error| RendererError::Surface(error.to_string()))?;
                 self.surface.configure(&self.device, &self.config);
+                self.force_full = true;
                 return Err(RendererError::SurfaceLost("surface was lost".to_owned()));
             }
             wgpu::CurrentSurfaceTexture::Validation => {
+                self.force_full = true;
                 return Err(RendererError::SurfaceLost("validation error".to_owned()));
             }
         };
 
-        let view = frame.texture.create_view(&TextureViewDescriptor::default());
         let mut encoder = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("astraterm-frame"),
             });
+        self.paint_canvas(
+            &mut encoder,
+            scene,
+            overlay,
+            &damage,
+            &mosaic_batches,
+            &overlay_batches,
+            size,
+        )?;
+
+        // The canvas already holds the composite, so the frame is exactly a copy of it.
+        let view = frame.texture.create_view(&TextureViewDescriptor::default());
         {
+            let canvas = self.canvas.as_ref().expect("the canvas was created above");
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("astraterm-pass"),
+                label: Some("astraterm-blit-pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        // Every pixel of the frame is written by the blit itself; the
+                        // clear only makes the attachment initialized.
+                        load: LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.blit.draw(
+                &mut pass,
+                &[texture::Batch {
+                    bind_group: &canvas.bind_group,
+                    range: 0..1,
+                }],
+            );
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+        self.queue.present(frame);
+        // Only now is the canvas what this frame says it is. A frame that failed to be
+        // acquired above returns before this line, so the next frame rebuilds the same
+        // strips instead of believing a target nobody saw.
+        self.bands = Some(bands);
+        self.atlas.trim();
+        Ok(())
+    }
+
+    /// Rebuilds the damaged strips of the canvas and draws both layers into them.
+    ///
+    /// A full repaint is one pass over the whole target. A damaged one is one pass per
+    /// strip: the strip is set to the clear colour, then the mosaic and the overlay are
+    /// drawn into it with the scissor confining them to it. What a strip then holds is
+    /// exactly what a full repaint would have left there.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_canvas(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &Scene,
+        overlay: Option<&Scene>,
+        damage: &Damage,
+        mosaic_batches: &[texture::Batch<'_>],
+        overlay_batches: &[texture::Batch<'_>],
+        size: (u32, u32),
+    ) -> Result<(), RendererError> {
+        let canvas = self.canvas.as_ref().expect("the canvas exists");
+        if damage.is_full() {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("astraterm-canvas-pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &canvas.view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: Operations {
@@ -536,25 +713,22 @@ impl Renderer {
                 multiview_mask: None,
             });
             self.quads.draw(&mut pass);
-            self.images.draw(&mut pass, &mosaic_batches);
+            self.images.draw(&mut pass, mosaic_batches);
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .map_err(|error| RendererError::Render(error.to_string()))?;
-        }
-
-        // Second pass: the overlay layer, onto the frame the first pass already
-        // painted, clipped to the box it owns. A layer whose clip falls entirely
-        // outside the target is not recorded at all.
-        if let Some(overlay) = overlay {
-            let clip = match overlay.clip {
-                Some(rect) => scissor_rect(rect, size),
-                None => Some((0, 0, size.0, size.1)),
-            };
-            if let Some((x, y, width, height)) = clip {
+        } else {
+            // The strip instances were uploaded by the caller: one per damaged strip,
+            // translating it to the scene's clear colour instead of blending onto what
+            // the strip held.
+            for (index, band) in damage.bands().iter().enumerate() {
+                let Some((x, y, width, height)) = scissor_rect(damage.band_rect(*band), size) else {
+                    continue;
+                };
                 let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                    label: Some("astraterm-overlay-pass"),
+                    label: Some("astraterm-canvas-strip"),
                     color_attachments: &[Some(RenderPassColorAttachment {
-                        view: &view,
+                        view: &canvas.view,
                         depth_slice: None,
                         resolve_target: None,
                         ops: Operations {
@@ -568,30 +742,142 @@ impl Renderer {
                     multiview_mask: None,
                 });
                 pass.set_scissor_rect(x, y, width, height);
-                self.overlay_quads.draw(&mut pass);
-                self.overlay_images.draw(&mut pass, &overlay_batches);
-                self.overlay_text
+                let strip = index as u32;
+                self.clear_strips.draw_slice(&mut pass, strip..strip + 1);
+                self.quads.draw(&mut pass);
+                self.images.draw(&mut pass, mosaic_batches);
+                self.text_renderer
                     .render(&self.atlas, &self.viewport, &mut pass)
                     .map_err(|error| RendererError::Render(error.to_string()))?;
             }
         }
 
-        self.queue.submit(Some(encoder.finish()));
-        self.queue.present(frame);
-        self.atlas.trim();
+        // The overlay layer, drawn over the mosaic once every strip it shares with the
+        // mosaic has been rebuilt, and clipped to the box it owns either way.
+        if let Some(overlay) = overlay {
+            if damage.is_full() {
+                let clip = match overlay.clip {
+                    Some(rect) => scissor_rect(rect, size),
+                    None => Some((0, 0, size.0, size.1)),
+                };
+                if let Some((x, y, width, height)) = clip {
+                    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("astraterm-overlay-pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: &canvas.view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: Operations {
+                                load: LoadOp::Load,
+                                store: StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_scissor_rect(x, y, width, height);
+                    self.overlay_quads.draw(&mut pass);
+                    self.overlay_images.draw(&mut pass, overlay_batches);
+                    self.overlay_text
+                        .render(&self.atlas, &self.viewport, &mut pass)
+                        .map_err(|error| RendererError::Render(error.to_string()))?;
+                }
+            } else {
+                for band in damage.bands() {
+                    let rect = damage.band_rect(*band);
+                    // The strip's own box narrowed to the layer's clip: a layer that
+                    // paints nothing over this strip records no pass at all.
+                    let visible = match overlay.clip {
+                        Some(clip) => damage::intersect(clip, rect),
+                        None => Some(rect),
+                    };
+                    let Some((x, y, width, height)) = visible.and_then(|rect| scissor_rect(rect, size))
+                    else {
+                        continue;
+                    };
+                    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("astraterm-overlay-strip"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: &canvas.view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: Operations {
+                                load: LoadOp::Load,
+                                store: StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_scissor_rect(x, y, width, height);
+                    self.overlay_quads.draw(&mut pass);
+                    self.overlay_images.draw(&mut pass, overlay_batches);
+                    self.overlay_text
+                        .render(&self.atlas, &self.viewport, &mut pass)
+                        .map_err(|error| RendererError::Render(error.to_string()))?;
+                }
+            }
+        }
         Ok(())
     }
 
-    /// Resolves prepared image batches of one layer into draw calls.
-    ///
-    /// `from..to` is the layer's slice of the combined instance buffer; the ranges
-    /// are rebased because each layer draws from its own buffer.
+    /// Creates the canvas the frames accumulate in, when it is missing or the target
+    /// changed size.
+    fn ensure_canvas(&mut self, size: (u32, u32)) {
+        if self.canvas.as_ref().map(|canvas| canvas.size) == Some(size) {
+            return;
+        }
+        let texture = self.device.create_texture(&TextureDescriptor {
+            label: Some("astraterm-canvas"),
+            size: Extent3d {
+                width: size.0.max(1),
+                height: size.1.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: self.format,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&TextureViewDescriptor::default());
+        let bind_group = self.blit.bind_group(&self.device, &view, &self.blit_sampler);
+        // The blit is one textured rectangle covering the whole target; its sizes only
+        // change with the canvas.
+        self.blit.upload(
+            &self.device,
+            &self.queue,
+            &[texture::Instance::new(
+                0.0,
+                0.0,
+                size.0 as f32,
+                size.1 as f32,
+                [0.0, 0.0, 1.0, 1.0],
+            )],
+            size,
+        );
+        self.canvas = Some(Canvas {
+            size,
+            _texture: texture,
+            view,
+            bind_group,
+        });
+    }
+
     /// Drops cached shaped rows (used after a theme change that alters colours).
     ///
     /// Measured cluster advances survive: they depend on the font, not on colour, and
     /// are keyed by the shaping style anyway.
     pub fn invalidate_text_cache(&mut self) {
         self.rows.clear();
+        // The glyphs are rasterised again; one full frame is cheaper than reasoning
+        // about which strips the new glyph bitmaps reach.
+        self.force_full = true;
     }
 }
 
@@ -645,11 +931,12 @@ fn for_target<'a>(
     scratch.insert(converted)
 }
 
-/// One instance per scene quad, in push order.
-fn quad_instances(scene: &Scene) -> Vec<quad::Instance> {
+/// One instance per scene quad that reaches a damaged strip, in push order.
+fn quad_instances(scene: &Scene, damage: &Damage) -> Vec<quad::Instance> {
     scene
         .quads
         .iter()
+        .filter(|quad| damage.touches(quad.rect))
         .map(|quad| {
             quad::Instance {
                 x: quad.rect.x as f32,

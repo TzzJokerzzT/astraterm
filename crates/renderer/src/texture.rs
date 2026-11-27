@@ -24,7 +24,7 @@ use wgpu::{
     RenderPipeline, RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor,
     ShaderModuleDescriptor, ShaderSource, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture,
     TextureAspect, TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType,
-    TextureUsages, TextureViewDescriptor, TextureViewDimension, VertexState,
+    TextureUsages, TextureView, TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 
 use crate::paint::ImageItem;
@@ -298,8 +298,32 @@ pub struct TexturePipeline {
 
 impl TexturePipeline {
     pub fn new(device: &Device, format: TextureFormat) -> Self {
+        Self::build(device, format, Some(BlendState::ALPHA_BLENDING), "astraterm-image")
+    }
+
+    /// Pipeline that writes the sampled texture verbatim.
+    ///
+    /// The renderer blits its retained canvas into the frame with this one: the canvas
+    /// already holds the composite, so copying it must not blend it onto whatever the
+    /// frame held.
+    pub fn new_replace(device: &Device, format: TextureFormat) -> Self {
+        Self::build(
+            device,
+            format,
+            Some(BlendState::REPLACE),
+            "astraterm-blit",
+        )
+    }
+
+    fn build(
+        device: &Device,
+        format: TextureFormat,
+        blend: Option<BlendState>,
+        name: &str,
+    ) -> Self {
+        let shader_label = format!("{name}-shader");
         let shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("astraterm-image-shader"),
+            label: Some(&shader_label),
             source: ShaderSource::Wgsl(SHADER.into()),
         });
 
@@ -363,7 +387,7 @@ impl TexturePipeline {
         });
 
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("astraterm-image-pipeline"),
+            label: Some(&format!("{name}-pipeline")),
             layout: Some(&layout),
             vertex: VertexState {
                 module: &shader,
@@ -392,9 +416,9 @@ impl TexturePipeline {
                 compilation_options: Default::default(),
                 targets: &[Some(ColorTargetState {
                     format,
-                    // Straight-alpha blending, exactly as the quad pipeline: the
-                    // decoded pixels are not premultiplied.
-                    blend: Some(BlendState::ALPHA_BLENDING),
+                    // Straight-alpha blending for decoded images, which are not
+                    // premultiplied; verbatim for the canvas blit.
+                    blend,
                     write_mask: ColorWrites::ALL,
                 })],
             }),
@@ -429,6 +453,27 @@ impl TexturePipeline {
     /// Layout of the per-texture bind group, used by [`TextureCache`].
     pub fn texture_layout(&self) -> &BindGroupLayout {
         &self.texture_layout
+    }
+
+    /// Bind group sampling `view` with `sampler`.
+    ///
+    /// The cache builds one per terminal image; this is for a texture it does not own,
+    /// which is the renderer's retained canvas.
+    pub fn bind_group(&self, device: &Device, view: &TextureView, sampler: &Sampler) -> BindGroup {
+        device.create_bind_group(&BindGroupDescriptor {
+            label: Some("astraterm-texture-bind-group"),
+            layout: &self.texture_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(view),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::Sampler(sampler),
+                },
+            ],
+        })
     }
 
     /// Uploads the frame's textured rectangles. Reallocates when needed.

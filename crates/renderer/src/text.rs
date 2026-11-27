@@ -8,17 +8,19 @@
 //! shaped buffers and the mutable font system at the same time.
 
 use std::collections::{HashMap, VecDeque};
+use std::ops::Range;
 use std::sync::Arc;
 
 use astraterm_config::schema::FontConfig;
-use astraterm_core::CellMetrics;
+use astraterm_core::{CellMetrics, Rect};
 use cosmic_text::{
     Attrs, Buffer, CacheKeyFlags, Family, FeatureTag, FontFeatures, FontSystem, Metrics, Shaping,
     Style, Weight,
 };
 use glyphon::{Color as GlyphonColor, TextArea, TextBounds};
 
-use crate::paint::{ANCHOR_TOLERANCE, Scene, TextItem};
+use crate::damage::Damage;
+use crate::paint::{ANCHOR_TOLERANCE, Scene, TextItem, column_clip};
 
 /// Resolved shaping style for the terminal font.
 #[derive(Clone, Debug)]
@@ -81,23 +83,124 @@ impl TextStyle {
 }
 
 struct CachedBuffer {
-    buffer: Buffer,
+    /// The shaped item, split where a substitution leaves its columns (S3). Almost
+    /// always one piece.
+    pieces: Vec<Piece>,
     hash: u64,
     style_key: u64,
 }
 
-/// Upper bound on cached rows; beyond this the cache is dropped wholesale.
-const MAX_CACHED_ITEMS: usize = 4096;
+/// One shaped piece of a cached item, positioned on the columns it owns.
+///
+/// Everything positional is stored relative to the item, never in device pixels: an
+/// item keeps its shaped buffer when only its position or its clip changed (the hash is
+/// over content), so absolute coordinates cached here would be stale the moment a pane
+/// moved.
+struct Piece {
+    buffer: Buffer,
+    /// Pixels from the item's left edge to this piece's left edge.
+    offset: f32,
+    /// Bytes of the item's text before this piece, which is where the tests read the
+    /// piece's starting column from.
+    #[cfg_attr(not(test), allow(dead_code))]
+    start: usize,
+    /// Columns the piece covers, for the clip that keeps one piece from painting over
+    /// the next. `None` for a whole item, which keeps the item's own clip exactly.
+    columns: Option<usize>,
+}
+
+impl Piece {
+    /// The piece that holds a whole item, placed exactly where the item starts.
+    fn whole(buffer: Buffer) -> Self {
+        Self {
+            buffer,
+            offset: 0.0,
+            start: 0,
+            columns: None,
+        }
+    }
+
+    /// Left edge in device pixels for this piece of `item`.
+    fn left(&self, item: &TextItem) -> f32 {
+        item.position.0 + self.offset
+    }
+
+    /// Rectangle the piece may paint into: its own columns plus one cell of slack, or
+    /// the item's own clip when it is the whole item.
+    fn bounds(&self, item: &TextItem, cell_width: f32) -> TextBounds {
+        match self.columns {
+            Some(columns) => bounds_of(column_clip(
+                self.left(item) as i32,
+                columns,
+                cell_width,
+                item.clip,
+            )),
+            None => bounds_of(item.clip),
+        }
+    }
+}
+
+fn bounds_of(clip: Rect) -> TextBounds {
+    TextBounds {
+        left: clip.x,
+        top: clip.y,
+        right: clip.right(),
+        bottom: clip.bottom(),
+    }
+}
+
+/// Upper bound on cached rows.
+///
+/// The cache evicts the oldest shaped row when it reaches this count instead of
+/// dropping everything, so the bound has to be larger than the number of items a
+/// screen can hold: a screen past the bound reshapes its whole item set on every
+/// frame however the cache evicts. A 4K display at the smallest layout the defaults
+/// allow is 3840/8 by 2160/16 = 480x135 cells, and a screen made entirely of wide
+/// clusters puts every second cell in a segment of its own, 240 per row and 32 400
+/// items; the mosaic, the floating terminal and the next frame's items leave room
+/// under 32 768. An entry is a shaped buffer plus a hash, so a full cache of
+/// single-glyph buffers is a few megabytes either way.
+const MAX_CACHED_ITEMS: usize = 1 << 15;
 
 /// Cache of shaped text items keyed by their stable identifier.
-#[derive(Default)]
+///
+/// An item is reshaped only when its content or style changed. The cache is bounded
+/// but never wiped: at the bound it evicts the item inserted longest ago, so the
+/// recent screen survives instead of being reshaped again on the next frame (B22).
 pub struct RowCache {
     rows: HashMap<u64, CachedBuffer>,
+    /// Identifiers in insertion order, so a full cache evicts the oldest item.
+    order: VecDeque<u64>,
+    /// Items kept before the oldest is evicted.
+    capacity: usize,
+    /// Width of one column under the style the cache last shaped with, for the clip a
+    /// split piece is given.
+    cell_width: f32,
+}
+
+impl Default for RowCache {
+    fn default() -> Self {
+        Self::with_capacity(MAX_CACHED_ITEMS)
+    }
 }
 
 impl RowCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Cache that evicts its oldest item past `capacity` entries.
+    ///
+    /// The bound is a seam: production uses [`MAX_CACHED_ITEMS`], and the tests use a
+    /// handful of entries so filling the cache past its bound stays cheap.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            rows: HashMap::new(),
+            order: VecDeque::new(),
+            // A cache that keeps nothing would reshape every item of every frame.
+            capacity: capacity.max(1),
+            cell_width: 1.0,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -108,15 +211,19 @@ impl RowCache {
         self.rows.is_empty()
     }
 
+    /// Items the cache keeps before evicting the oldest.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub fn clear(&mut self) {
         self.rows.clear();
+        self.order.clear();
     }
 
     /// Shapes every item that changed since the last call.
     pub fn update(&mut self, font_system: &mut FontSystem, style: &TextStyle, scene: &Scene) {
-        if self.rows.len() > MAX_CACHED_ITEMS {
-            self.rows.clear();
-        }
+        self.cell_width = style.cell.width.max(1.0);
         for item in &scene.texts {
             let hash = item.content_hash();
             let rebuild = match self.rows.get(&item.id) {
@@ -127,38 +234,97 @@ impl RowCache {
                 continue;
             }
             let buffer = shape(font_system, style, item);
-            self.rows.insert(
-                item.id,
-                CachedBuffer {
-                    buffer,
-                    hash,
-                    style_key: style.key,
-                },
-            );
+            let pieces = pieces(font_system, style, item, buffer);
+            self.insert(item.id, CachedBuffer {
+                pieces,
+                hash,
+                style_key: style.key,
+            });
         }
+    }
+
+    /// Stores one shaped item, evicting the oldest entries until it fits.
+    ///
+    /// Eviction never drops the whole cache: the items shaped most recently survive,
+    /// which is what keeps a frame whose item count exceeds the bound from reshaping
+    /// every one of them again on the next frame.
+    ///
+    /// A reshaped item keeps its place in the queue, so the queue order stays the order
+    /// items first entered the cache and an entry that changes on every frame (a
+    /// clock, a spinner) cannot push out the rows around it.
+    fn insert(&mut self, id: u64, cached: CachedBuffer) {
+        if self.rows.insert(id, cached).is_none() {
+            self.order.push_back(id);
+        }
+        while self.rows.len() > self.capacity {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.rows.remove(&oldest);
+        }
+    }
+
+    /// Position of every shaped glyph of one item, with the bytes it covers, for the
+    /// tests that prove glyphs land on their columns. `x` is measured from the item's
+    /// left edge, which is zero for a row painted at the origin.
+    #[cfg(test)]
+    pub(crate) fn glyph_positions(&self, id: u64) -> Vec<(usize, usize, f32)> {
+        let Some(cached) = self.rows.get(&id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for piece in &cached.pieces {
+            for run in piece.buffer.layout_runs() {
+                for glyph in run.glyphs.iter() {
+                    out.push((
+                        piece.start + glyph.start,
+                        piece.start + glyph.end,
+                        piece.offset + glyph.x,
+                    ));
+                }
+            }
+        }
+        out
     }
 
     /// Text areas ready to be handed to glyphon.
     pub fn areas<'a>(&'a self, scene: &'a Scene) -> Vec<TextArea<'a>> {
+        self.collect_areas(scene, |_| true)
+    }
+
+    /// Text areas of the items that reach a damaged strip.
+    ///
+    /// glyphon uploads and draws every glyph it is given, so handing it the whole
+    /// screen for a one-row change would draw the whole screen: a damaged repaint only
+    /// prepares the items the damage reaches (S7).
+    pub fn areas_damaged<'a>(&'a self, scene: &'a Scene, damage: &Damage) -> Vec<TextArea<'a>> {
+        self.collect_areas(scene, |item| damage.touches(item.clip))
+    }
+
+    fn collect_areas<'a>(
+        &'a self,
+        scene: &'a Scene,
+        keep: impl Fn(&TextItem) -> bool,
+    ) -> Vec<TextArea<'a>> {
         let mut areas = Vec::with_capacity(scene.texts.len());
         for item in &scene.texts {
+            if !keep(item) {
+                continue;
+            }
             let Some(cached) = self.rows.get(&item.id) else {
                 continue;
             };
-            areas.push(TextArea {
-                buffer: &cached.buffer,
-                left: item.position.0,
-                top: item.position.1,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: item.clip.x,
-                    top: item.clip.y,
-                    right: item.clip.right(),
-                    bottom: item.clip.bottom(),
-                },
-                default_color: GlyphonColor::rgb(255, 255, 255),
-                custom_glyphs: &[],
-            });
+            for piece in &cached.pieces {
+                areas.push(TextArea {
+                    buffer: &piece.buffer,
+                    left: piece.left(item),
+                    top: item.position.1,
+                    scale: 1.0,
+                    bounds: piece.bounds(item, self.cell_width),
+                    default_color: GlyphonColor::rgb(255, 255, 255),
+                    custom_glyphs: &[],
+                });
+            }
         }
         areas
     }
@@ -425,16 +591,34 @@ fn measure_ascii_is_one_column(font_system: &mut FontSystem, style: &TextStyle) 
 }
 
 fn shape(font_system: &mut FontSystem, style: &TextStyle, item: &TextItem) -> Buffer {
+    shape_range(font_system, style, item, 0..item.text_len())
+}
+
+/// Shapes one byte range of an item's text with the attributes its spans carry.
+///
+/// The whole item is the common case; a range is what the ligature split re-shapes
+/// around a substitution that left its columns (S3).
+fn shape_range(
+    font_system: &mut FontSystem,
+    style: &TextStyle,
+    item: &TextItem,
+    range: Range<usize>,
+) -> Buffer {
     let mut buffer = Buffer::new(font_system, style.metrics);
     // The terminal decides where lines break, so the shaper must not wrap.
     buffer.set_size(Some(1.0e6), Some(style.metrics.line_height));
 
     let family = style.family.clone();
     let features = font_features(style.ligatures);
-    let spans: Vec<(String, Attrs<'_>)> = item
-        .spans
-        .iter()
-        .map(|span| {
+    let mut spans: Vec<(String, Attrs<'_>)> = Vec::with_capacity(item.spans.len());
+    let mut offset = 0;
+    for span in &item.spans {
+        let length = span.text.len();
+        let start = range.start.max(offset);
+        let end = range.end.min(offset + length);
+        if start < end
+            && let Some(text) = span.text.get(start - offset..end - offset)
+        {
             let mut attrs = Attrs::new()
                 .family(Family::Name(&family))
                 .weight(if span.bold {
@@ -458,9 +642,10 @@ fn shape(font_system: &mut FontSystem, style: &TextStyle, item: &TextItem) -> Bu
             if style.letter_spacing.abs() > f32::EPSILON {
                 attrs = attrs.letter_spacing(style.letter_spacing);
             }
-            (span.text.clone(), attrs)
-        })
-        .collect();
+            spans.push((text.to_owned(), attrs));
+        }
+        offset += length;
+    }
 
     let span_refs: Vec<(&str, Attrs<'_>)> = spans
         .iter()
@@ -474,6 +659,109 @@ fn shape(font_system: &mut FontSystem, style: &TextStyle, item: &TextItem) -> Bu
     buffer.set_rich_text(span_refs, &default_attrs, Shaping::Advanced, None);
     buffer.shape_until_scroll(font_system, false);
     buffer
+}
+
+/// One shaped glyph of a grid run, as the ligature splitter sees it: the bytes it
+/// covers (which are the columns it covers, because the item is one byte per column)
+/// and the advance the shaper gave it.
+struct GlyphFootprint {
+    start: usize,
+    end: usize,
+    advance: f32,
+}
+
+/// The shaped glyphs of a run, with each glyph's advance recovered from the next
+/// glyph's position.
+///
+/// A row item holds one line, so the first layout run is the whole of it.
+fn footprints(buffer: &Buffer) -> Vec<GlyphFootprint> {
+    let mut out = Vec::new();
+    let Some(run) = buffer.layout_runs().next() else {
+        return out;
+    };
+    for (index, glyph) in run.glyphs.iter().enumerate() {
+        let next = run
+            .glyphs
+            .get(index + 1)
+            .map(|next| next.x)
+            .unwrap_or(run.line_w);
+        out.push(GlyphFootprint {
+            start: glyph.start,
+            end: glyph.end,
+            advance: next - glyph.x,
+        });
+    }
+    out
+}
+
+/// Byte offsets where a run of `length` bytes has to be split so no glyph moves the
+/// glyphs after it.
+///
+/// A substitution whose advance matches the columns it covers needs no split: it is the
+/// grid-anchoring rule of [`crate::paint`] holding one level up. One that does not leaves
+/// a piece boundary behind it, so the next piece starts on the columns it owns. A glyph
+/// at the very end of the run moves nothing, so it is not a boundary either — and a
+/// boundary at zero would make an empty piece.
+fn ligature_breaks(glyphs: &[GlyphFootprint], cell_width: f32, length: usize) -> Vec<usize> {
+    let mut breaks: Vec<usize> = Vec::new();
+    for glyph in glyphs {
+        let columns = glyph.end.saturating_sub(glyph.start);
+        if columns == 0 || glyph.end == 0 || glyph.end >= length {
+            continue;
+        }
+        let reserved = columns as f32 * cell_width;
+        if (glyph.advance - reserved).abs() <= ANCHOR_TOLERANCE {
+            continue;
+        }
+        // Glyphs of one cluster share their byte range, so consecutive glyphs can name
+        // the same boundary; only the first is a boundary.
+        if breaks.last() != Some(&glyph.end) {
+            breaks.push(glyph.end);
+        }
+    }
+    breaks
+}
+
+/// Splits a shaped grid item where a substitution leaves the columns it covers.
+///
+/// With ligatures on, the shaper may replace several characters with one glyph, and the
+/// row is shaped as one run, so a glyph whose advance disagrees with its columns moves
+/// every glyph after it (S3). The row walk anchors a *cluster* when its measured advance
+/// leaves its columns; one level up this splits a *run* at every glyph whose shaped
+/// advance leaves the columns it covers, and places each piece on the columns it owns.
+/// The substitution itself is not broken up: the piece that starts with it still shapes
+/// it as one glyph, and only the pieces after it move back onto the grid.
+///
+/// Nothing is split when the item is not a grid run (see [`TextItem::on_grid`]), when
+/// ligatures are off, or when every glyph already lands on its columns — which is what
+/// a monospace ligature font designed for a grid does.
+fn pieces(
+    font_system: &mut FontSystem,
+    style: &TextStyle,
+    item: &TextItem,
+    buffer: Buffer,
+) -> Vec<Piece> {
+    if !style.ligatures || !item.on_grid {
+        return vec![Piece::whole(buffer)];
+    }
+    let length = item.text_len();
+    let breaks = ligature_breaks(&footprints(&buffer), style.cell.width, length);
+    if breaks.is_empty() {
+        return vec![Piece::whole(buffer)];
+    }
+    let mut pieces = Vec::with_capacity(breaks.len() + 1);
+    let mut start = 0;
+    for end in breaks.into_iter().chain(std::iter::once(length)) {
+        let sub = shape_range(font_system, style, item, start..end);
+        pieces.push(Piece {
+            buffer: sub,
+            offset: start as f32 * style.cell.width,
+            start,
+            columns: Some(end - start),
+        });
+        start = end;
+    }
+    pieces
 }
 
 /// OpenType features that decide whether ligatures reach the shaper.
@@ -655,6 +943,30 @@ mod tests {
     }
 
     #[test]
+    fn a_moved_item_keeps_its_shaped_buffer_and_its_new_position() {
+        // The cache key is the item's content, so a pane that moved keeps its buffer. The
+        // position and the clip are therefore read from the scene every time an area is
+        // handed to glyphon, never from what was cached.
+        let mut system = FontSystem::new();
+        let style = TextStyle::new(&font(), 1.0, &mut system);
+        let mut cache = RowCache::new();
+        let scene = scene_with(5, "moved");
+        cache.update(&mut system, &style, &scene);
+        let before = &cache.areas(&scene)[0];
+        assert_eq!((before.left, before.top), (0.0, 0.0));
+
+        let mut moved = scene_with(5, "moved");
+        moved.texts[0].position = (120.0, 40.0);
+        moved.texts[0].clip = Rect::new(100, 40, 200, 20);
+        cache.update(&mut system, &style, &moved);
+        assert_eq!(cache.len(), 1, "the buffer was reused, not reshaped");
+        let after = &cache.areas(&moved)[0];
+        assert_eq!((after.left, after.top), (120.0, 40.0));
+        assert_eq!(after.bounds.left, 100);
+        assert_eq!(after.bounds.top, 40);
+    }
+
+    #[test]
     fn style_change_invalidates_cached_rows() {
         let mut system = FontSystem::new();
         let mut style = TextStyle::new(&font(), 1.0, &mut system);
@@ -784,7 +1096,7 @@ mod tests {
             .rows
             .get(&11)
             .expect("the row was shaped into the cache")
-            .buffer;
+            .pieces[0].buffer;
         let run = buffer.layout_runs().next().expect("one shaped run");
         // Ten ASCII cells: the grid advances `cell.width` per column, so the painted
         // run has to advance exactly that much or the grid and the glyphs drift apart.
@@ -862,7 +1174,7 @@ mod tests {
             .rows
             .get(&21)
             .expect("the row was shaped into the cache")
-            .buffer
+            .pieces[0].buffer
             .layout_runs()
             .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.cache_key_flags))
             .collect()
@@ -906,7 +1218,7 @@ mod tests {
             .rows
             .get(&22)
             .expect("the row was shaped into the cache")
-            .buffer
+            .pieces[0].buffer
             .layout_runs()
             .next()
             .expect("one shaped run");
@@ -927,6 +1239,115 @@ mod tests {
             unhinted, hinted,
             "the advance comes from unhinted glyph metrics, so the toggle only changes \
              rasterisation"
+        );
+    }
+
+    fn footprint(start: usize, end: usize, advance: f32) -> GlyphFootprint {
+        GlyphFootprint {
+            start,
+            end,
+            advance,
+        }
+    }
+
+    #[test]
+    fn a_substitution_that_leaves_its_columns_ends_a_piece() {
+        // S3 in the abstract: the substitution covers two columns and advances 13 px
+        // where they are 15.6, so a piece ends after it and the letters after it are
+        // placed on their own columns.
+        let glyphs = [
+            footprint(0, 2, 13.0),
+            footprint(2, 3, 7.8),
+            footprint(3, 4, 7.8),
+        ];
+        assert_eq!(ligature_breaks(&glyphs, 7.8, 4), vec![2]);
+    }
+
+    #[test]
+    fn a_substitution_that_fills_its_columns_is_not_split() {
+        // A monospace ligature font keeps the advance on the grid, so the row stays one
+        // piece: fonts that already behave see no change at all.
+        let glyphs = [footprint(0, 2, 15.6), footprint(2, 4, 15.6)];
+        assert!(ligature_breaks(&glyphs, 7.8, 4).is_empty());
+    }
+
+    #[test]
+    fn every_drifting_glyph_ends_a_piece_and_a_trailing_one_is_no_boundary() {
+        let glyphs = [
+            footprint(0, 1, 7.8),
+            footprint(1, 3, 13.0),
+            footprint(3, 5, 13.0),
+        ];
+        // The last substitution sits at the end of the run and moves nothing after it.
+        assert_eq!(ligature_breaks(&glyphs, 7.8, 5), vec![3]);
+        // With text after it, it ends a piece of its own.
+        assert_eq!(ligature_breaks(&glyphs, 7.8, 7), vec![3, 5]);
+    }
+
+    #[test]
+    fn glyphs_of_one_cluster_name_one_boundary() {
+        // A cluster can be shaped into several glyphs that share its byte range; the
+        // boundary is the cluster's end, once.
+        let glyphs = [footprint(0, 1, 0.0), footprint(0, 1, 7.8)];
+        assert_eq!(ligature_breaks(&glyphs, 7.8, 4), vec![1]);
+    }
+
+    #[test]
+    fn the_row_cache_evicts_the_oldest_instead_of_wiping_itself() {
+        // B22: reaching the bound used to drop every shaped row, so a screen with more
+        // items than the bound reshaped all of them on the next frame. The cache now
+        // evicts the item inserted longest ago and keeps the rest.
+        let capacity: usize = 4;
+        let mut system = FontSystem::new();
+        let style = TextStyle::new(&font(), 1.0, &mut system);
+        let mut cache = RowCache::with_capacity(capacity);
+        let ids: Vec<u64> = (0..capacity as u64 * 2).collect();
+        for id in &ids {
+            cache.update(&mut system, &style, &scene_with(*id, "row"));
+            assert!(
+                cache.len() <= capacity,
+                "the cache outgrew its bound: {} entries after {id}",
+                cache.len()
+            );
+        }
+        assert_eq!(cache.len(), capacity, "the cache is full, not emptied");
+        for id in &ids[..capacity] {
+            assert!(
+                !cache.rows.contains_key(id),
+                "item {id} was one of the oldest and had to be evicted"
+            );
+        }
+        for id in &ids[capacity..] {
+            assert!(
+                cache.rows.contains_key(id),
+                "item {id} is one of the {} most recently shaped and must survive",
+                capacity
+            );
+        }
+        // Evicting one made room for exactly one: the item shaped next is resident and
+        // the next oldest took the loss.
+        let newest = *ids.last().expect("ids") + 1;
+        cache.update(&mut system, &style, &scene_with(newest, "row"));
+        assert!(cache.rows.contains_key(&newest), "the new item is resident");
+        assert_eq!(cache.len(), capacity, "still bounded after the eviction");
+        assert!(
+            !cache.rows.contains_key(&ids[capacity]),
+            "the oldest resident item is the one that made room"
+        );
+    }
+
+    #[test]
+    fn the_row_bound_holds_a_screen_of_wide_clusters() {
+        // A bound smaller than the screen's items reshapes all of them on every frame
+        // however it evicts, so it has to cover a 4K screen at the smallest layout the
+        // defaults allow, made entirely of two-column clusters.
+        let columns = 3840 / 8;
+        let rows = 2160 / 16;
+        let items = (columns / 2) * rows;
+        assert!(
+            RowCache::new().capacity() >= items,
+            "{} entries against {items} items of a {columns}x{rows} screen",
+            MAX_CACHED_ITEMS
         );
     }
 
