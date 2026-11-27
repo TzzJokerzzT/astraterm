@@ -29,6 +29,7 @@ use astraterm_workspace::{LayoutConfig, Pane, Tab, WindowState};
 
 use crate::chrome;
 use crate::ime::{self, CursorCell};
+use crate::prompt;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::window::Window;
 
@@ -43,6 +44,22 @@ const STATUS_LIFETIME: Duration = Duration::from_secs(4);
 
 /// Blink period of the text cursor.
 pub const CURSOR_BLINK_PERIOD: Duration = Duration::from_millis(530);
+
+/// How long the bell's border flash stays on screen (S6).
+///
+/// Long enough to be noticed on a 60 Hz screen — about two dozen frames — and short
+/// enough that it never competes with the message in the status bar.
+pub const BELL_FLASH_DURATION: Duration = Duration::from_millis(400);
+
+/// Thickness of the bell's border flash, in device pixels.
+const BELL_FLASH_THICKNESS: u32 = 2;
+
+/// Scene item id of the input method's composition (S4).
+///
+/// Chrome starts at 1 000 000 and the floating terminal at 0x20_0000, so this keeps
+/// the composition in a range of its own; the shaping cache therefore never confuses
+/// it with a row, a label or the cursor.
+const PREEDIT_ID: u64 = 0x0E_0000;
 
 /// Scene item id base of the floating terminal.
 ///
@@ -70,24 +87,24 @@ pub fn floating_id_base(index: usize) -> u64 {
 
 /// Decides whether the cursor blink should toggle now, and when to check again.
 ///
-/// A blink that re-armed itself on every frame would spin the event loop at frame
-/// rate; this gate keeps it at exactly two toggles per period.
-pub fn blink_due(now: Instant, deadline: Option<Instant>) -> (bool, Instant) {
+/// The period is passed in rather than read from the configuration, because the idle
+/// frame budget may stretch it (S10). A blink that re-armed itself on every frame would
+/// spin the event loop at frame rate; this gate keeps it at exactly two toggles per
+/// period, and `CURSOR_BLINK_PERIOD` is what the application passes when the budget
+/// leaves the blink alone.
+pub fn blink_due_with(
+    now: Instant,
+    deadline: Option<Instant>,
+    period: Duration,
+) -> (bool, Instant) {
     match deadline {
         Some(deadline) if now < deadline => (false, deadline),
         Some(deadline) => {
             // Catch up without ever firing more than once per call.
-            let next = deadline + CURSOR_BLINK_PERIOD;
-            (
-                true,
-                if next <= now {
-                    now + CURSOR_BLINK_PERIOD
-                } else {
-                    next
-                },
-            )
+            let next = deadline + period;
+            (true, if next <= now { now + period } else { next })
         }
-        None => (true, now + CURSOR_BLINK_PERIOD),
+        None => (true, now + period),
     }
 }
 
@@ -604,6 +621,14 @@ pub struct WindowUi {
     /// on every keystroke and every frame of output: `set_ime_cursor_area` is a platform
     /// call the compositor cannot make anything new of.
     last_ime_area: Option<Rect>,
+    /// The composition an input method is in the middle of (S4).
+    ///
+    /// It is painted at the cursor and nowhere else; the grid the pane is drawn from
+    /// never sees it, so a composition can grow, shrink and vanish without writing a
+    /// cell or marking one damaged.
+    pub preedit: Option<ime::Preedit>,
+    /// When the bell's border flash ends, while one is running (S6).
+    pub bell_flash: Option<Instant>,
 }
 
 impl WindowUi {
@@ -641,6 +666,8 @@ impl WindowUi {
             session_bindings: BTreeMap::new(),
             floating: None,
             last_ime_area: None,
+            preedit: None,
+            bell_flash: None,
         }
     }
 
@@ -1138,6 +1165,14 @@ impl WindowUi {
             if let Overlay::Search(search) = &self.overlay {
                 self.paint_search_highlights(&mut scene, *rect, &snapshot, search);
             }
+
+            // Both are drawn over the pane's own cells and both belong to the pane that
+            // owns the keyboard: the bell's flash marks it, and the composition can only
+            // be typed into it.
+            if focused == Some(*pane) {
+                self.compose_bell_flash(&mut scene, *rect, show_border);
+                self.compose_preedit(&mut scene, *rect, show_border, &snapshot);
+            }
         }
 
         self.compose_status_bar(&mut scene, sessions, system);
@@ -1235,7 +1270,106 @@ impl WindowUi {
             if let Overlay::Search(search) = &self.overlay {
                 self.paint_search_highlights(scene, rect, &snapshot, search);
             }
+            if focused == pane {
+                self.compose_bell_flash(scene, rect, show_border);
+                self.compose_preedit(scene, rect, show_border, &snapshot);
+            }
         }
+    }
+
+    /// Whether the bell's border flash is on screen right now.
+    pub fn bell_flash_active(&self) -> bool {
+        self.bell_flash.is_some_and(|until| Instant::now() < until)
+    }
+
+    /// Paints the bell's border flash on the focused pane (S6).
+    ///
+    /// It is an accent-coloured frame just inside the pane's own rectangle, drawn after
+    /// the pane's glyphs so nothing can cover it, and confined to that rectangle so a
+    /// flash never lights a neighbouring pane or a divider.
+    fn compose_bell_flash(&self, scene: &mut Scene, rect: Rect, show_border: bool) {
+        if !self.bell_flash_active() {
+            return;
+        }
+        let inner = if show_border { rect.shrunk(1) } else { rect };
+        if inner.is_empty() {
+            return;
+        }
+        let thickness = BELL_FLASH_THICKNESS.min(inner.width).min(inner.height);
+        let color = self.theme.palette.accent;
+        scene.push_quad(
+            Rect::new(inner.x, inner.y, inner.width, thickness),
+            color,
+            1.0,
+        );
+        scene.push_quad(
+            Rect::new(
+                inner.x,
+                inner.bottom() - thickness as i32,
+                inner.width,
+                thickness,
+            ),
+            color,
+            1.0,
+        );
+        scene.push_quad(
+            Rect::new(inner.x, inner.y, thickness, inner.height),
+            color,
+            1.0,
+        );
+        scene.push_quad(
+            Rect::new(
+                inner.right() - thickness as i32,
+                inner.y,
+                thickness,
+                inner.height,
+            ),
+            color,
+            1.0,
+        );
+    }
+
+    /// Paints the input method's composition at the cursor (S4).
+    ///
+    /// The items are built from the composition's own state and the snapshot's cursor
+    /// cell, and they land in the band of the row the cursor is on — which is exactly
+    /// how the damage plan learns that this row changed. Nothing is drawn when there is
+    /// no composition, so a session that never composes a character looks exactly as it
+    /// did before.
+    fn compose_preedit(
+        &self,
+        scene: &mut Scene,
+        rect: Rect,
+        show_border: bool,
+        snapshot: &Snapshot,
+    ) {
+        let Some(preedit) = self.preedit.as_ref() else {
+            return;
+        };
+        // A hidden cursor is no caret to compose at: `DECTCEM` off means the program
+        // asked for no cursor, and the candidate window is already placed by the
+        // platform.
+        let Some(cursor) = snapshot.cursor.as_ref() else {
+            return;
+        };
+        let inner = if show_border { rect.shrunk(1) } else { rect };
+        let cell = CursorCell {
+            column: cursor.column,
+            row: cursor.row,
+        };
+        let Some(area) =
+            ime::preedit_area(inner, self.padding(), self.metrics, cell, &preedit.text)
+        else {
+            return;
+        };
+        push_preedit(
+            scene,
+            area,
+            &preedit.text,
+            self.theme.palette.background,
+            self.theme.palette.cursor,
+            self.theme.palette.foreground,
+        );
     }
 
     /// Queues the images anchored to one pane into the scene.
@@ -1381,6 +1515,12 @@ impl WindowUi {
         if let Some(pane) = self.focused_pane()
             && let Some(session) = sessions.for_pane(pane)
         {
+            // S1: the shell's own `OSC 133` marks say whether a command is running and
+            // what the last one returned. No marks, no segment: a program that never
+            // sends the sequence sees exactly today's status bar.
+            if let Some(state) = prompt::prompt_state(session.engine.semantic_marks()) {
+                parts.push(state.label());
+            }
             if let Some(title) = session.title.clone().or_else(|| session.label.clone()) {
                 parts.push(title);
             }
@@ -1727,6 +1867,39 @@ impl WindowUi {
         self.cursor_phase = !self.cursor_phase;
         self.window.request_redraw();
     }
+}
+
+/// Pushes the instructions that paint one composition at the cursor (S4).
+///
+/// The composition covers the cells it stands on with the terminal background, marks
+/// its end with the cursor colour and writes its text on top, all confined to `area`.
+/// It is a free function so the exact instructions — and therefore the bands the damage
+/// plan rebuilds — are assertable without a window: the whole item set is clipped to the
+/// one row the composition occupies.
+pub fn push_preedit(
+    scene: &mut Scene,
+    area: Rect,
+    text: &str,
+    background: astraterm_config::Rgb,
+    marker: astraterm_config::Rgb,
+    foreground: astraterm_config::Rgb,
+) {
+    if area.is_empty() {
+        return;
+    }
+    scene.push_quad(area, background, 1.0);
+    scene.push_quad(
+        Rect::new(area.x, area.bottom() - 1, area.width, 1),
+        marker,
+        1.0,
+    );
+    scene.push_text(TextItem::plain(
+        PREEDIT_ID,
+        (area.x as f32, area.y as f32),
+        text.to_owned(),
+        paint::rgba(foreground, 1.0),
+        area,
+    ));
 }
 
 /// Finds all occurrences of `query` in the visible rows.
@@ -2435,17 +2608,60 @@ mod tests {
     #[test]
     fn blink_gate_fires_twice_per_period() {
         let start = Instant::now();
-        let (toggle, next) = blink_due(start, None);
+        let (toggle, next) = blink_due_with(start, None, CURSOR_BLINK_PERIOD);
         assert!(toggle, "the first check arms the timer");
         assert_eq!(next, start + CURSOR_BLINK_PERIOD);
 
-        let (toggle, next_same) = blink_due(start + Duration::from_millis(100), Some(next));
+        let (toggle, next_same) = blink_due_with(
+            start + Duration::from_millis(100),
+            Some(next),
+            CURSOR_BLINK_PERIOD,
+        );
         assert!(!toggle, "no toggle before the deadline");
         assert_eq!(next_same, next);
 
-        let (toggle, next_after) = blink_due(next, Some(next));
+        let (toggle, next_after) = blink_due_with(next, Some(next), CURSOR_BLINK_PERIOD);
         assert!(toggle, "toggles exactly at the deadline");
         assert_eq!(next_after, next + CURSOR_BLINK_PERIOD);
+    }
+
+    #[test]
+    fn a_composition_damages_exactly_the_row_it_is_painted_on() {
+        use astraterm_config::Rgb;
+        use astraterm_renderer::damage::{Bands, Geometry, plan};
+
+        // Three text rows of 16 px on an 8 px grid: the bands are the rows.
+        let geometry = Geometry::new((160, 48), 16, [0.0, 0.0, 0.0, 1.0]);
+        let mut before = Scene::default();
+        for row in 0..3u32 {
+            before.push_text(TextItem::plain(
+                u64::from(row) + 1,
+                (0.0, (row * 16) as f32),
+                "aaaaaaaaaaaaaaaaaaaa",
+                paint::rgba(Rgb::new(0xff, 0xff, 0xff), 1.0),
+                Rect::new(0, (row * 16) as i32, 160, 16),
+            ));
+        }
+        let mut after = before.clone();
+        // A composition of three cells at column 2 of row 1: exactly one row's worth
+        // of pixels, which is what makes it one band.
+        push_preedit(
+            &mut after,
+            Rect::new(16, 16, 24, 16),
+            "あいう",
+            Rgb::new(0x10, 0x10, 0x10),
+            Rgb::new(0xff, 0x88, 0x00),
+            Rgb::new(0xff, 0xff, 0xff),
+        );
+
+        let previous = Bands::record(&before, None, geometry);
+        let current = Bands::record(&after, None, geometry);
+        let damage = plan(Some(&previous), &current);
+        assert_eq!(
+            damage.bands(),
+            &[1],
+            "the composition is a change of the cursor row, and of nothing else"
+        );
     }
 
     #[test]
@@ -2453,7 +2669,7 @@ mod tests {
         let start = Instant::now();
         let deadline = start + CURSOR_BLINK_PERIOD;
         let late = start + CURSOR_BLINK_PERIOD * 10;
-        let (toggle, next) = blink_due(late, Some(deadline));
+        let (toggle, next) = blink_due_with(late, Some(deadline), CURSOR_BLINK_PERIOD);
         assert!(toggle);
         assert!(
             next > late,
@@ -2980,11 +3196,7 @@ mod floating_tests {
         let mut floating = floating(true);
         let first = PaneId::from_raw(7);
         let second = PaneId::from_raw(8);
-        assert!(floating.split_active(
-            SplitAxis::Vertical,
-            second,
-            SessionId::from_raw(22)
-        ));
+        assert!(floating.split_active(SplitAxis::Vertical, second, SessionId::from_raw(22)));
         (floating, first, second)
     }
 
@@ -3054,11 +3266,15 @@ mod floating_tests {
     #[test]
     fn a_split_while_the_float_has_the_keyboard_adds_a_pane_to_the_float() {
         let mosaic_pane = PaneId::from_raw(3);
-        let mut workspace = WindowState::new(WindowId::from_raw(1), Tab::new("mosaic", mosaic_pane));
+        let mut workspace =
+            WindowState::new(WindowId::from_raw(1), Tab::new("mosaic", mosaic_pane));
 
         let mut float = floating(true);
         assert!(split_lands_in_floating(Some(&float)));
-        assert_eq!(keyboard_pane(Some(&float), tab_parent(&workspace)), Some(PaneId::from_raw(7)));
+        assert_eq!(
+            keyboard_pane(Some(&float), tab_parent(&workspace)),
+            Some(PaneId::from_raw(7))
+        );
 
         let second = PaneId::from_raw(8);
         assert!(float.split_active(SplitAxis::Vertical, second, SessionId::from_raw(22)));
@@ -3352,7 +3568,11 @@ mod floating_tests {
         let mut sorted = bases.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), bases.len(), "the bases are distinct: {bases:?}");
+        assert_eq!(
+            sorted.len(),
+            bases.len(),
+            "the bases are distinct: {bases:?}"
+        );
         // `paint_pane` puts the cursor at `base + 0x10_000`, so the stride has to be
         // wider than that offset plus the tallest pane.
         const { assert!(FLOATING_PANE_STRIDE > 0x10_000) };
@@ -3438,7 +3658,10 @@ mod floating_tests {
     fn without_a_float_the_mosaic_pane_is_the_tab_parent() {
         let mosaic_pane = PaneId::from_raw(3);
         let workspace = WindowState::new(WindowId::from_raw(1), Tab::new("mosaic", mosaic_pane));
-        assert_eq!(keyboard_pane(None, tab_parent(&workspace)), Some(mosaic_pane));
+        assert_eq!(
+            keyboard_pane(None, tab_parent(&workspace)),
+            Some(mosaic_pane)
+        );
         assert!(!split_lands_in_floating(None));
         assert!(pane_at_point(&[], 1.0, 1.0).is_none(), "no rects, no hit");
     }

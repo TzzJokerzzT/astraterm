@@ -21,6 +21,24 @@ pub fn gesture_target(target: CopyOnSelectTarget) -> ClipboardSelection {
     }
 }
 
+/// The text a completed gesture hands to [`CopyOnSelect`], or `None` when there is
+/// nothing to copy.
+///
+/// S9: with `terminal.copy_on_select` off, nothing is extracted at all. The setting is
+/// checked *before* the engine is asked, because building the text walks the whole
+/// selection: a rectangle over a full 4K screen is a few hundred kilobytes of `String`
+/// that the very next step would throw away. `extract` is a closure so the order is a
+/// property of this function instead of a convention at one call site.
+pub fn selection_for_gesture(
+    enabled: bool,
+    extract: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    extract()
+}
+
 /// Decides when copy-on-select writes, and where.
 ///
 /// Explicit copies (`ctrl+shift+c`) do not come through here: a user who asks for the
@@ -77,7 +95,9 @@ mod tests {
 
     use astraterm_platform::clipboard::ClipboardWriter;
 
-    use super::{CopyOnSelect, ClipboardSelection, CopyOnSelectTarget, gesture_target};
+    use super::{
+        ClipboardSelection, CopyOnSelect, CopyOnSelectTarget, gesture_target, selection_for_gesture,
+    };
 
     /// Where the gesture writes by default, spelled once so the drag helper below reads
     /// like the real call site.
@@ -305,12 +325,64 @@ mod tests {
             .expect("the worker started the write");
         assert_eq!(
             lock(&recorded).as_slice(),
-            [(
-                ClipboardSelection::Primary,
-                "selected text".to_owned()
-            )]
+            [(ClipboardSelection::Primary, "selected text".to_owned())]
         );
 
         gate.open();
+    }
+
+    /// A selection big enough that building its text is real work: the whole visible
+    /// screen of a 200x50 grid as one rectangle, tens of thousands of cells.
+    fn screen_wide_selection() -> astraterm_terminal::TerminalEngine {
+        use astraterm_terminal::SelectionKind;
+        use astraterm_terminal::engine::EngineOptions;
+
+        let mut engine = astraterm_terminal::TerminalEngine::new(EngineOptions {
+            cols: 200,
+            rows: 50,
+            scrollback: 100,
+            ..Default::default()
+        });
+        let line = "x".repeat(199) + "\r\n";
+        for _ in 0..50 {
+            engine.process(line.as_bytes());
+        }
+        engine.update_selection(0, 0, SelectionKind::Block, astraterm_terminal::Side::Left);
+        engine.update_selection(
+            199,
+            49,
+            SelectionKind::SimpleOrExisting,
+            astraterm_terminal::Side::Right,
+        );
+        assert!(engine.has_selection(), "the fixture needs a live selection");
+        engine
+    }
+
+    #[test]
+    fn a_large_selection_is_never_extracted_when_copy_on_select_is_off() {
+        let engine = screen_wide_selection();
+        let mut extractions = 0;
+        let text = selection_for_gesture(false, || {
+            extractions += 1;
+            engine.selection_text()
+        });
+        assert_eq!(text, None, "a gesture that copies nothing copies nothing");
+        assert_eq!(
+            extractions, 0,
+            "with the setting off the selection text is never built at all"
+        );
+    }
+
+    #[test]
+    fn the_same_selection_is_extracted_once_when_copy_on_select_is_on() {
+        let engine = screen_wide_selection();
+        let mut extractions = 0;
+        let text = selection_for_gesture(true, || {
+            extractions += 1;
+            engine.selection_text()
+        });
+        assert_eq!(extractions, 1, "the gate is the setting, not the selection");
+        let text = text.expect("the gesture copies what is selected");
+        assert!(text.len() > 1000, "the fixture is a full screen of text");
     }
 }

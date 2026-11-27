@@ -6,6 +6,7 @@
 //! tool is unavailable: a missing `notify-send` must not crash the terminal.
 //! The clipboard uses `arboard`, so its absence is a build-time matter.
 
+pub mod bell;
 pub mod clipboard;
 pub mod fonts;
 pub mod linux;
@@ -13,6 +14,7 @@ pub mod notifications;
 pub mod paths;
 pub mod system;
 
+pub use bell::Bell;
 pub use clipboard::Clipboard;
 pub use notifications::Notifications;
 pub use paths::StatePaths;

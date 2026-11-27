@@ -315,6 +315,8 @@ pub fn command_for(action: ActionId) -> Option<AppCommand> {
         ActionId::ScrollPageDown => AppCommand::ScrollLines { delta: i32::MIN },
         ActionId::ScrollToTop => AppCommand::ScrollLines { delta: i32::MAX },
         ActionId::ScrollToBottom => AppCommand::ScrollToBottom,
+        ActionId::JumpToPreviousPrompt => AppCommand::JumpToPrompt { forward: false },
+        ActionId::JumpToNextPrompt => AppCommand::JumpToPrompt { forward: true },
         ActionId::OpenSettings => AppCommand::OpenSettings,
         ActionId::ReloadConfig => AppCommand::ReloadConfig,
         ActionId::ToggleStatusBar => AppCommand::ToggleStatusBar,

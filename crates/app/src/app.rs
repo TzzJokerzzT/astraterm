@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use astraterm_config::keys::{ActionId, Keymap};
-use astraterm_config::schema::{Config, should_notify};
+use astraterm_config::schema::{BellMode, Config, should_notify};
 use astraterm_config::service::{ConfigService, ConfigWatcher, ReloadOutcome, SaveError};
 use astraterm_config::themes::{Theme, available_themes};
 use astraterm_core::events::{AppCommand, ExitReason, SessionEvent};
@@ -44,8 +44,8 @@ use crate::paste;
 use crate::prefs::{FONT_SIZE_STEP, Preferences, next_font_size};
 use crate::ui::{
     ClickInfo, ConfirmDialog, DragState, ExitCleanup, Floating, FloatingPress, Overlay,
-    PendingAction, RenameOverlay, SearchOverlay, SessionImages, WindowUi,
-    closes_floating, divider_drag_at, open_clicked_url, plan_exit_cleanup, plan_floating_press,
+    PendingAction, RenameOverlay, SearchOverlay, SessionImages, WindowUi, closes_floating,
+    divider_drag_at, open_clicked_url, plan_exit_cleanup, plan_floating_press,
     split_lands_in_floating,
 };
 
@@ -86,6 +86,31 @@ const NOTIFICATION_MIN_INTERVAL: Duration = Duration::from_millis(250);
 /// Whether a session may deliver a notification at `now`.
 fn notification_due(last: Option<&Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.duration_since(*last) >= NOTIFICATION_MIN_INTERVAL)
+}
+
+/// What one `BEL` does, from the configuration and the machine's speaker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BellAction {
+    /// `bell = "none"`: no status message, no flash, no sound.
+    Nothing,
+    /// Ring the speaker and draw nothing.
+    Ring,
+    /// The status message plus the focused pane's border flash.
+    Flash,
+}
+
+/// Decides what a bell does.
+///
+/// The audible mode degrades to the visual one when nothing on the machine can ring
+/// it: a bell that is neither heard nor seen is the one outcome the setting must not
+/// produce, and the report says so instead of leaving it silent.
+fn bell_action(mode: BellMode, speaker_available: bool) -> BellAction {
+    match mode {
+        BellMode::None => BellAction::Nothing,
+        BellMode::Visual => BellAction::Flash,
+        BellMode::Audible if speaker_available => BellAction::Ring,
+        BellMode::Audible => BellAction::Flash,
+    }
 }
 
 /// Minimum gap before an identical save or reload notice is repeated.
@@ -218,6 +243,16 @@ pub struct Application {
     /// Decoded images of each session, anchored to buffer lines. Only filled when
     /// `terminal.images` is on; dropped when the session closes.
     images: BTreeMap<SessionId, SessionImages>,
+    /// The speaker, for `[terminal] bell = "audible"`.
+    ///
+    /// Resolved once at startup from what exists on this machine, and rung on its own
+    /// worker: a missing or wedged sound server can only ever answer `false` here,
+    /// which is where the visual bell takes over.
+    bell: astraterm_platform::bell::Bell,
+    /// When the last frame reached the screen, for the idle frame budget (S10).
+    last_draw: Option<Instant>,
+    /// Idle work is owed a frame the budget deferred, so the next pass draws it.
+    idle_pending: bool,
 }
 
 impl Application {
@@ -309,6 +344,9 @@ impl Application {
             system: SystemMonitor::new(),
             system_deadline: None,
             images: BTreeMap::new(),
+            bell: astraterm_platform::bell::Bell::detect(),
+            last_draw: None,
+            idle_pending: false,
         })
     }
 
@@ -655,9 +693,33 @@ impl Application {
                             .unwrap_or_default()
                     })
                     .unwrap_or_default();
+                // Read live, so a configuration saved a moment ago decides this bell
+                // without waiting for a restart.
+                let mode = self.config.config().terminal.bell;
+                match bell_action(mode, self.bell.available()) {
+                    BellAction::Nothing => return,
+                    // The speaker is rung on its own worker; a ring that cannot be
+                    // queued falls through to the screen instead of being lost.
+                    BellAction::Ring if self.bell.ring() => {
+                        tracing::trace!(?session, "bell rung on the speaker");
+                        return;
+                    }
+                    BellAction::Ring | BellAction::Flash => {}
+                }
+                if mode == BellMode::Audible {
+                    tracing::debug!("no audible bell backend; answering the bell on screen");
+                }
+                // Visual: today's status message, plus the focused pane's border.
+                let now = Instant::now();
                 for ui in self.windows.values_mut() {
-                    ui.status = Some((format!("bell: {label}"), Instant::now()));
+                    ui.status = Some((format!("bell: {label}"), now));
                     ui.window.request_redraw();
+                }
+                if let Some(window_id) = self.window_for_session(session) {
+                    self.with_window(window_id, |ui| {
+                        ui.bell_flash = Some(now + crate::ui::BELL_FLASH_DURATION);
+                        ui.window.request_redraw();
+                    });
                 }
             }
             SessionEvent::ColorQuery { session, index } => {
@@ -675,6 +737,25 @@ impl Application {
             }
             SessionEvent::Exited { session, reason } => self.handle_exit(session, reason),
         }
+    }
+
+    /// Expires the bell flashes whose time is up, and says how long the next one runs.
+    ///
+    /// Returns the wait until the earliest flash still on screen, so the loop can wake
+    /// up and repaint the pane without it. A flash that just expired owes a frame, and
+    /// receives one here.
+    fn expire_bell_flash(&mut self, now: Instant) -> Option<Duration> {
+        let mut next: Option<Instant> = None;
+        for ui in self.windows.values_mut() {
+            let Some(until) = ui.bell_flash else { continue };
+            if now >= until {
+                ui.bell_flash = None;
+                ui.window.request_redraw();
+            } else if next.is_none_or(|next| until < next) {
+                next = Some(until);
+            }
+        }
+        next.map(|until| until.saturating_duration_since(now))
     }
 
     /// Turns one OSC 9 / OSC 777 request into a status message and, when the
@@ -1260,6 +1341,11 @@ impl Application {
                 }
                 self.with_window(window_id, |ui| ui.window.request_redraw());
             }
+            AppCommand::JumpToPrompt { forward } => {
+                if let Some(pane) = focused_pane {
+                    self.jump_to_prompt(window_id, pane, forward);
+                }
+            }
             AppCommand::IncreaseFontSize => self.change_font_size(FONT_SIZE_STEP),
             AppCommand::DecreaseFontSize => self.change_font_size(-FONT_SIZE_STEP),
             AppCommand::ResetFontSize => {
@@ -1297,6 +1383,36 @@ impl Application {
         // metrics the candidate window follows; doing it once here keeps every arm from
         // having to remember it. It is a no-op when nothing moved.
         self.sync_ime_area(window_id);
+    }
+
+    /// Scrolls the focused pane's viewport to the previous or the next prompt (S1).
+    ///
+    /// The marks come from the engine, which drops the ones whose rows the buffer no
+    /// longer has, so a row this reads is always a row the buffer still holds. With no
+    /// marks — a program that never sends `OSC 133` — the jump does nothing and says
+    /// nothing, which is the whole of the pre-shell-integration behaviour.
+    fn jump_to_prompt(&mut self, window_id: WinitWindowId, pane: PaneId, forward: bool) {
+        let Some(session) = self.sessions.for_pane_mut(pane) else {
+            return;
+        };
+        let (_, rows) = session.engine.size();
+        let offset = session.engine.display_offset();
+        let Some(target) =
+            crate::prompt::jump_offset(session.engine.semantic_marks(), offset, rows, forward)
+        else {
+            return;
+        };
+        // The jump is a scroll like any other, so it moves the viewport the same way a
+        // wheel or a page key does and lands inside the scrollback the engine keeps.
+        let delta = target as i64 - offset as i64;
+        if delta != 0 {
+            session
+                .engine
+                .scroll_display(delta.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+        }
+        // `dispatch` refreshes the candidate window's rectangle after every command, so
+        // the jump only has to ask for the frame.
+        self.with_window(window_id, |ui| ui.window.request_redraw());
     }
 
     /// Divider the resize shortcuts act on, in the layout the keyboard drives.
@@ -1660,10 +1776,8 @@ impl Application {
     /// (S5).
     fn split_floating(&mut self, window_id: WinitWindowId, axis: SplitAxis) -> anyhow::Result<()> {
         let config = self.config.config().clone();
-        let Some((cols, rows, cell, parent, recorded_cwd, profile_id)) = self
-            .windows
-            .get(&window_id)
-            .and_then(|ui| {
+        let Some((cols, rows, cell, parent, recorded_cwd, profile_id)) =
+            self.windows.get(&window_id).and_then(|ui| {
                 let rect = ui.floating_rect()?;
                 let (cols, rows) = ui.grid_size(rect);
                 let parent = ui.floating.as_ref()?.active_pane();
@@ -1708,7 +1822,9 @@ impl Application {
             start_rows,
             cell,
         );
-        let session = self.sessions.create(new_pane, &spec, start_cols, start_rows)?;
+        let session = self
+            .sessions
+            .create(new_pane, &spec, start_cols, start_rows)?;
 
         let split = self
             .with_window(window_id, |ui| {
@@ -1783,10 +1899,7 @@ impl Application {
     fn close_floating(&mut self, window_id: WinitWindowId) {
         let Some((panes, sessions)) = self.windows.get(&window_id).and_then(|ui| {
             let floating = ui.floating.as_ref()?;
-            Some((
-                floating.panes(),
-                floating.session_ids().collect::<Vec<_>>(),
-            ))
+            Some((floating.panes(), floating.session_ids().collect::<Vec<_>>()))
         }) else {
             return;
         };
@@ -2038,7 +2151,9 @@ impl Application {
             .windows
             .get(&window_id)
             .and_then(WindowUi::focused_pane)?;
-        self.sessions.for_pane(pane).and_then(|s| s.selection_text())
+        self.sessions
+            .for_pane(pane)
+            .and_then(|s| s.selection_text())
     }
 
     /// Queues `text` for `selection` on the clipboard worker and reports it in the status
@@ -2053,18 +2168,16 @@ impl Application {
         text: String,
     ) {
         let proxy = self.proxy.clone();
-        let queued = self.clipboard_writer.set_reported(
-            selection,
-            &text,
-            move |result| {
+        let queued = self
+            .clipboard_writer
+            .set_reported(selection, &text, move |result| {
                 if let Err(message) = result {
                     let _ = proxy.send_event(UserEvent::ClipboardWriteFailed {
                         window: window_id,
                         message,
                     });
                 }
-            },
-        );
+            });
         let message = match queued {
             Ok(()) => format!("copied {} character(s)", text.chars().count()),
             // The platform distinguishes "no clipboard backend" from "the write ran and
@@ -2699,12 +2812,21 @@ impl Application {
     /// key-encoding paths, so `|` from `AltGr+1` and `á` from a dead key reach the
     /// child process unchanged.
     fn handle_ime(&mut self, window_id: WinitWindowId, ime: Ime) {
+        // S4: the composition in progress is window state that the next frame paints at
+        // the cursor. A frame is owed whenever it changes, including when it disappears,
+        // because the cells it covered have to be painted as they were again.
+        self.with_window(window_id, |ui| {
+            let next = crate::ime::apply_preedit(ui.preedit.take(), &ime);
+            if ui.preedit != next {
+                ui.preedit = next;
+                ui.window.request_redraw();
+            }
+        });
         match ime {
             Ime::Commit(text) => {
                 self.commit_composed_text(window_id, &text);
                 self.sync_ime_area(window_id);
             }
-            // Preedit is not drawn: the composition is visible once committed.
             Ime::Preedit(text, _) => {
                 tracing::trace!(preedit = %text, "ime preedit");
                 // A preedit update re-anchors the candidate window at the caret, so the
@@ -2919,7 +3041,11 @@ impl Application {
                 // does. Copying the target out of the config ends the borrow of `self`
                 // before the queue below.
                 let target = gesture_target(config.terminal.copy_on_select_target);
-                let text = self.selection_text(window_id);
+                // S9: with the setting off no text is built at all — a rectangle over a
+                // full screen is hundreds of kilobytes that the next step would drop.
+                let text = crate::copy_on_select::selection_for_gesture(enabled, || {
+                    self.selection_text(window_id)
+                });
                 if let Some(text) = self.copy_on_select.completed(enabled, target, text) {
                     self.queue_copy(window_id, target, text);
                 }
@@ -2958,15 +3084,61 @@ impl Application {
             }
             _ => 1,
         };
-        let kind = match count {
-            2 => astraterm_terminal::SelectionKind::Semantic,
-            3 => astraterm_terminal::SelectionKind::Lines,
-            _ => astraterm_terminal::SelectionKind::Simple,
+        // S2: a rectangle instead of a range while Alt is held, the modifier the mouse
+        // section of the manual documents. It is read where every other mouse modifier
+        // already is, and the drag that follows extends whatever kind this press made.
+        let block = self.mods.alt_key();
+        let delimiters = self.config.config().terminal.word_delimiters.clone();
+        // A double click selects the word under the pointer, resolved here against the
+        // configured delimiters: the engine's own set is fixed and cannot read the
+        // configuration. The row is the visible one the click landed on, and a stale
+        // column resolves to no word at all.
+        let word = if count == 2 && !block {
+            self.sessions.for_pane_mut(pane).and_then(|session| {
+                let snapshot = session.snapshot();
+                let cells = &snapshot.lines.get(row as usize)?.cells;
+                crate::word::word_range(cells, column, &delimiters)
+            })
+        } else {
+            None
         };
         if let Some(session) = self.sessions.for_pane_mut(pane) {
-            session
-                .engine
-                .update_selection(column, row, kind, astraterm_terminal::Side::Left);
+            match (block, word) {
+                (true, _) => session.engine.update_selection(
+                    column,
+                    row,
+                    astraterm_terminal::SelectionKind::Block,
+                    astraterm_terminal::Side::Left,
+                ),
+                // A word is a plain selection over exactly the columns the delimiters
+                // leave, which is why the semantic kind is not used here.
+                (false, Some((start, end))) => {
+                    session.engine.update_selection(
+                        start,
+                        row,
+                        astraterm_terminal::SelectionKind::Simple,
+                        astraterm_terminal::Side::Left,
+                    );
+                    session.engine.update_selection(
+                        end,
+                        row,
+                        astraterm_terminal::SelectionKind::SimpleOrExisting,
+                        astraterm_terminal::Side::Right,
+                    );
+                }
+                (false, None) => {
+                    let kind = match count {
+                        3 => astraterm_terminal::SelectionKind::Lines,
+                        _ => astraterm_terminal::SelectionKind::Simple,
+                    };
+                    session.engine.update_selection(
+                        column,
+                        row,
+                        kind,
+                        astraterm_terminal::Side::Left,
+                    );
+                }
+            }
         }
         self.with_window(window_id, |ui| {
             ui.drag = DragState::Selection { pane };
@@ -3326,6 +3498,9 @@ impl ApplicationHandler<UserEvent> for Application {
             WindowEvent::MouseWheel { delta, .. } => self.handle_wheel(window_id, delta),
             WindowEvent::CursorLeft { .. } => self.cursor = None,
             WindowEvent::RedrawRequested => {
+                // S10: the idle budget is a gap between frames, so a frame records when
+                // it started rather than when it finished.
+                self.last_draw = Some(Instant::now());
                 let system = self.system.snapshot();
                 let frame = match self.windows.get_mut(&window_id) {
                     Some(ui) => ui.compose(&mut self.sessions, &system, &self.images),
@@ -3375,41 +3550,74 @@ impl ApplicationHandler<UserEvent> for Application {
             self.reload_config();
         }
 
+        let now = Instant::now();
+        // S10: `[performance] max_fps_when_idle` paces the *idle* work below. A frame
+        // that output, a keystroke or a resize asked for was requested by its own code
+        // path and is drawn as soon as the loop gets to it; nothing here can delay it.
+        let max_fps = self.config.config().performance.max_fps_when_idle;
+        let mut waits: Vec<Duration> = Vec::new();
+
+        // A bell flash is painted from state, so expiring it owes one frame: without
+        // that the border would stay lit until something else happened.
+        if let Some(wait) = self.expire_bell_flash(now) {
+            waits.push(wait);
+        }
+
         // System readings for the status bar: one sample per second, and only while
         // the bar is visible. With the bar hidden there is no timer for them at all.
         let status_visible = self
             .windows
             .values()
             .any(|ui| ui.config.appearance.show_status_bar);
-        let mut status_wait: Option<Duration> = None;
+        let mut idle_work = self.idle_pending;
         if status_visible {
-            let now = Instant::now();
             let due = self.system_deadline.unwrap_or(now);
             if now >= due {
                 if self.system.sample(Duration::from_millis(900)) {
-                    for ui in self.windows.values() {
-                        ui.window.request_redraw();
-                    }
+                    idle_work = true;
                 }
                 let next = now + Duration::from_secs(1);
                 self.system_deadline = Some(next);
-                status_wait = Some(next.saturating_duration_since(now));
+                waits.push(next.saturating_duration_since(now));
             } else {
-                status_wait = Some(due.saturating_duration_since(now));
+                waits.push(due.saturating_duration_since(now));
             }
         } else {
             self.system_deadline = None;
         }
 
-        // Cursor blink is the only periodic timer, and only while blinking is on.
+        // Idle work draws at most `max_fps_when_idle` frames per second. A deferred
+        // frame stays owed, so the work is drawn at the allowed moment instead of being
+        // lost, and the wait below is what wakes the loop for it.
+        if idle_work {
+            match crate::idle::idle_frame(now, self.last_draw, max_fps, false) {
+                crate::idle::IdleFrame::Draw => {
+                    self.idle_pending = false;
+                    for ui in self.windows.values() {
+                        ui.window.request_redraw();
+                    }
+                }
+                crate::idle::IdleFrame::Wait(wait) => {
+                    self.idle_pending = true;
+                    waits.push(wait);
+                }
+            }
+        } else {
+            self.idle_pending = false;
+        }
+
+        // Cursor blink is the only other periodic timer, and only while blinking is on.
+        // Its period is stretched to the idle interval rather than its toggles being
+        // dropped: two toggles drawn in one frame leave the cursor looking frozen
+        // instead of slower.
         let blink = self
             .focused
             .and_then(|id| self.windows.get(&id))
             .map(|ui| ui.should_blink())
             .unwrap_or(false);
         if blink {
-            let now = Instant::now();
-            let (toggle, next) = crate::ui::blink_due(now, self.blink_deadline);
+            let period = crate::idle::blink_period(crate::ui::CURSOR_BLINK_PERIOD, max_fps);
+            let (toggle, next) = crate::ui::blink_due_with(now, self.blink_deadline, period);
             self.blink_deadline = Some(next);
             if toggle
                 && let Some(window_id) = self.focused
@@ -3417,28 +3625,56 @@ impl ApplicationHandler<UserEvent> for Application {
             {
                 ui.toggle_cursor_phase();
             }
-            let wait = next.saturating_duration_since(now);
-            if let Some(status_wait) = status_wait {
-                event_loop.set_control_flow(winit::event_loop::ControlFlow::wait_duration(
-                    wait.min(status_wait),
-                ));
-            } else {
-                event_loop.set_control_flow(winit::event_loop::ControlFlow::wait_duration(wait));
-            }
-        } else if let Some(status_wait) = status_wait {
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::wait_duration(status_wait));
-        } else if self.watcher_deadline.is_some() {
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::wait_duration(
-                Duration::from_millis(100),
-            ));
-        } else {
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            waits.push(next.saturating_duration_since(now));
         }
+
+        if self.watcher_deadline.is_some() {
+            waits.push(Duration::from_millis(100));
+        }
+
+        event_loop.set_control_flow(match waits.into_iter().min() {
+            Some(wait) => winit::event_loop::ControlFlow::wait_duration(wait),
+            // Nothing is scheduled: sleep until an event arrives.
+            None => winit::event_loop::ControlFlow::Wait,
+        });
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.persist_workspace();
         self.sessions.shutdown_all();
+    }
+}
+
+#[cfg(test)]
+mod bell_tests {
+    use astraterm_config::schema::BellMode;
+
+    use super::{BellAction, bell_action};
+
+    #[test]
+    fn each_configured_bell_does_exactly_one_thing() {
+        assert_eq!(bell_action(BellMode::None, true), BellAction::Nothing);
+        assert_eq!(
+            bell_action(BellMode::None, false),
+            BellAction::Nothing,
+            "none drops the status message and the flash as well as the sound"
+        );
+        assert_eq!(
+            bell_action(BellMode::Visual, true),
+            BellAction::Flash,
+            "visual is the status message plus the border flash, even when a speaker exists"
+        );
+        assert_eq!(bell_action(BellMode::Visual, false), BellAction::Flash);
+        assert_eq!(bell_action(BellMode::Audible, true), BellAction::Ring);
+    }
+
+    #[test]
+    fn an_audible_bell_with_no_speaker_is_answered_on_screen() {
+        assert_eq!(
+            bell_action(BellMode::Audible, false),
+            BellAction::Flash,
+            "degrading is the only outcome that is not a silent bell"
+        );
     }
 }
 
@@ -3630,10 +3866,7 @@ mod new_tab_parent_tests {
         // — what the tab path did before — resolves to the floating pane and inherits
         // the wrong directory.
         assert_eq!(
-            parent_directory(
-                None,
-                keyboard_pane(Some(&floating), parent).and_then(live)
-            ),
+            parent_directory(None, keyboard_pane(Some(&floating), parent).and_then(live)),
             Some(PathBuf::from("/work/float"))
         );
     }

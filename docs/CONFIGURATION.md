@@ -208,7 +208,8 @@ The shell, emulation and session behaviour.
 | `copy_on_select` | bool | `false` | `true`, `false` | Copies the selection to the system clipboard (the same one `copy` fills) when the selection gesture completes — on the mouse release that ends the drag, not on the pointer motions inside it — and only when the selected text differs from the last one copied, so selecting the same text twice writes once. The write goes through the native clipboard library on a background thread, so a slow or stuck compositor never freezes the window, and a newer selection replaces one that has not started yet. Applies live. |
 | `copy_on_select_target` | string | `"clipboard"` | `"clipboard"`, `"primary"`; any other value is an error | Which selection the copy-on-select gesture writes. `clipboard` is the regular clipboard that `ctrl+shift+c` fills and every application reads; `primary` is the X11/Wayland primary selection that the middle mouse button pastes. Only the gesture follows this key: the explicit copy (`ctrl+shift+c`) always writes the regular clipboard, whatever this says. A middle mouse button click pastes the primary selection — the read runs on the same background thread as the `paste` command, so it never blocks the frame, and an empty primary selection pastes nothing and only reports `the clipboard holds no text or image` in the status bar. Changing the target makes the next gesture write the same text again, because the newly configured selection does not hold it yet. Applies live. |
 | `open_urls_on_click` | bool | `true` | `true`, `false` | Enables Ctrl+click to open a link with `xdg-open`: the cell's OSC 8 hyperlink when it carries one, otherwise a detected `http`/`https` URL in the visible text. A hyperlink whose scheme is refused opens nothing — there is no fallback to the text under the pointer — and a plain click never opens anything. Applies live. |
-| `word_delimiters` | string | `" /\\()\"'-.,:;<>~!@#$%^&*\|+=[]{}~?"` | any string | **Accepted but not applied.** Double-click word selection uses the terminal core's own rules; no code reads this value. |
+| `bell` | string | `"visual"` | `"none"`, `"visual"`, `"audible"` (lowercase exactly; anything else is a parse error) | What a program's bell (`BEL`, `0x07`) does. `none` drops it: no status message, no flash, no sound. `visual` answers on screen — the status bar reports `bell: <title>` for the session that rang, as it has always done, and the pane's border flashes. `audible` rings the speaker instead of drawing attention on screen. `visual` is the default because a `BEL` already became a status message before this key existed, so an existing configuration keeps its visible answer to the bell. Read each time a bell arrives, so it applies live. |
+| `word_delimiters` | string | `" /\\()\"'-.,:;<>~!@#$%^&*\|+=[]{}~?"` | any string | Characters that end a word for double-click selection. A double click selects the run of characters up to the nearest delimiter on either side, and a click on a delimiter selects that one cell. Whitespace and control characters always end a word, whatever the list says; an empty list makes every non-blank character a word character. Wide glyphs are never split. |
 
 ### `[font]`
 
@@ -268,7 +269,7 @@ What happens on start and when a shell exits.
 |---|---|---|---|---|
 | `gpu_acceleration` | bool | `true` | `true`, `false` | **Accepted but not applied.** The GPU renderer is always attempted; a failure is reported as a startup error instead of silently degrading. |
 | `low_power_mode` | bool | `false` | `true`, `false` | Requests the low-power GPU adapter (`wgpu` `PowerPreference::LowPower`) for a new window and disables cursor blinking. The adapter choice is fixed when the window is created; the blink part applies live. |
-| `max_fps_when_idle` | integer | `1` | 0–240; above 240 is an error | **Accepted but not applied.** The schema documents `0` as "unlimited on demand", but there is no idle redraw loop, so no code reads it. |
+| `max_fps_when_idle` | integer | `1` | 0–240; above 240 is an error | Upper bound on *idle* redraws per second: the cursor blink and the status bar's readings. `0` means no cap. A redraw caused by output, input or a resize is never delayed by it. The blink keeps working by stretching its own period to the interval rather than by dropping toggles, so `1` gives a one-second on/off cycle and anything above 2 leaves the default 530 ms period alone. |
 
 ### `[notifications]`
 
@@ -338,7 +339,7 @@ increase-font-size = "ctrl+=|ctrl+plus"   # either chord triggers the action
 rename-tab = "none"                       # an empty value or "none" unbinds it
 ```
 
-Every accepted action name with its default chord (48 in total):
+Every accepted action name with its default chord (50 in total):
 
 | Action | Default chord | Action | Default chord |
 |---|---|---|---|
@@ -363,8 +364,8 @@ Every accepted action name with its default chord (48 in total):
 | `close-pane` | `ctrl+shift+w` | `toggle-floating` | `ctrl+shift+grave` |
 | `focus-left` | `alt+left` | `send-literal-next` | `ctrl+shift+enter` |
 | `focus-right` | `alt+right` | `quit` | `ctrl+shift+q` |
-| `focus-up` | `alt+up` | | |
-| `focus-down` | `alt+down` | | |
+| `focus-up` | `alt+up` | `jump-to-previous-prompt` | `ctrl+shift+up` |
+| `focus-down` | `alt+down` | `jump-to-next-prompt` | `ctrl+shift+down` |
 | `resize-left` | `ctrl+alt+left` | | |
 | `resize-right` | `ctrl+alt+right` | | |
 | `resize-up` | `ctrl+alt+up` | | |
@@ -424,6 +425,8 @@ Every action is configurable in `[keys]`. Defaults:
 | `scroll-page-down` | `shift+pagedown` | Scrolls one page back towards the prompt |
 | `scroll-to-top` | `ctrl+shift+home` | Scrolls to the oldest line |
 | `scroll-to-bottom` | `ctrl+shift+end` | Returns to the live prompt |
+| `jump-to-previous-prompt` | `ctrl+shift+up` | Scrolls to the previous prompt the shell reported with `OSC 133` (`A`), landing it on the top row. Does nothing, and says nothing, when the program sends no marks or no prompt is above the viewport. |
+| `jump-to-next-prompt` | `ctrl+shift+down` | Scrolls to the next prompt below the viewport, landing it on the bottom row, towards the live screen. Same silence when there is nothing to jump to. |
 | `open-settings` | `ctrl+comma` | Opens the settings panel |
 | `reload-config` | `ctrl+shift+comma` | Re-reads the configuration file |
 | `toggle-status-bar` | `ctrl+shift+s` | Shows/hides the status bar and persists it |
@@ -524,8 +527,8 @@ divider thickness, tab bar position, strip width, compact tabs, status bar and i
 segments, clock format, font family/size/weight/line height/letter spacing,
 ligatures, `integer_cell_width`, `hinting`, `solid_shades`,
 opacity, `terminal.images`, all keybindings, `confirm_on_close`, `copy_on_select`,
-`copy_on_select_target`, `open_urls_on_click`, `close_pane_when_shell_exits`,
-`notifications.on`.
+`copy_on_select_target`, `open_urls_on_click`, `terminal.bell`,
+`close_pane_when_shell_exits`, `notifications.on`.
 
 `appearance.cursor` is an exception inside that list: it is the default shape a
 pane's engine starts with, so a change reaches panes created after it. A pane that
@@ -566,7 +569,8 @@ confirm_on_close = true     # ask before closing a pane with a live child
 copy_on_select = false      # copy when a mouse selection gesture ends
 copy_on_select_target = "clipboard"  # gesture target: "clipboard" or "primary"
 open_urls_on_click = true   # Ctrl+click on a URL opens it with xdg-open
-word_delimiters = " /\\()\"'-.,:;<>~!@#$%^&*|+=[]{}~?"  # accepted; not applied
+bell = "visual"             # BEL: "none", "visual" (border flash) or "audible"
+word_delimiters = " /\\()\"'-.,:;<>~!@#$%^&*|+=[]{}~?"  # characters that end a word
 
 [font]
 family = "JetBrainsMono Nerd Font"  # primary font family
@@ -608,7 +612,7 @@ close_pane_when_shell_exits = true  # close a pane when its child exits
 [performance]
 gpu_acceleration = true     # accepted; the GPU renderer is always attempted
 low_power_mode = false      # low-power adapter plus no cursor blink
-max_fps_when_idle = 1       # accepted; there is no idle redraw loop
+max_fps_when_idle = 1       # idle redraws per second; 0 is no cap
 
 [notifications]
 on = "unfocused"            # unfocused | always | never
@@ -647,14 +651,12 @@ These keys parse, load and validate (mostly), and change nothing:
 | Key | What happens instead |
 |---|---|
 | `window.remember_geometry` | no code reads it; the size saved in `workspace.toml` is ignored on restore |
-| `terminal.word_delimiters` | double-click selection uses the terminal core's rules |
 | `font.fallbacks` | cosmic-text resolves missing glyphs through the system font database |
 | `appearance.background_blur` | documentation only; no compositor request is sent |
 | `appearance.style` | stored only |
 | `appearance.show_window_controls` | `[window] show_window_controls` is the one the window reads |
 | `appearance.accent_color` | validated; the theme's `accent` is what paints |
 | `performance.gpu_acceleration` | the GPU renderer is always attempted; a failure is an error, not a fallback |
-| `performance.max_fps_when_idle` | there is no idle redraw loop to cap |
 | `profiles[].theme`, `profiles[].font_size` | validated (`font_size` 4–96), then ignored |
 
 ### Values that are clamped

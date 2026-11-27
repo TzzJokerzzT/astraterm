@@ -31,7 +31,8 @@ names the test that covers it.
 | Reflow on resize | wrapped text reflows, cursor anchored | `resize_reflows_wrapped_text` |
 | Wide characters | double-width cells with a spacer cell | `wide_characters_use_two_columns` |
 | Combining marks | kept attached to the base cell | `combining_marks_stay_attached_to_their_base_cell` |
-| Selection | simple and line selection produce text | `selection_produces_the_expected_text`, `line_selection_includes_whole_lines` |
+| Selection | simple, line and rectangle selection produce text | `selection_produces_the_expected_text`, `line_selection_includes_whole_lines` (`crates/terminal/tests/`); `a_block_selection_keeps_its_rectangle_while_the_drag_grows`, `the_range_handed_to_the_engine_copies_exactly_the_word` (`crates/app/src/word.rs`) |
+| Shell integration (OSC 133) | `A`/`B`/`C`/`D` marks recorded per buffer row and carried in `Snapshot::marks`; the status bar reports the running command and its exit code | `every_mark_kind_reaches_the_snapshot_on_its_row`, `marks_stay_on_their_buffer_lines_when_the_view_scrolls`, `marks_whose_rows_were_trimmed_away_are_dropped`, `a_terminal_without_osc_133_produces_the_snapshot_it_always_did` (`crates/terminal/tests/shell_marks.rs`); `prompt::tests` (`crates/app/src/prompt.rs`) |
 | Damage tracking | changed rows reported per snapshot | `damage_reports_rows_that_changed` |
 | Buffer text | visible screen text and per-line text | `snapshot_text_round_trips_visible_lines`, `line_text_exposes_buffer_lines_for_search` |
 | OSC 8 hyperlinks | destination carried beside the text in `CellSnapshot`, opened by Ctrl+click when `terminal.open_urls_on_click` is on; only the schemes the opener already accepts reach it | `an_osc8_hyperlink_reaches_the_snapshot`, `a_cell_without_a_hyperlink_carries_none`, `an_empty_uri_closes_the_link`, `an_opened_hyperlink_with_no_visible_text_links_no_cell`, `a_linked_cell_is_underlined_even_when_the_program_asked_for_no_style` (`crates/terminal/src/engine.rs`); `a_click_on_a_linked_cell_opens_the_hyperlink`, `a_click_on_an_unlinked_cell_still_opens_the_visible_url`, `an_unlinked_non_url_cell_opens_nothing`, `a_refused_scheme_never_reaches_the_opener` (`crates/app/src/ui.rs`) |
@@ -68,6 +69,46 @@ Beyond the grid, the application reads these mode flags from
 
 Shift+click bypasses mouse reporting so local text selection still works when an
 application captures the mouse.
+
+### Pointer: click granularity and the rectangle
+
+The local selection belongs to the application, so these rules are AstraTerm's own:
+
+| Gesture | Selection |
+|---|---|
+| Press and drag | Linear selection from the press to the pointer |
+| Double click | The word under the pointer, delimited by `terminal.word_delimiters`. A click on a delimiter selects that one cell, whitespace and control characters always end a word, and a double-width glyph is never split. |
+| Triple click | The whole line |
+| **Alt+drag** | **Rectangle**: every row the drag covers contributes the same column range (`SelectionKind::Block`), and the copy is padded with blanks so the block keeps its shape. Add Shift when a program has mouse reporting on, so the drag stays local. |
+
+Alt is the rectangle modifier everywhere the terminal owns the pointer, including
+when an application reports mouse input and Shift is held to keep the drag local.
+The linear selection, the copy-on-select gesture and the clipboard are untouched by
+it: a drag without Alt is exactly the selection it always was, and with
+`terminal.copy_on_select` off no selection text is built at all — the engine is
+never asked to walk the selection.
+
+### Shell integration, the status bar and the bell
+
+`OSC 133;A|B|C|D` marks are recorded by the engine against the buffer row they
+arrived on and exposed as `Snapshot::marks`. The status bar reads them through the
+engine's own accessor and shows `running` while a command is in flight and
+`exit <code>` (or `exit ?` when the shell sent no readable code) once it ends; a
+program that never sends the sequence sees exactly the status bar it had before.
+`jump-to-previous-prompt` (`Ctrl+Shift+Up`) and `jump-to-next-prompt`
+(`Ctrl+Shift+Down`) scroll the focused pane to the nearest prompt outside the
+viewport — backwards lands it on the top row, forwards on the bottom one — and both
+do nothing at all when there is no prompt to move to, so a session without shell
+integration is unaffected.
+Nothing is recorded on the alternate screen, and a resize — which reflows the
+buffer — clears the marks rather than leaving them pointing at unrelated rows.
+
+`[terminal] bell` decides what `BEL` does: `none` drops it, `visual` (the default)
+keeps the `bell: <title>` status message and flashes the focused pane's border, and
+`audible` rings the speaker instead. The audible path never runs on the UI thread:
+the helper is resolved from what exists on the machine at startup and rung on its
+own worker. On a machine with no usable helper the bell degrades to the visual
+answer instead of vanishing.
 
 ## `$TERM` policy
 

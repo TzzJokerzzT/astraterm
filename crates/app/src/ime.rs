@@ -12,6 +12,7 @@
 //! functions that take numbers and return a rectangle.
 
 use astraterm_core::{CellMetrics, Padding, Rect};
+use winit::event::Ime;
 
 /// One cell of a pane's grid: the cursor's column and row, zero-based.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,6 +113,63 @@ pub fn cursor_cell(
     })
 }
 
+/// The composition an input method is in the middle of (S4).
+///
+/// It lives beside the terminal's own text, never in it: the grid is drawn from the
+/// snapshot and is not touched, so the composition can grow, shrink and disappear
+/// without writing a single cell.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Preedit {
+    /// Text being composed, exactly as the input method last reported it.
+    pub text: String,
+}
+
+/// The composition to paint after one input-method event.
+///
+/// `current` is what the last frame painted. The input method reports the *whole*
+/// composition every time, so a replacement is kept and a deleted character is
+/// simply absent from the new text; an empty preedit, a commit and a disabled input
+/// method all end the composition, which is what clears it from the screen.
+/// `Enabled` starts a session without touching a composition in progress, because
+/// some platforms send the current text again right after it.
+pub fn apply_preedit(current: Option<Preedit>, event: &Ime) -> Option<Preedit> {
+    match event {
+        Ime::Preedit(text, _) if text.is_empty() => None,
+        Ime::Preedit(text, _) => Some(Preedit { text: text.clone() }),
+        // The text reached the PTY, so the composition it stood for is gone.
+        Ime::Commit(_) | Ime::Disabled => None,
+        Ime::Enabled => current,
+    }
+}
+
+/// Rectangle the composition occupies, starting at the cursor cell.
+///
+/// It is the cursor cell widened by one cell per character, clamped to the grid the
+/// pane shows, so a long composition can never paint over a neighbouring pane or a
+/// border. `None` when there is nothing to paint or no cursor to anchor it to.
+pub fn preedit_area(
+    pane: Rect,
+    padding: Padding,
+    metrics: CellMetrics,
+    cursor: CursorCell,
+    text: &str,
+) -> Option<Rect> {
+    let cells = text.chars().count() as f32;
+    if cells < 1.0 {
+        return None;
+    }
+    let cell = cursor_area(pane, padding, metrics, Some(cursor))?;
+    let grid = grid_area(pane, padding);
+    let width = (cells * metrics.width.max(1.0)).ceil() as u32;
+    let available = grid.right().saturating_sub(cell.x).max(0) as u32;
+    Some(Rect::new(
+        cell.x,
+        cell.y,
+        width.min(available).max(1),
+        cell.height,
+    ))
+}
+
 /// Whether `area` has to be pushed to the platform.
 ///
 /// Sending the same rectangle again on every keystroke and every frame of output is a
@@ -148,7 +206,11 @@ fn clamp_into(area: Rect, bounds: Rect) -> Rect {
 mod tests {
     use astraterm_core::{CellMetrics, Padding, Rect};
 
-    use super::{CursorCell, cursor_area, cursor_cell, needs_update, no_cursor_area};
+    use super::{
+        CursorCell, Preedit, apply_preedit, cursor_area, cursor_cell, needs_update, no_cursor_area,
+        preedit_area,
+    };
+    use winit::event::Ime;
 
     /// An 8x16 cell, the shape a default font produces.
     const CELL: CellMetrics = CellMetrics {
@@ -350,5 +412,103 @@ mod tests {
         // and back is sent both times.
         assert!(needs_update(Some(area), Rect::new(0, 0, 0, 0)));
         assert!(needs_update(Some(Rect::new(0, 0, 0, 0)), area));
+    }
+
+    fn preedit(text: &str) -> Option<Preedit> {
+        Some(Preedit {
+            text: text.to_owned(),
+        })
+    }
+
+    #[test]
+    fn no_preedit_paints_nothing() {
+        let pane = Rect::new(0, 0, 800, 600);
+        assert_eq!(
+            preedit_area(
+                pane,
+                Padding::default(),
+                CELL,
+                CursorCell { column: 0, row: 0 },
+                ""
+            ),
+            None
+        );
+        assert_eq!(
+            apply_preedit(None, &Ime::Preedit(String::new(), None)),
+            None
+        );
+        assert_eq!(apply_preedit(None, &Ime::Commit("a".to_owned())), None);
+        assert_eq!(apply_preedit(None, &Ime::Disabled), None);
+    }
+
+    #[test]
+    fn a_composition_is_painted_on_the_cursor_cell() {
+        let pane = Rect::new(0, 0, 200, 80);
+        let padding = Padding { x: 4, y: 4 };
+        // 8x16 cells starting at (4, 4): column 2 and row 3 are 20 px across and 52
+        // px down, and three characters are three cells wide.
+        let area = preedit_area(
+            pane,
+            padding,
+            CELL,
+            CursorCell { column: 2, row: 3 },
+            "にほん",
+        )
+        .expect("there is a composition to paint");
+        assert_eq!(area, Rect::new(20, 52, 24, 16));
+    }
+
+    #[test]
+    fn the_composition_never_paints_outside_the_grid() {
+        // Ten columns of 8 px fit beside the padding, so a composition of twenty
+        // characters from column 6 is cut at the pane's inner edge.
+        let pane = Rect::new(0, 0, 92, 100);
+        let area = preedit_area(
+            pane,
+            Padding::default(),
+            CELL,
+            CursorCell { column: 6, row: 0 },
+            &"x".repeat(20),
+        )
+        .expect("there is a composition to paint");
+        assert_eq!(area.x, 48);
+        assert_eq!(area.right(), 92);
+        assert_eq!(area.height, 16);
+    }
+
+    #[test]
+    fn a_composition_replaces_and_deletes_as_the_input_method_updates_it() {
+        let mut current = apply_preedit(None, &Ime::Preedit("に".to_owned(), None));
+        assert_eq!(current, preedit("に"));
+        // A replacement: the input method sends the whole new composition.
+        current = apply_preedit(current, &Ime::Preedit("にほ".to_owned(), None));
+        assert_eq!(current, preedit("にほ"));
+        // A deletion: the character is simply not in the new text.
+        current = apply_preedit(current, &Ime::Preedit("に".to_owned(), None));
+        assert_eq!(current, preedit("に"));
+        // The platform reports the whole text replaced rather than edited.
+        current = apply_preedit(current, &Ime::Preedit("kanji".to_owned(), None));
+        assert_eq!(current, preedit("kanji"));
+    }
+
+    #[test]
+    fn a_commit_or_a_disabled_input_method_clears_the_composition() {
+        let composing = preedit("かん");
+        assert_eq!(
+            apply_preedit(composing.clone(), &Ime::Commit("漢".to_owned())),
+            None,
+            "the committed text went to the PTY; nothing is left to paint"
+        );
+        assert_eq!(apply_preedit(composing.clone(), &Ime::Disabled), None);
+        assert_eq!(
+            apply_preedit(composing.clone(), &Ime::Preedit(String::new(), None)),
+            None,
+            "an empty preedit is how a cancelled composition arrives"
+        );
+        assert_eq!(
+            apply_preedit(composing.clone(), &Ime::Enabled),
+            composing,
+            "a new session does not throw away text the platform is still composing"
+        );
     }
 }
