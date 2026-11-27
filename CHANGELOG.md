@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-11-26
+
+### Added
+
+- `[terminal] copy_on_select_target` chooses where the selection gesture writes:
+  `"clipboard"` (the default) or `"primary"`. The explicit copy always writes the
+  regular clipboard.
+- Middle-click pastes the primary selection, through the same threaded read as the
+  normal paste, so it never blocks the window; an empty selection shows the usual
+  message.
+
+### Changed
+
+- The cursor shape belongs to the program. A `DECSCUSR` request from an editor is
+  now painted as asked, and `[appearance] cursor` is only the default for programs
+  that never ask. Before this the terminal's setting hid the editor's cursor
+  entirely, so a beam in insert mode and a block in normal mode never appeared. The
+  override path was removed rather than disabled, and the change reaches panes
+  created after it.
+
+### Performance
+
+- The PTY reader no longer copies every read: the buffer is handed over and
+  recycled, so a steady session copies nothing and allocates almost never (1.00 ->
+  0.0004 allocations per chunk, measured over 190 MB). Bytes, order, chunk
+  boundaries, backpressure and the drop accounting are unchanged.
+
+### Fixed
+
+- Turning `copy_on_select` off releases the remembered selection instead of keeping
+  it for the rest of the session.
+
 ## [1.2.2] - 2026-11-26
 
 ### Added
