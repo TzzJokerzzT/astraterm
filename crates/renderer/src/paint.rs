@@ -470,7 +470,7 @@ pub fn push_border(scene: &mut Scene, rect: Rect, color: Rgb) {
 /// by, without letting a real drift through: the gaps this feature exists for are far
 /// larger, measured with the shipped default font as `क` at 1.280 cells where the grid
 /// reserves one, and emoji fallbacks at 2.075 cells where it reserves two.
-const ANCHOR_TOLERANCE: f32 = 0.5;
+pub(crate) const ANCHOR_TOLERANCE: f32 = 0.5;
 
 /// Whether `c` continues the grapheme cluster of the character before it.
 ///
@@ -536,9 +536,50 @@ struct Cluster<'a> {
     columns: usize,
     /// First cell, whose style paints the whole cluster.
     base: &'a CellSnapshot,
-    text: String,
+    /// Cluster text, borrowed from the row walk's scratch buffer: building it costs
+    /// no allocation of its own, and only an anchored cluster copies it out.
+    text: &'a str,
     /// Whether the cluster needs its own grid-anchored segment (S8).
     anchored: bool,
+}
+
+/// Whether the cell at `column` is a plain one-column cluster in the primary face.
+///
+/// Such a cell paints one printable ASCII character from the primary font, carries no
+/// zero-width continuation, is neither wide nor hidden, and the cell after it does not
+/// continue it. Its advance is then already known: [`ClusterMeasurer::ascii_is_one_column`]
+/// proves every such character advances exactly the column the grid reserves, so the
+/// walk neither builds a cluster string nor looks an advance up. That is what keeps a
+/// plain row free of per-cell work (B19); every other cell takes the measured path and
+/// decides exactly as before.
+fn plain_cell(
+    row: &RowSnapshot,
+    column: usize,
+    solid_shades: bool,
+    measure: &ClusterMeasurer<'_>,
+) -> bool {
+    if !measure.ascii_is_one_column() {
+        return false;
+    }
+    let cell = &row.cells[column];
+    if cell.wide
+        || cell.flags.hidden
+        || cell.zerowidth.is_some()
+        || (solid_shades && shade_factor(cell.ch).is_some())
+        || !matches!(cell.ch, ' '..='~')
+    {
+        return false;
+    }
+    // A cluster stands alone only when the next cell starts a new one. The order of
+    // these cases is the one [`cluster_at`] applies: a spacer continues whatever it
+    // follows even when it is hidden, a hidden cell never continues anything, and an
+    // ASCII base never ends with a joiner and never starts a regional-indicator pair.
+    match row.cells.get(column + 1) {
+        None => true,
+        Some(next) if next.wide_spacer => false,
+        Some(next) if next.flags.hidden => true,
+        Some(next) => !cluster_continuation(next.ch),
+    }
 }
 
 /// Reads the cluster that starts at `column` and decides whether it is anchored.
@@ -556,16 +597,21 @@ struct Cluster<'a> {
 /// Anchoring is then measured, not listed: a wide base always anchors (the model
 /// already gave it two columns), and a cluster whose shaped advance disagrees with
 /// the columns reserved for it anchors by more than [`ANCHOR_TOLERANCE`].
+///
+/// The cluster text is built in the caller's buffer, which the row walk reuses for
+/// every cluster of the row: a plain row therefore allocates nothing per cell (B19).
+#[allow(clippy::too_many_arguments)]
 fn cluster_at<'a>(
     row: &'a RowSnapshot,
     column: usize,
     cell_width: f32,
     measure: &mut ClusterMeasurer<'_>,
     solid_shades: bool,
+    text: &'a mut String,
 ) -> Cluster<'a> {
     let base = &row.cells[column];
-    let mut text = String::new();
-    push_cell_text(&mut text, base, solid_shades);
+    text.clear();
+    push_cell_text(text, base, solid_shades);
     // A cluster holds at most one regional-indicator pair, so the third indicator
     // starts the next cluster instead of joining this one. A hidden cell is not a
     // half of anything: it paints a space, so it must not seed the count either.
@@ -596,21 +642,50 @@ fn cluster_at<'a>(
             break;
         }
         if !cell.wide_spacer {
-            push_cell_text(&mut text, cell, solid_shades);
+            push_cell_text(text, cell, solid_shades);
             indicators += usize::from(regional_indicator(cell.ch));
         }
         end += 1;
     }
     let columns = end - column;
     let reserved = columns as f32 * cell_width;
-    let measured = measure.advance(&text);
+    let measured = measure.advance(text);
     Cluster {
         column,
         columns,
         base,
-        text,
+        text: text.as_str(),
         anchored: base.wide || (measured - reserved).abs() > ANCHOR_TOLERANCE,
     }
+}
+
+/// Appends one cluster's text to the style run being accumulated, closing the run
+/// first when the style changed.
+///
+/// Both halves of the row walk use it — the measured cluster and the plain cell that
+/// skipped measurement — so a run is split exactly where its style changes and nowhere
+/// else.
+fn push_run_text(
+    spans: &mut Vec<Span>,
+    current: &mut String,
+    current_style: &mut Option<(Rgb, bool, bool)>,
+    style: (Rgb, bool, bool),
+    text: &str,
+) {
+    if *current_style != Some(style) {
+        if let Some((color, bold, italic)) = *current_style
+            && !current.is_empty()
+        {
+            spans.push(Span {
+                text: std::mem::take(current),
+                color: rgba(color, 1.0),
+                bold,
+                italic,
+            });
+        }
+        *current_style = Some(style);
+    }
+    current.push_str(text);
 }
 
 /// Appends one cell's text to a cluster, hiding a hidden cell behind a space.
@@ -658,6 +733,11 @@ fn segment_id(row_id: u64, column: usize) -> u64 {
 /// advance disagrees with its columns (S8), becomes its own item, positioned at
 /// `origin_x + column * cell_width` and clipped to the columns it owns plus one cell
 /// of slack, so its painted advance never shifts the rest of the row.
+///
+/// Nothing on this walk allocates per cell: a plain ASCII cell in the primary face
+/// appends its character to the run buffer without being measured or looked up
+/// ([`plain_cell`]), and every other cluster is built in a buffer the row reuses
+/// (B19).
 #[allow(clippy::too_many_arguments)]
 fn row_text_item(
     row_id: u64,
@@ -672,7 +752,11 @@ fn row_text_item(
 ) -> Vec<TextItem> {
     let mut items: Vec<TextItem> = Vec::new();
     let mut spans: Vec<Span> = Vec::new();
-    let mut current = String::new();
+    // One text buffer for the whole row: a row of plain cells appends its characters
+    // here and never builds a cluster string of its own (B19).
+    let mut current = String::with_capacity(row.cells.len());
+    let mut cluster_text = String::new();
+    let mut cell_char = [0u8; 4];
     let mut current_style: Option<(Rgb, bool, bool)> = None;
     let mut run_start: Option<usize> = None;
 
@@ -684,7 +768,30 @@ fn row_text_item(
             column += 1;
             continue;
         }
-        let cluster = cluster_at(row, column, cell_width, measure, solid_shades);
+        // A plain one-column ASCII cell is known to advance exactly the slot it owns,
+        // so it is neither measured nor looked up: it appends its character to the run
+        // and the walk moves on to the next column.
+        if plain_cell(row, column, solid_shades, measure) {
+            let cell = &row.cells[column];
+            run_start.get_or_insert(column);
+            push_run_text(
+                &mut spans,
+                &mut current,
+                &mut current_style,
+                cell_style(cell, theme),
+                cell.ch.encode_utf8(&mut cell_char),
+            );
+            column += 1;
+            continue;
+        }
+        let cluster = cluster_at(
+            row,
+            column,
+            cell_width,
+            measure,
+            solid_shades,
+            &mut cluster_text,
+        );
         column = cluster.column + cluster.columns;
         if cluster.anchored {
             flush_clean_run(
@@ -705,22 +812,13 @@ fn row_text_item(
             continue;
         }
         run_start.get_or_insert(cluster.column);
-        let (foreground, bold, italic) = cell_style(cluster.base, theme);
-        let style = (foreground, bold, italic);
-        if current_style != Some(style) {
-            if let Some((color, bold, italic)) = current_style
-                && !current.is_empty()
-            {
-                spans.push(Span {
-                    text: std::mem::take(&mut current),
-                    color: rgba(color, 1.0),
-                    bold,
-                    italic,
-                });
-            }
-            current_style = Some(style);
-        }
-        current.push_str(&cluster.text);
+        push_run_text(
+            &mut spans,
+            &mut current,
+            &mut current_style,
+            cell_style(cluster.base, theme),
+            cluster.text,
+        );
     }
     flush_clean_run(
         &mut items,
@@ -803,7 +901,7 @@ fn anchored_item(
             y as f32,
         ),
         spans: vec![Span {
-            text: cluster.text.clone(),
+            text: cluster.text.to_owned(),
             color: rgba(color, 1.0),
             bold,
             italic,
@@ -1547,6 +1645,161 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_ascii_row_never_reaches_the_advance_cache() {
+        // B19: a one-column cell in the primary face is known to fill its column, so
+        // the walk appends the character and moves on: no cluster string, no measured
+        // advance, no cache entry for the row.
+        let text = "x".repeat(120);
+        let snapshot = snapshot(&text, 130, 1);
+        let mut font = TestFont::new();
+        let (lookups, measurements) = {
+            let (metrics, mut measure) = font.painter();
+            let items = row_text_item(
+                0,
+                0,
+                0,
+                &snapshot.lines[0],
+                &theme(),
+                Rect::new(0, 0, 2000, 20),
+                metrics.width,
+                &mut measure,
+                false,
+            );
+            assert_eq!(items.len(), 1, "the whole row is still one segment");
+            assert_eq!(items[0].spans.len(), 1);
+            (measure.lookups(), measure.measurements())
+        };
+        assert_eq!(lookups, 0, "no per-cell advance lookup");
+        assert_eq!(measurements, 0, "nothing was shaped");
+        assert!(
+            font.widths.is_empty(),
+            "a plain row leaves no measurement behind"
+        );
+    }
+
+    #[test]
+    fn a_plain_ascii_row_allocates_nothing_per_cell() {
+        // The seam is a counting allocator, not a stopwatch: a row of plain cells must
+        // cost the same allocations however many cells it has, whatever the row says
+        // (B19). Distinct characters are what distinguish the two paths — a repeated
+        // one would only ever be measured once.
+        let small = snapshot(&plain_row(8), 10, 1);
+        let large = snapshot(&plain_row(300), 302, 1);
+        let anchored = snapshot(&"\u{0915}".repeat(300), 302, 1);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
+        let clip = Rect::new(0, 0, 4000, 20);
+        let mut walk = |row: &RowSnapshot| {
+            crate::test_alloc::reset();
+            let items = row_text_item(
+                0,
+                0,
+                0,
+                row,
+                &theme(),
+                clip,
+                metrics.width,
+                &mut measure,
+                false,
+            );
+            (items.len(), crate::test_alloc::allocations())
+        };
+        // Warm the buffers the walk itself allocates once before counting.
+        walk(&small.lines[0]);
+        let (small_items, small_allocs) = walk(&small.lines[0]);
+        let (large_items, large_allocs) = walk(&large.lines[0]);
+        let (anchored_items, anchored_allocs) = walk(&anchored.lines[0]);
+        assert_eq!(small_items, 1);
+        assert_eq!(large_items, 1, "300 plain cells are still one segment");
+        assert_eq!(
+            large_allocs, small_allocs,
+            "300 plain cells allocated {large_allocs} times and 10 allocated \
+             {small_allocs}: the walk allocated per cell"
+        );
+        // The counter does see per-cell work: every devanagari cell anchors and owns a
+        // string and a span of its own.
+        assert_eq!(
+            anchored_items, 301,
+            "300 drifting cells plus the run of two trailing spaces"
+        );
+        assert!(
+            anchored_allocs > large_allocs,
+            "an anchored row allocated {anchored_allocs} times against {large_allocs}"
+        );
+    }
+
+    #[test]
+    fn a_row_that_needs_measuring_still_caches_its_advances() {
+        // The plain path must not take over the cells it cannot prove: a wide cell is
+        // still measured, still anchored, and its advance is still cached for the next
+        // frame.
+        let snapshot = snapshot("\u{4F60}x", 10, 1);
+        let mut font = TestFont::new();
+        let (items, lookups) = {
+            let (metrics, mut measure) = font.painter();
+            let items = row_text_item(
+                0,
+                0,
+                0,
+                &snapshot.lines[0],
+                &theme(),
+                Rect::new(0, 0, 200, 20),
+                metrics.width,
+                &mut measure,
+                true,
+            );
+            let lookups = measure.lookups();
+            (items, lookups)
+        };
+        assert_eq!(items.len(), 2, "the wide glyph and the ASCII run");
+        assert!(lookups > 0, "a wide cell is measured");
+        assert!(
+            !font.widths.is_empty(),
+            "the measurement stays for the next frame"
+        );
+    }
+
+    #[test]
+    fn ascii_that_does_not_fill_its_column_is_still_anchored() {
+        // With a style whose ASCII advance leaves the column, the walk measures every
+        // cell exactly as it did before the plain-cell shortcut existed.
+        let mut system = FontSystem::new();
+        let style = TextStyle::new(
+            &FontConfig {
+                letter_spacing: 3.0,
+                ..Default::default()
+            },
+            1.0,
+            &mut system,
+        );
+        assert!(!style.ascii_is_one_column);
+        let mut widths = ClusterWidths::new();
+        let snapshot = snapshot("abc", 3, 1);
+        let mut measure = ClusterMeasurer::new(&mut system, &style, &mut widths);
+        let items = row_text_item(
+            0,
+            0,
+            0,
+            &snapshot.lines[0],
+            &theme(),
+            Rect::new(0, 0, 200, 20),
+            style.cell.width,
+            &mut measure,
+            false,
+        );
+        assert!(measure.lookups() > 0, "each cell was measured");
+        assert_eq!(
+            items.len(),
+            3,
+            "every spaced-out letter owns its column: {:?}",
+            items.iter().map(segment_text).collect::<Vec<_>>()
+        );
+        for (column, item) in items.iter().enumerate() {
+            assert_eq!(item.position, (column as f32 * style.cell.width, 0.0));
+        }
+    }
+
+    #[test]
     fn segment_ids_are_stable_and_distinct() {
         assert_eq!(segment_id(3, 4), segment_id(3, 4), "deterministic");
         assert_ne!(segment_id(3, 4), segment_id(3, 5), "different columns");
@@ -1701,7 +1954,15 @@ mod tests {
             let mut font = TestFont::new();
             let (metrics, mut measure) = font.painter();
             let cell_width = metrics.width;
-            let cluster = cluster_at(&snapshot.lines[0], 0, cell_width, &mut measure, false);
+            let mut text = String::new();
+            let cluster = cluster_at(
+                &snapshot.lines[0],
+                0,
+                cell_width,
+                &mut measure,
+                false,
+                &mut text,
+            );
             assert_eq!(cluster.text, expected, "{input:?} is one cluster");
             assert_eq!(cluster.columns, columns, "{input:?} owns its columns");
             let items = row_text_item(
@@ -1729,6 +1990,13 @@ mod tests {
     /// snapshot can still carry.
     fn row_of(cells: Vec<CellSnapshot>) -> RowSnapshot {
         RowSnapshot { cells }
+    }
+
+    /// A row of printable ASCII cells, cycling so that no two neighbours repeat.
+    fn plain_row(cells: usize) -> String {
+        (0..cells)
+            .map(|index| char::from(b'!' + (index % 94) as u8))
+            .collect()
     }
 
     #[test]
@@ -1796,10 +2064,11 @@ mod tests {
         let mut font = TestFont::new();
         let (metrics, mut measure) = font.painter();
         let cell_width = metrics.width;
-        let hidden = cluster_at(&row, 0, cell_width, &mut measure, false);
+        let mut text = String::new();
+        let hidden = cluster_at(&row, 0, cell_width, &mut measure, false, &mut text);
         assert_eq!(hidden.text, " ", "a hidden cell paints as a space");
         assert_eq!(hidden.columns, 1, "a hidden cell owns no continuation");
-        let visible = cluster_at(&row, 1, cell_width, &mut measure, false);
+        let visible = cluster_at(&row, 1, cell_width, &mut measure, false, &mut text);
         assert_eq!(visible.text, "\u{1F1F8}");
         assert_eq!(visible.columns, 1);
         let items = row_text_item(
@@ -1849,7 +2118,8 @@ mod tests {
         let mut font = TestFont::new();
         let (metrics, mut measure) = font.painter();
         let cell_width = metrics.width;
-        let cluster = cluster_at(&row, 0, cell_width, &mut measure, false);
+        let mut text = String::new();
+        let cluster = cluster_at(&row, 0, cell_width, &mut measure, false, &mut text);
         assert_eq!(cluster.text, "\u{1F1EA}", "the hidden half stays out");
         assert_eq!(cluster.columns, 1);
         let items = row_text_item(

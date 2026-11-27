@@ -7,7 +7,8 @@
 //! The `FontSystem` lives next to the cache (not inside it) so the renderer can hold
 //! shaped buffers and the mutable font system at the same time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use astraterm_config::schema::FontConfig;
 use astraterm_core::CellMetrics;
@@ -17,7 +18,7 @@ use cosmic_text::{
 };
 use glyphon::{Color as GlyphonColor, TextArea, TextBounds};
 
-use crate::paint::{Scene, TextItem};
+use crate::paint::{ANCHOR_TOLERANCE, Scene, TextItem};
 
 /// Resolved shaping style for the terminal font.
 #[derive(Clone, Debug)]
@@ -32,6 +33,9 @@ pub struct TextStyle {
     pub metrics: Metrics,
     pub cell: CellMetrics,
     pub scale: f32,
+    /// Whether a single printable ASCII cell in the primary face is known to
+    /// advance exactly one column; see [`TextStyle::ascii_is_one_column`].
+    pub ascii_is_one_column: bool,
     /// Hash of the inputs that affect shaping; changing it invalidates buffers.
     pub key: u64,
 }
@@ -41,7 +45,7 @@ impl TextStyle {
     pub fn new(font: &FontConfig, scale: f32, font_system: &mut FontSystem) -> Self {
         let scale = scale.max(0.1);
         let (metrics, cell) = measure_style(font_system, font, scale);
-        Self {
+        let mut style = Self {
             family: font.family.clone(),
             weight: Weight(font.weight),
             letter_spacing: font.letter_spacing,
@@ -50,8 +54,11 @@ impl TextStyle {
             metrics,
             cell,
             scale,
+            ascii_is_one_column: false,
             key: style_key(font, scale),
-        }
+        };
+        style.ascii_is_one_column = measure_ascii_is_one_column(font_system, &style);
+        style
     }
 
     /// Whether the configured family is installed.
@@ -157,9 +164,16 @@ impl RowCache {
     }
 }
 
-/// Upper bound on cached cluster advances; beyond this the cache is dropped
-/// wholesale, the way [`RowCache`] bounds itself.
-const MAX_CACHED_CLUSTERS: usize = 4096;
+/// Lower bound on cached cluster advances.
+///
+/// The cache evicts its oldest measurements when it reaches this count instead of
+/// dropping everything, so the bound has to be larger than the number of distinct
+/// clusters a screen can hold: a screen wider than the bound reshapes its whole row
+/// set on every frame no matter how the cache evicts. A 4K display at the default
+/// font holds about 60 000 cells, so 64 Ki rows cover it. An entry is a shared
+/// cluster string plus a float, so even a cache full of distinct CJK clusters stays
+/// a few megabytes.
+const MAX_CACHED_CLUSTERS: usize = 1 << 16;
 
 /// Measured advances of grapheme clusters, keyed by shaping style and cluster text.
 ///
@@ -174,18 +188,55 @@ const MAX_CACHED_CLUSTERS: usize = 4096;
 /// every cluster stood alone. The limitation is accepted: a cluster measured wider
 /// than the columns it owns is anchored, which costs it its own segment and nothing
 /// else, so the grid stays exact even where the advance is approximate.
-#[derive(Default)]
+///
+/// The cache is bounded but never wiped: at the bound it evicts the measurements
+/// inserted longest ago, so a screen that churns through more clusters than the old
+/// clear-at-capacity behaviour held keeps the recent ones resident instead of
+/// reshaping everything on the next frame.
 pub struct ClusterWidths {
     /// One map per shaping style, so a font or scale change leaves stale entries
     /// behind without ever reading them back.
-    widths: HashMap<u64, HashMap<String, f32>>,
+    ///
+    /// The key is a shared `Arc<str>`, so looking one up costs no allocation and the
+    /// eviction queue below can hold another reference to it without copying text.
+    widths: HashMap<u64, HashMap<Arc<str>, f32>>,
+    /// Keys in insertion order, so a full cache evicts the oldest measurement.
+    order: VecDeque<(u64, Arc<str>)>,
     /// Entries across every style, for bounding.
     len: usize,
+    /// Entries kept before the oldest is evicted.
+    capacity: usize,
+    /// [`Self::advance`] calls, so a test can assert a row never reached the cache.
+    lookups: u64,
+    /// Clusters actually shaped, so a test can assert a cached advance was reused.
+    measurements: u64,
+}
+
+impl Default for ClusterWidths {
+    fn default() -> Self {
+        Self::with_capacity(MAX_CACHED_CLUSTERS)
+    }
 }
 
 impl ClusterWidths {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Cache that evicts its oldest measurement past `capacity` entries.
+    ///
+    /// The bound is a seam: production uses [`MAX_CACHED_CLUSTERS`], and the tests
+    /// use a handful of entries so filling the cache past its bound stays cheap.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            widths: HashMap::new(),
+            order: VecDeque::new(),
+            len: 0,
+            // A cache that keeps nothing would measure every cluster of every frame.
+            capacity: capacity.max(1),
+            lookups: 0,
+            measurements: 0,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -196,8 +247,24 @@ impl ClusterWidths {
         self.len == 0
     }
 
+    /// Entries the cache keeps before evicting the oldest.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Advance lookups served, cached or not.
+    pub fn lookups(&self) -> u64 {
+        self.lookups
+    }
+
+    /// Advances actually shaped, one per cache miss.
+    pub fn measurements(&self) -> u64 {
+        self.measurements
+    }
+
     pub fn clear(&mut self) {
         self.widths.clear();
+        self.order.clear();
         self.len = 0;
     }
 
@@ -211,6 +278,7 @@ impl ClusterWidths {
         style: &TextStyle,
         cluster: &str,
     ) -> f32 {
+        self.lookups += 1;
         if let Some(width) = self
             .widths
             .get(&style.key)
@@ -219,15 +287,41 @@ impl ClusterWidths {
             return *width;
         }
         let width = measure_cluster(font_system, style, cluster);
-        if self.len >= MAX_CACHED_CLUSTERS {
-            self.clear();
-        }
-        self.widths
-            .entry(style.key)
-            .or_default()
-            .insert(cluster.to_owned(), width);
-        self.len += 1;
+        self.measurements += 1;
+        self.insert(style.key, cluster, width);
         width
+    }
+
+    /// Stores one measurement, evicting the oldest entries until it fits.
+    ///
+    /// Eviction never drops the whole cache: the entries inserted most recently
+    /// survive, which is what keeps a screen whose distinct clusters exceed the bound
+    /// from reshaping every cluster again on the next frame.
+    fn insert(&mut self, style_key: u64, cluster: &str, width: f32) {
+        while self.len >= self.capacity {
+            let Some((evicted_style, evicted)) = self.order.pop_front() else {
+                break;
+            };
+            let removed = self
+                .widths
+                .get_mut(&evicted_style)
+                .and_then(|widths| widths.remove(evicted.as_ref()))
+                .is_some();
+            if removed {
+                self.len -= 1;
+            }
+        }
+        let key: Arc<str> = Arc::from(cluster);
+        let replaced = self
+            .widths
+            .entry(style_key)
+            .or_default()
+            .insert(Arc::clone(&key), width)
+            .is_some();
+        self.order.push_back((style_key, key));
+        if !replaced {
+            self.len += 1;
+        }
     }
 }
 
@@ -261,6 +355,26 @@ impl<'a> ClusterMeasurer<'a> {
     pub fn advance(&mut self, cluster: &str) -> f32 {
         self.widths.advance(self.font_system, self.style, cluster)
     }
+
+    /// Whether one printable ASCII cell in the primary face is known to advance
+    /// exactly the column the grid reserves for it.
+    ///
+    /// [`crate::paint`] anchors a cluster when its measured advance disagrees with
+    /// its columns, so when this holds the walk can treat such a cell as unanchored
+    /// without measuring it or consulting the cache at all (B19).
+    pub fn ascii_is_one_column(&self) -> bool {
+        self.style.ascii_is_one_column
+    }
+
+    /// Advance lookups this measurer served, cached or not.
+    pub fn lookups(&self) -> u64 {
+        self.widths.lookups()
+    }
+
+    /// Advances this measurer actually shaped.
+    pub fn measurements(&self) -> u64 {
+        self.widths.measurements()
+    }
 }
 
 /// Shapes one cluster with exactly the attributes [`shape`] gives a regular span.
@@ -290,6 +404,24 @@ fn measure_cluster(font_system: &mut FontSystem, style: &TextStyle, text: &str) 
         .next()
         .map(|run| run.line_w)
         .unwrap_or(0.0)
+}
+
+/// Whether every printable ASCII cell advances exactly one column in this style.
+///
+/// The row walk anchors a cluster whose measured advance disagrees with the columns
+/// the grid reserved for it (S8), and that measurement is what a plain row used to
+/// pay per cell. For a monospace primary face no ASCII cell ever disagrees, so the
+/// walk can skip the measurement — but only once it has been *checked*: a
+/// proportional family configured as the terminal font drifts on its narrowest
+/// characters exactly like a fallback script does, and anchoring those is existing
+/// behaviour. Each cell is therefore measured the way the walk would measure it, once
+/// per style instead of once per cell per frame.
+fn measure_ascii_is_one_column(font_system: &mut FontSystem, style: &TextStyle) -> bool {
+    let mut buffer = [0u8; 4];
+    (' '..='~').all(|c| {
+        let advance = measure_cluster(font_system, style, c.encode_utf8(&mut buffer));
+        (advance - style.cell.width).abs() <= ANCHOR_TOLERANCE
+    })
 }
 
 fn shape(font_system: &mut FontSystem, style: &TextStyle, item: &TextItem) -> Buffer {
@@ -868,5 +1000,102 @@ mod tests {
         assert!(!widths.is_empty());
         widths.clear();
         assert!(widths.is_empty(), "the cache can be dropped wholesale");
+    }
+
+    /// Distinct one-character clusters, enough to overflow a small cache.
+    fn clusters(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| {
+                let code = char::from(b'a' + (index % 26) as u8);
+                let mut cluster = String::new();
+                cluster.push(code);
+                cluster.push_str(&format!("{index}"));
+                cluster
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_cluster_cache_evicts_the_oldest_instead_of_wiping_itself() {
+        // B19: reaching the bound used to clear every style map, so a screen with more
+        // distinct clusters than the bound reshaped all of them on the next frame.
+        let capacity = 8;
+        let mut system = FontSystem::new();
+        let style = TextStyle::new(&mono_font(), 1.0, &mut system);
+        let mut widths = ClusterWidths::with_capacity(capacity);
+        let clusters = clusters(capacity + 4);
+        for cluster in &clusters {
+            let mut measurer = ClusterMeasurer::new(&mut system, &style, &mut widths);
+            measurer.advance(cluster);
+            assert!(
+                widths.len() <= capacity,
+                "the cache outgrew its bound with {} entries after {cluster:?}",
+                widths.len()
+            );
+        }
+        assert_eq!(widths.len(), capacity, "the cache is full, not emptied");
+
+        let shaped = widths.measurements();
+        for cluster in &clusters[4..] {
+            let mut measurer = ClusterMeasurer::new(&mut system, &style, &mut widths);
+            measurer.advance(cluster);
+        }
+        assert_eq!(
+            widths.measurements(),
+            shaped,
+            "the {} most recently inserted clusters are still resident",
+            clusters.len() - 4
+        );
+
+        // The four oldest measurements were the ones evicted, and evicting one made
+        // room for exactly one.
+        let mut measurer = ClusterMeasurer::new(&mut system, &style, &mut widths);
+        measurer.advance(&clusters[0]);
+        assert_eq!(
+            widths.measurements(),
+            shaped + 1,
+            "the oldest cluster had to be shaped again"
+        );
+        assert_eq!(widths.len(), capacity, "still bounded after the eviction");
+    }
+
+    #[test]
+    fn the_production_bound_covers_the_cells_of_a_4k_screen() {
+        // A bound smaller than the screen's distinct clusters reshapes every one of
+        // them on every frame however it evicts, so it has to hold a whole 4K screen
+        // at the smallest layout the defaults allow.
+        let columns = 3840 / 8;
+        let rows = 2160 / 16;
+        assert!(
+            ClusterWidths::new().capacity() >= columns * rows,
+            "{} entries against {columns}x{rows} cells",
+            MAX_CACHED_CLUSTERS
+        );
+    }
+
+    #[test]
+    fn plain_ascii_is_only_skipped_when_it_really_fits_one_column() {
+        // The row walk skips the measurement of an ASCII cell because this check says
+        // the advance is already known, so the check has to come from measurement
+        // rather than from an assumption about the family.
+        let mut system = FontSystem::new();
+        let monospace = TextStyle::new(&mono_font(), 1.0, &mut system);
+        assert!(
+            monospace.ascii_is_one_column,
+            "the shipped default font fills one column per ASCII cell"
+        );
+        let spaced = TextStyle::new(
+            &FontConfig {
+                letter_spacing: 3.0,
+                ..mono_font()
+            },
+            1.0,
+            &mut system,
+        );
+        assert!(
+            !spaced.ascii_is_one_column,
+            "letter spacing widens every ASCII cell past its column, so it must be \
+             measured as before"
+        );
     }
 }

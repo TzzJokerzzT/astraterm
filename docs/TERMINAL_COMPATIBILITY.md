@@ -34,6 +34,7 @@ names the test that covers it.
 | Selection | simple and line selection produce text | `selection_produces_the_expected_text`, `line_selection_includes_whole_lines` |
 | Damage tracking | changed rows reported per snapshot | `damage_reports_rows_that_changed` |
 | Buffer text | visible screen text and per-line text | `snapshot_text_round_trips_visible_lines`, `line_text_exposes_buffer_lines_for_search` |
+| OSC 8 hyperlinks | destination carried beside the text in `CellSnapshot`, opened by Ctrl+click when `terminal.open_urls_on_click` is on; only the schemes the opener already accepts reach it | `an_osc8_hyperlink_reaches_the_snapshot`, `a_cell_without_a_hyperlink_carries_none`, `an_empty_uri_closes_the_link`, `an_opened_hyperlink_with_no_visible_text_links_no_cell`, `a_linked_cell_is_underlined_even_when_the_program_asked_for_no_style` (`crates/terminal/src/engine.rs`); `a_click_on_a_linked_cell_opens_the_hyperlink`, `a_click_on_an_unlinked_cell_still_opens_the_visible_url`, `an_unlinked_non_url_cell_opens_nothing`, `a_refused_scheme_never_reaches_the_opener` (`crates/app/src/ui.rs`) |
 | OSC 52 | disabled by default | `osc52_is_disabled_by_default` |
 | Images (opt-in) | kitty graphics, iTerm2 `OSC 1337;File=` and sixel captured before the VT parser; decode, anchoring and drawing behind `terminal.images` | `the_engine_keeps_the_text_and_hands_the_images_over`, `arbitrary_chunking_does_not_change_the_result` (`crates/terminal/tests/image_scanner.rs`); `png_over_max_dimension_is_rejected_before_expanding`, `kitty_wire_chunking_is_accepted_and_reassembled`, `iterm2_inline_zero_is_unsupported` (`crates/terminal/src/image_decode.rs`); `a_captured_kitty_image_is_anchored_and_drawn`, `images_are_discarded_without_decoding_when_the_option_is_off`, `a_partially_visible_image_is_clipped_instead_of_overflowing`, `an_anchor_the_resize_pushed_off_screen_keeps_its_image`, `a_resize_drops_and_counts_the_anchors_beyond_the_buffer` (`crates/app/src/ui.rs`) |
 | Malformed sequences | never corrupt the grid | `malformed_escape_sequences_do_not_corrupt_the_grid` |
@@ -439,9 +440,21 @@ or the application.
   inside its own slot instead of pushing the rest of the row, which is what keeps a
   powerlevel10k prompt or a neovim status line aligned. The trade-off is that such a
   glyph can overflow by up to one cell: alignment is exact, clipping is not.
-- **No OSC 8 hyperlink styling.** The embedded core accepts OSC 8, but
-  `CellSnapshot` has no hyperlink field, so links are not underlined or clickable
-  and only the visible URL text can be opened.
+- **OSC 8 hyperlinks click, but do not yet look like links.** The destination
+  reaches the UI in `CellSnapshot::hyperlink` (the model drops it when the span is
+  closed with an empty URI), and with `terminal.open_urls_on_click` on, a
+  Ctrl+click on a linked cell opens that destination instead of the text under
+  the cursor; a cell without a link still opens the visible `http`/`https` URL.
+  The destination is program-controlled, so `ui::link_target` screens it with
+  `astraterm_platform::linux::is_safe_url` before the opener is called, and a
+  refused scheme opens nothing — it does not fall back to the text either.
+  What is missing is the styling: the whole visual indication today is the
+  existing underline flag, which `convert_cell` sets for a linked cell whose
+  program asked for no underline. A renderer-side treatment would give
+  `paint::cell_style` and `paint::cell_underlined` a link colour from the theme
+  (so the underline is drawn in it rather than in the foreground) and the UI a
+  hand cursor when the pointer hovers a linked cell; neither touches the
+  snapshot.
 - **No bell sound/visual bell.** BEL becomes a status message and a `bell` flag,
   not an audible bell.
 - **No scrollback search while output is flooding.** Search is computed on the

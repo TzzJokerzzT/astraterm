@@ -45,8 +45,8 @@ use crate::prefs::{FONT_SIZE_STEP, Preferences, next_font_size};
 use crate::ui::{
     ClickInfo, ConfirmDialog, DragState, ExitCleanup, Floating, FloatingPress, Overlay,
     PendingAction, RenameOverlay, SearchOverlay, SessionImages, WindowUi,
-    closes_floating, divider_drag_at, plan_exit_cleanup, plan_floating_press,
-    split_lands_in_floating, url_at,
+    closes_floating, divider_drag_at, open_clicked_url, plan_exit_cleanup, plan_floating_press,
+    split_lands_in_floating,
 };
 
 /// Characters of notification body repeated in the status bar.
@@ -2962,16 +2962,19 @@ impl Application {
         if !open_enabled {
             return false;
         }
-        let url = self.sessions.for_pane_mut(pane).and_then(|session| {
+        let opened = self.sessions.for_pane_mut(pane).and_then(|session| {
             let snapshot = session.snapshot();
-            snapshot
-                .lines
-                .get(row as usize)
-                .and_then(|line| url_at(&line.text(), column as usize))
+            let line = snapshot.lines.get(row as usize)?;
+            open_clicked_url(
+                snapshot.cell(column, row),
+                line,
+                column as usize,
+                linux::open_url,
+            )
         });
-        let Some(url) = url else { return false };
-        let message = match linux::open_url(&url) {
-            Ok(()) => format!("opened {url}"),
+        let Some(opened) = opened else { return false };
+        let message = match opened.result {
+            Ok(()) => format!("opened {}", opened.url),
             Err(error) => error,
         };
         self.with_window(window_id, |ui| ui.set_status(message));

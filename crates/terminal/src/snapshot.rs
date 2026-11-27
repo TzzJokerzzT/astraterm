@@ -29,8 +29,9 @@ pub struct CellFlags {
 /// One grid cell.
 ///
 /// Rows are built cell by cell, so the struct stays cheap to clone: every field
-/// but `zerowidth` is a scalar, and `zerowidth` is `None` for all but the handful
-/// of cells that carry a grapheme continuation.
+/// but `zerowidth` and `hyperlink` is a scalar, and both are `None` for almost
+/// every cell: `zerowidth` only for the handful that carry a grapheme
+/// continuation, `hyperlink` only for the ones inside an `OSC 8` span.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CellSnapshot {
     pub ch: char,
@@ -46,6 +47,12 @@ pub struct CellSnapshot {
     /// characters and combining marks. The renderer shapes them directly after
     /// `ch`, so the shaper always sees the cluster whole.
     pub zerowidth: Option<Box<[char]>>,
+    /// Destination of the `OSC 8` hyperlink the program attached to this cell.
+    ///
+    /// The destination is untrusted program input and is not part of the text:
+    /// the click path screens it with the opener's scheme allow-list before
+    /// anything is launched, and nothing is ever opened without a click.
+    pub hyperlink: Option<Box<str>>,
 }
 
 impl Default for CellSnapshot {
@@ -58,6 +65,7 @@ impl Default for CellSnapshot {
             wide: false,
             wide_spacer: false,
             zerowidth: None,
+            hyperlink: None,
         }
     }
 }
@@ -75,6 +83,11 @@ impl CellSnapshot {
     /// Codepoints that continue this cell's character, in receipt order.
     pub fn zerowidth(&self) -> &[char] {
         self.zerowidth.as_deref().unwrap_or_default()
+    }
+
+    /// `OSC 8` destination of this cell, if the program attached one.
+    pub fn hyperlink(&self) -> Option<&str> {
+        self.hyperlink.as_deref()
     }
 }
 

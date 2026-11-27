@@ -24,6 +24,9 @@ pub mod quad;
 pub mod text;
 pub mod texture;
 
+#[cfg(test)]
+mod test_alloc;
+
 use std::sync::Arc;
 
 use astraterm_config::schema::FontConfig;

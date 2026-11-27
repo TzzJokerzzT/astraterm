@@ -575,6 +575,13 @@ pub enum SelectionKind {
 
 fn convert_cell(cell: &alacritty_terminal::term::cell::Cell) -> CellSnapshot {
     let flags = cell.flags;
+    // B6: the `OSC 8` destination is not part of the visible text, so it has to
+    // travel beside it or a click can only guess from the characters. The model
+    // clears its cursor template on an empty URI, so a closed span yields `None`.
+    let hyperlink = cell
+        .hyperlink()
+        .map(|link| link.uri().to_owned().into_boxed_str())
+        .filter(|uri| !uri.is_empty());
     CellSnapshot {
         ch: cell.c,
         fg: convert_color(cell.fg),
@@ -582,7 +589,10 @@ fn convert_cell(cell: &alacritty_terminal::term::cell::Cell) -> CellSnapshot {
         flags: CellFlags {
             bold: flags.contains(Flags::BOLD),
             italic: flags.contains(Flags::ITALIC),
-            underline: flags.intersects(Flags::ALL_UNDERLINES),
+            // A linked cell the program did not style is underlined anyway: the
+            // painter already honours this flag, so the link is visible without
+            // a renderer change. A proper link style belongs in the renderer.
+            underline: flags.intersects(Flags::ALL_UNDERLINES) || hyperlink.is_some(),
             dim: flags.contains(Flags::DIM),
             inverse: flags.contains(Flags::INVERSE),
             hidden: flags.contains(Flags::HIDDEN),
@@ -598,6 +608,7 @@ fn convert_cell(cell: &alacritty_terminal::term::cell::Cell) -> CellSnapshot {
         zerowidth: cell
             .zerowidth()
             .map(|codepoints| codepoints.to_vec().into_boxed_slice()),
+        hyperlink,
     }
 }
 
@@ -897,5 +908,109 @@ mod zerowidth_snapshot_tests {
         assert_eq!(cell_text(&mut engine, 0), ('\u{1F468}', vec!['\u{200D}']));
         assert_eq!(cell_text(&mut engine, 2), ('\u{1F469}', vec!['\u{200D}']));
         assert_eq!(cell_text(&mut engine, 4), ('\u{1F467}', Vec::new()));
+    }
+}
+
+#[cfg(test)]
+mod hyperlink_snapshot_tests {
+    use super::{EngineOptions, TerminalEngine};
+
+    /// A one-line engine wide enough for the whole link and the text after it.
+    fn engine() -> TerminalEngine {
+        TerminalEngine::new(EngineOptions {
+            cols: 40,
+            rows: 2,
+            ..Default::default()
+        })
+    }
+
+    /// The hyperlink the snapshot reports for `column` of the first row.
+    fn hyperlink_at(engine: &mut TerminalEngine, column: u16) -> Option<String> {
+        let snapshot = engine.snapshot();
+        snapshot
+            .cell(column, 0)
+            .and_then(|cell| cell.hyperlink().map(str::to_owned))
+    }
+
+    #[test]
+    fn an_osc8_hyperlink_reaches_the_snapshot() {
+        // B6: `convert_cell` dropped `Cell::hyperlink()`, so the destination the
+        // program attached to the text never reached the UI and a click could
+        // only guess from the visible characters.
+        let mut engine = engine();
+        engine.process(b"\x1b]8;;https://example.com/target\x1b\\click me");
+        for column in 0..8 {
+            assert_eq!(
+                hyperlink_at(&mut engine, column).as_deref(),
+                Some("https://example.com/target"),
+                "column {column} belongs to the link span"
+            );
+        }
+        assert_eq!(
+            hyperlink_at(&mut engine, 8),
+            None,
+            "the cell after the span carries no hyperlink"
+        );
+        let snapshot = engine.snapshot();
+        assert_eq!(
+            snapshot.lines[0].text(),
+            "click me",
+            "the destination is carried beside the text, never printed"
+        );
+    }
+
+    #[test]
+    fn a_cell_without_a_hyperlink_carries_none() {
+        let mut engine = engine();
+        engine.process(b"plain text");
+        assert_eq!(hyperlink_at(&mut engine, 0), None);
+    }
+
+    #[test]
+    fn an_empty_uri_closes_the_link() {
+        // `OSC 8 ; ; ST` with an empty URI ends the span: the model clears the
+        // cursor template, so everything written afterwards is unlinked.
+        let mut engine = engine();
+        engine.process(
+            b"\x1b]8;;https://example.com/target\x1b\\link\x1b]8;;\x1b\\plain",
+        );
+        assert_eq!(
+            hyperlink_at(&mut engine, 0).as_deref(),
+            Some("https://example.com/target"),
+            "the span covers the text before the closing sequence"
+        );
+        assert_eq!(
+            hyperlink_at(&mut engine, 4),
+            None,
+            "the text after the closing sequence is not linked"
+        );
+    }
+
+    #[test]
+    fn an_opened_hyperlink_with_no_visible_text_links_no_cell() {
+        let mut engine = engine();
+        engine.process(b"\x1b]8;;https://example.com/target\x1b\\");
+        let snapshot = engine.snapshot();
+        assert!(
+            snapshot
+                .lines
+                .iter()
+                .flat_map(|row| &row.cells)
+                .all(|cell| cell.hyperlink().is_none()),
+            "a sequence that prints nothing links nothing"
+        );
+    }
+
+    #[test]
+    fn a_linked_cell_is_underlined_even_when_the_program_asked_for_no_style() {
+        // The underline is the only indication that needs no renderer change:
+        // the painter already honours `CellFlags::underline`.
+        let mut engine = engine();
+        engine.process(b"\x1b]8;;https://example.com/target\x1b\\link");
+        let snapshot = engine.snapshot();
+        assert!(
+            snapshot.lines[0].cells[0].flags.underline,
+            "a link the program did not style is still marked"
+        );
     }
 }

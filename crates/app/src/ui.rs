@@ -14,6 +14,7 @@ use astraterm_config::themes::Theme;
 use astraterm_core::{
     CellMetrics, FocusDirection, PaneId, Rect, SessionId, Size, SplitAxis, TabId, WindowId,
 };
+use astraterm_platform::linux;
 use astraterm_platform::system::SystemSnapshot;
 use astraterm_renderer::Renderer;
 use astraterm_renderer::paint::{self, ImageItem, ImagePixels, PaintOptions, Scene, TextItem};
@@ -22,7 +23,7 @@ use astraterm_settings_ui::panel::{PanelStyle, SettingsPanel};
 use astraterm_terminal::TerminalEngine;
 use astraterm_terminal::image::{ImagePlacement, ImageStore};
 use astraterm_terminal::image_decode::{DecodeLimits, ImageDecoder};
-use astraterm_terminal::snapshot::{CursorVisual, Snapshot};
+use astraterm_terminal::snapshot::{CellSnapshot, CursorVisual, RowSnapshot, Snapshot};
 use astraterm_workspace::tree::SplitId;
 use astraterm_workspace::{LayoutConfig, Pane, Tab, WindowState};
 
@@ -2229,6 +2230,54 @@ pub fn url_at(text: &str, column: usize) -> Option<String> {
     }
 }
 
+/// What a click resolved to, and what the platform opener answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClickOpen {
+    /// The destination the click resolved to.
+    pub url: String,
+    /// The opener's verdict, reported in the status bar by the caller.
+    pub result: Result<(), String>,
+}
+
+/// Resolves what a click on the cell under `column` opens.
+///
+/// A cell that carries an `OSC 8` hyperlink contributes that destination, and
+/// only that destination: it wins over the visible characters so a label can
+/// differ from its target. The destination comes from the program, so it is
+/// screened with the same allow-list the opener enforces, and a refused scheme
+/// resolves to nothing rather than falling back to text the program only
+/// displayed. A cell with no hyperlink keeps the text-detection behaviour of
+/// [`url_at`].
+pub fn link_target(
+    cell: Option<&CellSnapshot>,
+    line: &RowSnapshot,
+    column: usize,
+) -> Option<String> {
+    match cell.and_then(CellSnapshot::hyperlink) {
+        Some(uri) => linux::is_safe_url(uri).then(|| uri.to_owned()),
+        None => url_at(&line.text(), column),
+    }
+}
+
+/// Resolves the click and hands the result to `open` exactly once.
+///
+/// `open` is the platform opener in the application and a recorder in the tests,
+/// so the click path needs no GUI to be exercised. It is called only for a URL
+/// [`link_target`] accepted, and never with an empty or refused destination.
+pub fn open_clicked_url<F>(
+    cell: Option<&CellSnapshot>,
+    line: &RowSnapshot,
+    column: usize,
+    open: F,
+) -> Option<ClickOpen>
+where
+    F: FnOnce(&str) -> Result<(), String>,
+{
+    let url = link_target(cell, line, column)?;
+    let result = open(&url);
+    Some(ClickOpen { url, result })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2289,6 +2338,74 @@ mod tests {
     fn url_detection_ignores_non_web_words() {
         let text = "ssh user@host and mailto:x@y";
         assert_eq!(url_at(text, 2), None);
+    }
+
+    /// Runs the click path for the cell under `column`, recording every URL the
+    /// opener is handed. Nothing is launched: the opener is the seam.
+    fn click(snapshot: &Snapshot, column: u16) -> (Option<super::ClickOpen>, Vec<String>) {
+        let mut opened = Vec::new();
+        let outcome = super::open_clicked_url(
+            snapshot.cell(column, 0),
+            &snapshot.lines[0],
+            column as usize,
+            |url| {
+                opened.push(url.to_owned());
+                Ok(())
+            },
+        );
+        (outcome, opened)
+    }
+
+    #[test]
+    fn a_click_on_a_linked_cell_opens_the_hyperlink() {
+        // B6: the visible text and the destination disagree on purpose, so a
+        // path that still scans the text opens the wrong URL.
+        let snapshot = snapshot(
+            "\x1b]8;;https://link.example/target\x1b\\https://text.example/page\x1b]8;;\x1b\\",
+        );
+        let (outcome, opened) = click(&snapshot, 0);
+        assert_eq!(
+            opened,
+            vec!["https://link.example/target".to_owned()],
+            "the opener is asked once, for the hyperlink and not for the text"
+        );
+        let outcome = outcome.expect("a linked click resolves to a URL");
+        assert_eq!(outcome.url, "https://link.example/target");
+        assert!(outcome.result.is_ok());
+    }
+
+    #[test]
+    fn a_click_on_an_unlinked_cell_still_opens_the_visible_url() {
+        // Pins the behaviour the hyperlink path must not disturb.
+        let snapshot = snapshot("see https://example.com/docs for details");
+        let (outcome, opened) = click(&snapshot, 6);
+        assert_eq!(opened, vec!["https://example.com/docs".to_owned()]);
+        assert!(outcome.is_some_and(|outcome| outcome.result.is_ok()));
+    }
+
+    #[test]
+    fn an_unlinked_non_url_cell_opens_nothing() {
+        let snapshot = snapshot("see https://example.com/docs for details");
+        let (outcome, opened) = click(&snapshot, 0);
+        assert!(outcome.is_none());
+        assert!(opened.is_empty(), "`see` is not a URL");
+    }
+
+    #[test]
+    fn a_refused_scheme_never_reaches_the_opener() {
+        // The destination is program-controlled. Only the schemes the opener
+        // already accepts may pass, and a refused link does not fall back to the
+        // visible text either: the link wins even when it is refused.
+        for uri in ["file:///etc/passwd", "javascript:alert(1)", "ssh://host/x"] {
+            let text = format!("\x1b]8;;{uri}\x1b\\https://text.example/page\x1b]8;;\x1b\\");
+            let snapshot = snapshot(&text);
+            let (outcome, opened) = click(&snapshot, 0);
+            assert!(outcome.is_none(), "{uri} must be refused");
+            assert!(
+                opened.is_empty(),
+                "{uri} must never reach the opener, not even as the text URL"
+            );
+        }
     }
 
     #[test]
