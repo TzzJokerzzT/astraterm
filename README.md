@@ -5,56 +5,17 @@ real PTY, emulates the terminal with a mature VT core, and draws its own window
 with wgpu — no Electron, no webview, no browser engine. Tabs and split panes are
 implemented by the application itself, so **tmux is not a runtime dependency**.
 
+This is an entirely personal project. I wrote it because I wanted a terminal for
+myself — one that behaves the way I work — and it is not a product: no roadmap
+obligations, no support promises, no release schedule owed to anyone. It is
+shared in case someone else finds it useful, and it stays shaped by what I need
+from it.
+
 Visual identity: dark, minimal, productivity-first. The default theme is
 `midnight`; a light theme (`dawn`) is available as an option.
 
-## Status
-
-**Usable MVP: a real terminal with native tabs and splits.** The whole stack is
-implemented and covered by 571 automated tests plus manual verification on
-Wayland/Hyprland with Neovim, zsh and the Omarchy prompt:
-
-| Crate | Contents | State |
-|---|---|---|
-| `crates/core` | shared ids, cell metrics/geometry, application events | implemented |
-| `crates/config` | one typed config model, TOML loader/writer, validation, atomic + watched config service, themes, keymap | implemented |
-| `crates/workspace` | recursive split tree, tabs, focus traversal, layout math, window/tab metadata | implemented |
-| `crates/pty` | `portable-pty` adapter with bounded queues and reader/writer/waiter threads | implemented |
-| `crates/terminal` | `alacritty_terminal` adapter: snapshots, damage, selection, search, key/mouse/paste encoding | implemented |
-| `crates/session` | session lifecycle, output coalescing with per-session budgets, cwd tracking | implemented |
-| `crates/renderer` | wgpu quad pipeline + glyphon text, damaged-row shaping cache | implemented |
-| `crates/settings-ui` | native, keyboard-driven settings panel model and text projection | implemented |
-| `crates/platform` | clipboard, URL/XDG path and font discovery without `sh -c` | implemented |
-| `crates/app` | winit window and event loop, tabs/splits, keybinding dispatch, mouse selection, search, settings overlay, workspace restore, CLI | implemented |
-
-Build it with `cargo build --release` and run `./target/release/astraterm`.
-Measured on the development machine (Intel UHD 630, Wayland, 2494×1396 window):
-about 1 % idle CPU with one pane and roughly 129 MB RSS in a debug build. See
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the measurement method and
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together.
-Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
-
-What 1.2.0 added on top of that base:
-
-- **A floating terminal that is a real workspace.** It opens in the directory of
-the pane you are in, holds its own split tree with dividers and per-pane sizes,
-and clicking a floating pane focuses it. It stays outside the mosaic: reflow,
-layout and the restored workspace never see it.
-- **Directory inheritance.** A new tab starts where the active tab is; a floating
-pane starts where you opened it from. Both follow the pane's live directory,
-refreshed from `/proc`, so a `cd` in the parent is inherited rather than the
-directory the parent started in. An explicit `working_directory` path still wins.
-- **Grid-anchored glyphs.** A cell whose glyph does not advance exactly one cell
-— emoji, CJK, a fallback script — is placed on its grid column instead of pushing
-the rest of the row, which is what keeps a powerlevel10k prompt and a Neovim
-status line aligned.
-- **A correct colour space for text.** Glyph colours shared one colour space with
-the cell backgrounds; before that every glyph was drawn darker than the theme
-asked, which flattened gradients and dimmed thin ink.
-- **Three typography controls**: `[font] integer_cell_width` snaps the cell
-advance to whole pixels, `[font] hinting` (off by default) keeps real glyph
-weight instead of snapping outlines, and `[font] solid_shades` paints `░▒▓` as a
-flat blend the way foot does.
+**Status:** [docs/STATUS.md](docs/STATUS.md) — the current version, the
+crate-by-crate state and the measured numbers.
 
 ## What AstraTerm is (and is not)
 
@@ -90,23 +51,42 @@ Every option is documented with what it does and when to change it in
 
 ## Requirements
 
+What the **build** needs:
+
 - Rust **1.85+** (the workspace uses edition 2024).
+- A C toolchain and `pkg-config`, for crates with C dependencies.
+- Development headers for Wayland, `libxkbcommon`, fontconfig, FreeType and X11
+  (the winit backend loads `libX11`).
+
+What running the binary needs:
+
 - Linux with Wayland or X11.
-- GPU drivers for wgpu (Vulkan or OpenGL). Mesa is enough on most systems.
+- GPU drivers for wgpu (Vulkan or OpenGL), and the Vulkan loader when Vulkan is
+  the backend. Mesa covers most systems.
 - A font: the default family is `JetBrainsMono Nerd Font`, falling back to
   `JetBrains Mono`, `Symbols Nerd Font`, `Noto Color Emoji`, `DejaVu Sans Mono`
   and finally `monospace`.
+- Optionally `notify-send` (libnotify) for desktop notifications: the save and
+  reload notices, and `OSC 9`/`OSC 777` requests from applications. Without it a
+  single warning is logged and the terminal still shows notifications in the
+  status bar.
+
+The clipboard needs nothing at runtime. It is linked into the binary through the
+`arboard` crate, which reaches the compositor over the Wayland data-control
+protocol and falls back to X11, so no `wl-copy`, `wl-paste`, `xclip` or `xsel`
+process is spawned and **`wl-clipboard` is no longer a dependency**. The Rust
+crates behind this are `arboard` and `png`, plus `proptest` for the tests only.
 
 System packages:
 
 ```sh
 # Arch Linux
 sudo pacman -S --needed base-devel wayland libxkbcommon fontconfig freetype2 mesa \
-    vulkan-icd-loader libx11 wl-clipboard libnotify git ttf-jetbrains-mono-nerd
+    vulkan-icd-loader libx11 libnotify git ttf-jetbrains-mono-nerd
 # Debian / Ubuntu
-sudo apt install build-essential pkg-config libwayland-dev libxkbcommon-dev \
+sudo apt install build-essential pkg-config git libwayland-dev libxkbcommon-dev \
     libfontconfig1-dev libfreetype6-dev mesa-vulkan-drivers libgl1-mesa-dri libvulkan1 \
-    libx11-dev wl-clipboard libnotify-bin
+    libx11-dev libnotify-bin
 ```
 
 The bootstrap script installs the same set for the detected distribution, checks
@@ -145,9 +125,12 @@ cargo build --release
 ./target/release/astraterm
 ```
 
-> **Note:** until the `crates/app` shell is implemented the binary exits
-> immediately. Everything below describes the intended behaviour of the shipped
-> configuration and packaging assets, which are complete.
+The first run writes a documented default `config.toml`, then opens a shell in
+`[terminal] working_directory` — `$HOME` by default — and draws its window.
+
+The command line takes `--working-directory <DIR>`, `--profile <NAME>`,
+`--command <ARGV>…` (an argument vector, never a shell string), `--title <TEXT>`,
+`--config <PATH>`, `--new-window`, `--debug` and `--version`.
 
 Installing it on `PATH` for the current user is covered by
 [packaging](#packaging).
@@ -173,18 +156,37 @@ Guarantees of the configuration service (`crates/config/src/service.rs`):
 - saves are atomic (temporary file + rename), so a crash cannot truncate the file;
 - an external edit is detected and reloaded; a save never silently overwrites
   newer changes made by another program;
-- a broken edit keeps the last known-good configuration active.
+- a broken edit keeps the last-known-good configuration active.
 
 Sections: `[window]`, `[terminal]`, `[font]`, `[appearance]`, `[workspace]`,
 `[performance]`, `[notifications]`, `[keys]` and `[[profiles]]`. Every key, its
-type, default, accepted values and effect is documented in
-[docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+type, default, accepted values, whether it applies live or needs a new session,
+and the keys that are accepted but not applied are documented in
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md), which is the full reference.
 
-The typography keys worth knowing first, because they decide how text looks:
-`[font] size` is in **logical pixels**, not points; `integer_cell_width` trades a
-few columns for a cell advance on a whole pixel; `hinting` is off by default so
-thin ink keeps its weight; and `solid_shades` emulates foot's flat shade blocks
-instead of the font's dither.
+The keys a reader most often wants first:
+
+- `[terminal] bell` — what a program's bell does: `"visual"` (the default: a
+  status message and a border flash), `"none"`, or `"audible"`, which rings the
+  speaker and falls back to the visual answer when no sound backend exists.
+- `[terminal] copy_on_select_target` — whether the selection gesture writes
+  `"clipboard"` (the default) or `"primary"`. The explicit copy always writes the
+  regular clipboard.
+- `[terminal] word_delimiters` — the characters that end a word for double-click
+  selection; whitespace and control characters always end one.
+- `[font] integer_cell_width` — snaps the cell advance to a whole pixel, which
+  narrows the dark seams inside a gradient drawn with block glyphs, at the cost of
+  a few columns.
+- `[font] hinting` — off by default so thin ink keeps its weight and `░▒▓` keep
+  the font's dither instead of turning into a hatch.
+- `[font] solid_shades` — paints `░▒▓` as one flat blend per cell (25/50/75 %)
+  instead of drawing the font's dither, the way foot does.
+- `[performance] max_fps_when_idle` — upper bound on idle redraws per second
+  (cursor blink, status-bar readings); `0` means no cap, and a redraw caused by
+  output, input or a resize is never delayed by it.
+
+The typography keys decide how text looks, so their units matter: `[font] size`
+is in **logical pixels**, not points.
 
 Themes live under `${XDG_CONFIG_HOME:-~/.config}/astraterm/themes/*.toml`.
 Exports of the two built-in themes are in [`assets/themes`](assets/themes)
@@ -223,12 +225,23 @@ table of `config.toml`.
 | Paste | `Ctrl+Shift+V` |
 | Scroll page up / down | `Shift+PageUp` / `Shift+PageDown` |
 | Scroll to top / bottom | `Ctrl+Shift+Home` / `Ctrl+Shift+End` |
+| Previous prompt / next prompt | `Ctrl+Shift+Up` / `Ctrl+Shift+Down` |
 | Open settings | `Ctrl+,` |
 | Reload configuration | `Ctrl+Shift+,` |
 | Toggle status bar | `Ctrl+Shift+S` |
+| Toggle floating terminal | `Ctrl+Shift+Grave` |
 | New window | `Ctrl+Shift+N` |
 | Send next key literally | `Ctrl+Shift+Enter` |
 | Quit | `Ctrl+Shift+Q` |
+
+The mouse is part of the same model. Double click selects the word under the
+pointer (`[terminal] word_delimiters`), triple click selects the line, `Alt`+drag
+selects a rectangle whose copy keeps its padding, and a middle click pastes the
+primary selection. `Ctrl`+click opens a link only when
+`[terminal] open_urls_on_click` is enabled (it is by default): the destination is
+the cell's `OSC 8` hyperlink when it carries one, otherwise the visible text under
+the pointer. Previous and next prompt jumps work where the shell emits `OSC 133`
+marks.
 
 Chord syntax in `[keys]`: lower-case tokens joined by `+`, for example
 `ctrl+shift+t`, `alt+left`, `ctrl+pageup`, `ctrl+comma`, `ctrl+minus`,
@@ -236,7 +249,7 @@ Chord syntax in `[keys]`: lower-case tokens joined by `+`, for example
 `delete`, `insert`, `home`, `end`, `pageup`, `pagedown`, `left`, `right`, `up`,
 `down`, `f1`–`f24`, plus `space`, `comma`, `period`, `minus`, `plus`, `equal`,
 `slash`, `backslash`, `semicolon`, `quote`, `bracketleft`, `bracketright`,
-`backtick`. Alternate chords are separated by `|`
+`backtick` (or `grave`). Alternate chords are separated by `|`
 (`increase-font-size = "ctrl+=|ctrl+plus"`); an empty value or `none` unbinds an
 action.
 
@@ -282,6 +295,17 @@ never touches your configuration. Remove it again with:
 sh packaging/linux/uninstall.sh
 ```
 
+To build a tagged release instead of the working tree, `scripts/setup.sh`
+verifies the tag and leaves your checkout alone:
+
+```sh
+./scripts/setup.sh --version v1.3.0 --install
+```
+
+It refuses unless `HEAD` is exactly that tag and the working tree is clean, never
+runs `git checkout`/`git switch`, and prints the two remedies when the checkout is
+elsewhere (see [docs/INSTALL.md](docs/INSTALL.md#installing-a-specific-release---version)).
+
 Building an Arch package from a release tarball:
 
 ```sh
@@ -289,14 +313,40 @@ cd packaging/linux
 makepkg -si
 ```
 
-The `PKGBUILD` ships `sha256sums=('SKIP')`; **fill in the real release tarball
-checksums before publishing** (see the comment at the top of the file).
+The `pkgver` in the `PKGBUILD` has to be bumped with each release; it still reads
+`1.1.5`, so bump it before packaging 1.3.0. The file ships
+`sha256sums=('SKIP')`; **fill in the real release tarball checksums before
+publishing** (see the comment at the top of the file).
 
 ## Security posture
 
-- **OSC 52 is disabled by default.** Applications cannot read or write the system
-  clipboard through escape sequences unless that is enabled explicitly; terminal
-  escape sequences are treated as untrusted input.
+- **The clipboard is linked in, not spawned.** Copy and paste go through the
+  `arboard` library over the Wayland data-control protocol, with an X11 fallback;
+  no helper process is created, so nothing can block the UI thread waiting on a
+  child and there is no `TMPDIR` for a helper to inherit.
+- **A pasted image becomes a file path.** The clipboard image is validated
+  against a 16 MiB and 16-megapixel limit, written exclusively into a temporary
+  directory with a name built only from numbers, and its **path** is inserted into
+  the session — never graphics-protocol bytes.
+- **OSC 52 is off, and there is no way to turn it on.** Applications cannot read
+  the clipboard and their writes never arrive: the engine is created with
+  `Osc52::Disabled` and no configuration key changes that. This is a deliberate
+  gap rather than a finished design — the application side would write such a
+  request straight to the clipboard without asking, so the protection today is
+  the disabled engine, not a confirmation prompt.
+- **Links open only on an explicit `Ctrl`+click**, and only when
+  `[terminal] open_urls_on_click` is on. The destination is the cell's `OSC 8`
+  hyperlink when it carries one, screened by the platform allow-list, which
+  accepts absolute `http://`, `https://`, `mailto:` and `ftp://` URLs; the visible
+  text counts only when it starts with `http://` or `https://`. **A refused scheme
+  opens nothing** — there is no fallback to the text under the pointer — and the
+  opener runs `xdg-open` with one argument and no shell.
+- **Images are opt-in and bounded.** `terminal.images` is off by default; with it
+  off, captured sequences are dropped without decoding a byte. With it on, a
+  payload is capped at 8 MiB, a decoded image at 4096 pixels per axis and
+  2048×2048 pixels (16 MiB of RGBA), the declared size is checked before the
+  pixel buffer is sized, the per-session store holds at most 64 MiB, and nothing
+  is ever fetched from the network or written to a path a payload names.
 - **SSH goes through the system OpenSSH client.** AstraTerm starts `ssh` with an
   argument vector, never a shell string, never disables host-key checking and
   **never stores SSH passwords or private keys** in its configuration. SSH
@@ -305,33 +355,38 @@ checksums before publishing** (see the comment at the top of the file).
   vector; `sh -c` is never used to interpret a command.
 - **No secret logging.** Terminal output, clipboard contents and configuration
   values are not written to logs.
-- **Bounded resources.** PTY output queues, input queues and scrollback are
-  bounded, so a noisy process cannot exhaust memory or starve other panes.
-- **No automatic link opening.** URL detection only acts on an explicit user
-  action.
-- **Minimal `unsafe`.** Two places: the `SIGKILL` escalation that stops a child
-  which ignores the polite close (`crates/pty/src/lib.rs`) and the `localtime_r` +
-  `strftime` call that formats the status-bar clock in the user's timezone
-  (`crates/platform/src/system.rs`). See [docs/SECURITY.md](docs/SECURITY.md).
+- **Bounded resources.** PTY output queues, input queues, scrollback, image
+  payloads and the session count are bounded, so a noisy process cannot exhaust
+  memory or starve other panes.
+- **Minimal `unsafe`.** Two places in the shipping code: the `SIGKILL` escalation
+  that stops a child which ignores the polite close (`crates/pty/src/lib.rs`) and
+  the `localtime_r` + `strftime` call that formats the status-bar clock in the
+  user's timezone (`crates/platform/src/system.rs`). A counting global allocator
+  in `crates/renderer/src/test_alloc.rs` exists only for the tests. See
+  [docs/SECURITY.md](docs/SECURITY.md).
 
 ## Known limitations
 
-- IME preedit is not drawn: composed text arrives through the input method and is
-  written to the pane, and the candidate window is now positioned at the cursor
-  cell, but the composition in progress is still only traced rather than drawn.
+- Copy and search text use the cell's base character only: a copied emoji keeps
+  its glyph but loses its variation selectors and joiners, which the renderer does
+  keep.
+- `OSC 133` marks are cleared when the grid is resized, are not recorded while the
+  alternate screen is up, and are dropped when one parser piece moves the buffer
+  more than 64 lines, because the movement can no longer be measured.
 - Ligatures are opt-in (`font.ligatures`, off by default) and images are opt-in
   (`terminal.images`, off by default because the payload is untrusted input).
-- Image protocols cover kitty single-chunk PNG and raw frames, iTerm2
-  `OSC 1337;File=` and sixel. Kitty chunked transfers (`m=1`), HLS sixel palettes and
-  iTerm2 `inline=0` are refused rather than approximated.
+- Image protocols cover kitty graphics (single chunk and chunked, PNG or raw
+  RGB/RGBA), iTerm2 `OSC 1337;File=` and sixel, including HLS palettes. Kitty
+  formats other than PNG and raw frames, kitty control messages other than
+  `a=T`/`a=t`, and iTerm2 `inline=0` (save the file instead of showing it) are
+  refused rather than approximated.
 - Desktop notifications use `notify-send`; without libnotify the terminal still shows
   them in the status bar.
+- The audible bell (`[terminal] bell = "audible"`) degrades to the visual answer
+  when no sound backend exists, so on such a system the setting changes nothing
+  audible.
 - Search is plain substring matching (no regular expressions) and searches the
   buffer, not just the screen.
-- Wide glyphs are rendered followed by one filler space so later columns stay
-  aligned; the glyph itself may slightly overflow its cell.
-- OSC 52 (clipboard from the application) is disabled by default because escape
-  sequences are untrusted input; enable it only if you need remote copy.
 - Blur is compositor-specific: transparency works, blur needs a compositor rule
   (for example a Hyprland `blur` layer rule). The application never claims
   universal blur support.
@@ -340,12 +395,38 @@ checksums before publishing** (see the comment at the top of the file).
 - The icon set is generated from `assets/icons/logo.png`; regenerate it with
   `sh assets/icons/generate-icons.sh` after changing the artwork and commit the
   resulting PNGs.
-- Settings that are declared but not yet consumed: `word_delimiters`,
-  `remember_geometry`, `appearance.style`, `appearance.show_window_controls`,
-  `background_blur` (a compositor rule), `font.fallbacks`, `gpu_acceleration`,
-  `max_fps_when_idle` and per-profile `theme`/`font_size`. See
+- Settings that are declared but not yet consumed: `remember_geometry`,
+  `appearance.style`, `appearance.show_window_controls`, `background_blur` (a
+  compositor rule), `appearance.accent_color`, `font.fallbacks`,
+  `gpu_acceleration` and per-profile `theme`/`font_size`. See
   [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 ## License
 
 MIT (see the `license` field in `Cargo.toml`).
+
+Copyright © Alexis Buelvas, author and copyright holder.
+
+### Third-party components
+
+AstraTerm is built on other people's work. Grouped by what they do, with the
+licence each crate declares in its own `Cargo.toml` (versions as resolved by
+`cargo metadata` in this tree); the full text of every licence ships with the
+crate that declares it:
+
+- **Rendering and window** — `wgpu` 30.0.2 (MIT OR Apache-2.0), `glyphon` 0.12.0
+  (MIT OR Apache-2.0 OR Zlib), `cosmic-text` 0.19.0 (MIT OR Apache-2.0),
+  `winit` 0.30.13 (Apache-2.0), `pollster` 0.4.0 (Apache-2.0/MIT), `bytemuck`
+  1.25.2 (Zlib OR Apache-2.0 OR MIT).
+- **Terminal core** — `alacritty_terminal` 0.26.0 (Apache-2.0),
+  `portable-pty` 0.9.0 (MIT), `png` 0.18.1 (MIT OR Apache-2.0).
+- **Configuration and plumbing** — `serde` 1.0.229 (MIT OR Apache-2.0),
+  `serde_ignored` 0.1.14 (MIT OR Apache-2.0), `toml` 1.2.2+spec-1.1.0
+  (MIT OR Apache-2.0), `notify` 9.0.0 (CC0-1.0), `thiserror` 2.0.21
+  (MIT OR Apache-2.0), `anyhow` 1.0.105 (MIT OR Apache-2.0),
+  `crossbeam-channel` 0.5.17 (MIT OR Apache-2.0), `tracing` 0.1.44 (MIT),
+  `tracing-subscriber` 0.3.23 (MIT), `clap` 4.6.9 (MIT OR Apache-2.0).
+- **Platform and system** — `arboard` 3.7.0 (MIT OR Apache-2.0), `libc` 0.2.191
+  (MIT OR Apache-2.0).
+- **Tooling and tests only** — `proptest` 1.12.0 (MIT OR Apache-2.0),
+  `tempfile` 3.27.0 (MIT OR Apache-2.0).
