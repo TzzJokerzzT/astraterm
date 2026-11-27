@@ -1,8 +1,11 @@
 //! Paste handling: the clipboard is read off the event loop and the payload bounded.
 //!
-//! Reading a selection spawns `wl-paste`/`xclip` and waits for it, which blocks for
-//! as long as the selection owner takes to answer. That wait belongs on a worker
-//! thread, never on the event loop, and the result comes back as a `UserEvent`.
+//! A read waits for the selection owner to answer, which blocks for as long as that
+//! owner takes. That wait belongs on a worker thread, never on the event loop, and the
+//! result comes back as a `UserEvent`. Text is encoded here; an image arrives already
+//! written to a temporary file by the platform, so what is encoded for it is the path.
+
+use std::path::Path;
 
 use astraterm_terminal::input::encode_paste;
 use astraterm_terminal::snapshot::ModeFlags;
@@ -17,6 +20,8 @@ pub enum PasteError {
     Empty,
     /// The payload is larger than `MAX_PASTE_BYTES`.
     TooLarge { limit: usize },
+    /// The pasted image's path cannot be sent as text.
+    PathNotUtf8,
 }
 
 impl PasteError {
@@ -28,6 +33,7 @@ impl PasteError {
                 "paste is larger than {} MiB; copy a smaller range",
                 limit / (1024 * 1024)
             ),
+            Self::PathNotUtf8 => "the pasted image path is not valid UTF-8".to_owned(),
         }
     }
 }
@@ -46,6 +52,16 @@ pub fn encode_pasted_text(text: &str, modes: ModeFlags) -> Result<Vec<u8>, Paste
         });
     }
     Ok(encode_paste(text, modes))
+}
+
+/// Encodes the path of a pasted image so the terminal receives it as if it were typed.
+///
+/// The image itself stays in its temporary file: what the shell gets is the path, which
+/// any program can consume. The encoding is the text one — same normalisation, same
+/// bracketed-paste wrapping — so a path arrives exactly like a typed one.
+pub fn encode_pasted_image(path: &Path, modes: ModeFlags) -> Result<Vec<u8>, PasteError> {
+    let text = path.to_str().ok_or(PasteError::PathNotUtf8)?;
+    encode_pasted_text(text, modes)
 }
 
 #[cfg(test)]
@@ -106,5 +122,38 @@ mod tests {
         let text = "linea uno\rlinea dos\nlinea tres\ttab";
         let bytes = encode_pasted_text(text, ModeFlags::default()).unwrap();
         assert_eq!(bytes, b"linea uno\rlinea dos\rlinea tres\ttab");
+    }
+
+    #[test]
+    fn an_image_path_is_inserted_as_plain_text() {
+        let path = Path::new("/tmp/astraterm-paste-4242-0-17.png");
+        let bytes = encode_pasted_image(path, ModeFlags::default()).unwrap();
+        assert_eq!(bytes, b"/tmp/astraterm-paste-4242-0-17.png");
+    }
+
+    #[test]
+    fn an_image_path_follows_the_bracketed_paste_setting() {
+        let path = Path::new("/tmp/astraterm-paste-4242-1-42.png");
+        let bytes = encode_pasted_image(path, bracketed()).unwrap();
+        assert_eq!(
+            bytes,
+            b"\x1b[200~/tmp/astraterm-paste-4242-1-42.png\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn an_image_path_that_is_not_utf8_is_refused() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(OsStr::from_bytes(b"/tmp/astraterm-paste-\xff.png"));
+        assert_eq!(
+            encode_pasted_image(path, ModeFlags::default()),
+            Err(PasteError::PathNotUtf8)
+        );
+        assert_eq!(
+            PasteError::PathNotUtf8.message(),
+            "the pasted image path is not valid UTF-8"
+        );
     }
 }

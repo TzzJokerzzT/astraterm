@@ -4,7 +4,7 @@
 //! that completes the gesture and never off the motion. That keeps a fifty-event drag
 //! to at most one write, and the write itself is queued on the platform's clipboard
 //! worker (see `astraterm_platform::clipboard::ClipboardWriter`) so no frame ever waits
-//! for `wl-copy`/`xclip`.
+//! for the native clipboard library.
 
 /// Decides when copy-on-select writes.
 ///
@@ -30,7 +30,7 @@ impl CopyOnSelect {
         let text = text.filter(|text| !text.is_empty())?;
         if self.last.as_deref() == Some(text.as_str()) {
             // The clipboard already holds exactly this text: the previous gesture is
-            // still the last thing copied, so a helper is not spawned again.
+            // still the last thing copied, so the write is not queued again.
             return None;
         }
         self.last = Some(text.clone());
@@ -69,7 +69,7 @@ mod tests {
     #[test]
     fn an_unchanged_selection_is_not_written_again() {
         // The reported bug wrote on every release, so selecting the same text twice
-        // spawned a second helper for text the clipboard already held.
+        // queued a second write for text the clipboard already held.
         let mut copier = CopyOnSelect::default();
         assert_eq!(drag(&mut copier, 3, "same text"), 1);
         assert_eq!(drag(&mut copier, 3, "same text"), 0);

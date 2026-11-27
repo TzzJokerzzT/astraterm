@@ -32,6 +32,7 @@ astraterm-settings-ui = { path = "crates/settings-ui" }
 astraterm-platform = { path = "crates/platform" }
 
 alacritty_terminal = "0.26"
+arboard = { version = "3.6", features = ["wayland-data-control"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 cosmic-text = "0.19"

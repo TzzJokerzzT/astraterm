@@ -16,7 +16,9 @@ use astraterm_config::service::{ConfigService, ConfigWatcher, ReloadOutcome, Sav
 use astraterm_config::themes::{Theme, available_themes};
 use astraterm_core::events::{AppCommand, ExitReason, SessionEvent};
 use astraterm_core::{PaneId, ProfileId, SessionId, Size, SplitAxis, TabId, WindowId};
-use astraterm_platform::clipboard::{Clipboard, ClipboardWriter, Selection as ClipboardSelection};
+use astraterm_platform::clipboard::{
+    Clipboard, ClipboardWriter, Paste as ClipboardPaste, Selection as ClipboardSelection,
+};
 use astraterm_platform::linux;
 use astraterm_platform::notifications::{MAX_BODY_CHARS, MAX_TITLE_CHARS, Notifications, sanitize};
 use astraterm_platform::paths::StatePaths;
@@ -134,10 +136,13 @@ pub enum UserEvent {
     /// The configuration file changed on disk.
     ConfigChanged,
     /// A clipboard read finished off the event loop and is ready to send.
+    ///
+    /// `Ok` is the text the clipboard held or the path an image was written to, so an
+    /// image paste reaches the terminal as a path any program can read.
     PasteReady {
         window: WinitWindowId,
         pane: PaneId,
-        result: Result<String, String>,
+        result: Result<ClipboardPaste, String>,
     },
     /// A queued clipboard write failed; the message belongs in the status bar.
     ///
@@ -154,8 +159,9 @@ pub struct Application {
     config: ConfigService,
     keymap: Keymap,
     clipboard: Clipboard,
-    /// Every clipboard write goes through this worker: spawning a helper, writing its
-    /// stdin, closing it and reaping the child all happen off the UI thread.
+    /// Every clipboard write goes through this worker: opening the native handle,
+    /// setting the selection and any wait inside the library all happen off the UI
+    /// thread, and the handle stays alive there for as long as the worker does.
     clipboard_writer: ClipboardWriter,
     /// The copy-on-select trigger: a selection is copied when the gesture ends.
     copy_on_select: CopyOnSelect,
@@ -2001,9 +2007,9 @@ impl Application {
 
     /// Copies the selection of the focused pane.
     ///
-    /// This is the explicit copy (`ctrl+shift+c`) and it never waits: the helper runs
-    /// on the clipboard worker, which is what stopped an explicit copy from freezing
-    /// the window when the helper never returns.
+    /// This is the explicit copy (`ctrl+shift+c`) and it never waits: the write runs on
+    /// the clipboard worker, which is what stopped an explicit copy from freezing the
+    /// window when the clipboard stalled.
     fn copy_selection(&mut self, window_id: WinitWindowId) {
         let Some(text) = self.selection_text(window_id) else {
             return;
@@ -2022,7 +2028,7 @@ impl Application {
 
     /// Queues `text` on the clipboard worker and reports it in the status bar.
     ///
-    /// The call returns as soon as the text is queued; the helper's own failure, if it
+    /// The call returns as soon as the text is queued; the write's own failure, if it
     /// comes at all, arrives later as [`UserEvent::ClipboardWriteFailed`].
     fn queue_copy(&mut self, window_id: WinitWindowId, text: String) {
         let proxy = self.proxy.clone();
@@ -2040,9 +2046,8 @@ impl Application {
         );
         let message = match queued {
             Ok(()) => format!("copied {} character(s)", text.chars().count()),
-            // The platform distinguishes a missing helper from a helper that ran and
-            // failed, so a broken TMPDIR no longer sends anyone to install what they
-            // already have.
+            // The platform distinguishes "no clipboard backend" from "the write ran and
+            // failed", so the message says which one happened.
             Err(error) => error,
         };
         self.with_window(window_id, |ui| ui.set_status(message));
@@ -2056,12 +2061,12 @@ impl Application {
         else {
             return;
         };
-        // Reading the selection spawns a helper process and waits for the owner to
-        // answer, so it runs off the event loop; the text comes back as an event.
+        // Reading the selection waits for the owner to answer — and an image takes longer
+        // than text — so it runs off the event loop; the payload comes back as an event.
         let clipboard = self.clipboard.clone();
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            let result = clipboard.get(ClipboardSelection::Clipboard);
+            let result = clipboard.read(ClipboardSelection::Clipboard);
             let _ = proxy.send_event(UserEvent::PasteReady {
                 window: window_id,
                 pane,
@@ -2071,14 +2076,17 @@ impl Application {
     }
 
     /// Sends a clipboard payload that was read off the event loop.
+    ///
+    /// Text is pasted as text; an image was already written to a temporary file by the
+    /// platform, so what reaches the PTY is that path, encoded exactly like typed text.
     fn finish_paste(
         &mut self,
         window_id: WinitWindowId,
         pane: PaneId,
-        result: Result<String, String>,
+        result: Result<ClipboardPaste, String>,
     ) {
-        let text = match result {
-            Ok(text) => text,
+        let payload = match result {
+            Ok(payload) => payload,
             Err(message) => {
                 self.with_window(window_id, |ui| ui.set_status(message));
                 return;
@@ -2091,7 +2099,11 @@ impl Application {
         else {
             return;
         };
-        match paste::encode_pasted_text(&text, modes) {
+        let encoded = match &payload {
+            ClipboardPaste::Text(text) => paste::encode_pasted_text(text, modes),
+            ClipboardPaste::Image { path } => paste::encode_pasted_image(path, modes),
+        };
+        match encoded {
             Ok(bytes) => {
                 if let Some(session) = self.sessions.for_pane_mut(pane) {
                     session.write(&bytes);

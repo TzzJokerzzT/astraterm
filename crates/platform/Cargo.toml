@@ -7,5 +7,7 @@ license.workspace = true
 [dependencies]
 astraterm-core = { workspace = true }
 astraterm-config = { workspace = true }
+arboard = { workspace = true }
 libc = { workspace = true }
+png = { workspace = true }
 tracing = { workspace = true }
