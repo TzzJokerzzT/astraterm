@@ -6,6 +6,7 @@
 mod app;
 mod chrome;
 mod cli;
+mod copy_on_select;
 mod ime;
 mod keys;
 mod paste;

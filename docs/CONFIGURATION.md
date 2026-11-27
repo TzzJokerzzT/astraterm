@@ -205,7 +205,7 @@ The shell, emulation and session behaviour.
 | `scrollback_lines` | integer | `10000` | 100–1,000,000; outside is an error | History lines kept per session (bounded memory per pane). Fixed when the session is created. |
 | `working_directory` | string | `"home"` | `"home"`, `"current"`, `"inherit"`, `""`, or an absolute path | Directory a new session starts in, in this precedence: an absolute path is used as written and outranks everything; otherwise a pane created from another pane — a new tab or the floating terminal — starts in that pane's live directory, so a `cd` in the parent is inherited; otherwise the policy applies: `home`/`""` = `$HOME`, `current`/`inherit` = the directory of the pane the session is created from (or `--working-directory`). A relative value that is not a policy is an error; a configured directory that does not exist warns and the session falls back to `$HOME`, then to the pane's directory. Needs a new session. |
 | `confirm_on_close` | bool | `true` | `true`, `false` | Asks before closing a pane or tab whose child is still running, and before quitting with live sessions. Read at the moment of the action, so it applies live. |
-| `copy_on_select` | bool | `false` | `true`, `false` | Copies the selection to the system clipboard (the same one `copy` fills) as soon as a mouse selection ends. Applies live. |
+| `copy_on_select` | bool | `false` | `true`, `false` | Copies the selection to the system clipboard (the same one `copy` fills) when the selection gesture completes — on the mouse release that ends the drag, not on the pointer motions inside it — and only when the selected text differs from the last one copied, so selecting the same text twice writes once. The clipboard helper runs on a background thread with a bounded wait, so a slow or stuck `wl-copy`/`xclip` never freezes the window, and a newer selection replaces one that has not started yet. Applies live. |
 | `open_urls_on_click` | bool | `true` | `true`, `false` | Enables Ctrl+click on a detected `http`/`https` URL, which opens it with `xdg-open`; a plain click never opens anything. Applies live. |
 | `word_delimiters` | string | `" /\\()\"'-.,:;<>~!@#$%^&*\|+=[]{}~?"` | any string | **Accepted but not applied.** Double-click word selection uses the terminal core's own rules; no code reads this value. |
 
@@ -556,7 +556,7 @@ images = false              # decode images from terminal output (opt-in)
 scrollback_lines = 20000    # history lines per session (100-1000000)
 working_directory = "home"  # "home", "current"/"inherit" or an absolute path
 confirm_on_close = true     # ask before closing a pane with a live child
-copy_on_select = false      # copy as soon as a mouse selection ends
+copy_on_select = false      # copy when a mouse selection gesture ends
 open_urls_on_click = true   # Ctrl+click on a URL opens it with xdg-open
 word_delimiters = " /\\()\"'-.,:;<>~!@#$%^&*|+=[]{}~?"  # accepted; not applied
 

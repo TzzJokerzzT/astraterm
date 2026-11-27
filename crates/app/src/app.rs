@@ -16,7 +16,7 @@ use astraterm_config::service::{ConfigService, ConfigWatcher, ReloadOutcome, Sav
 use astraterm_config::themes::{Theme, available_themes};
 use astraterm_core::events::{AppCommand, ExitReason, SessionEvent};
 use astraterm_core::{PaneId, ProfileId, SessionId, Size, SplitAxis, TabId, WindowId};
-use astraterm_platform::clipboard::{Clipboard, Selection as ClipboardSelection};
+use astraterm_platform::clipboard::{Clipboard, ClipboardWriter, Selection as ClipboardSelection};
 use astraterm_platform::linux;
 use astraterm_platform::notifications::{MAX_BODY_CHARS, MAX_TITLE_CHARS, Notifications, sanitize};
 use astraterm_platform::paths::StatePaths;
@@ -36,6 +36,7 @@ use winit::keyboard::ModifiersState;
 use winit::window::{ImePurpose, UserAttentionType, Window, WindowId as WinitWindowId};
 
 use crate::cli::Cli;
+use crate::copy_on_select::CopyOnSelect;
 use crate::keys;
 use crate::paste;
 use crate::prefs::{FONT_SIZE_STEP, Preferences, next_font_size};
@@ -138,6 +139,14 @@ pub enum UserEvent {
         pane: PaneId,
         result: Result<String, String>,
     },
+    /// A queued clipboard write failed; the message belongs in the status bar.
+    ///
+    /// The write itself runs on the clipboard worker, so its outcome arrives after the
+    /// frame that asked for it and cannot be returned by the call.
+    ClipboardWriteFailed {
+        window: WinitWindowId,
+        message: String,
+    },
 }
 
 /// Application state shared by all windows.
@@ -145,6 +154,11 @@ pub struct Application {
     config: ConfigService,
     keymap: Keymap,
     clipboard: Clipboard,
+    /// Every clipboard write goes through this worker: spawning a helper, writing its
+    /// stdin, closing it and reaping the child all happen off the UI thread.
+    clipboard_writer: ClipboardWriter,
+    /// The copy-on-select trigger: a selection is copied when the gesture ends.
+    copy_on_select: CopyOnSelect,
     sessions: astraterm_session::SessionManager,
     windows: BTreeMap<WinitWindowId, WindowUi>,
     focused: Option<WinitWindowId>,
@@ -241,10 +255,17 @@ impl Application {
         }
         let preferences = Preferences::load(&state_paths.preferences_file());
 
+        // One worker for every clipboard write, started before the first frame so a
+        // selection never has to wait for it.
+        let clipboard = Clipboard::detect();
+        let clipboard_writer = clipboard.writer();
+
         Ok(Self {
             config: service,
             keymap,
-            clipboard: Clipboard::detect(),
+            clipboard,
+            clipboard_writer,
+            copy_on_select: CopyOnSelect::default(),
             sessions: astraterm_session::SessionManager::new(),
             windows: BTreeMap::new(),
             focused: None,
@@ -518,8 +539,11 @@ impl Application {
     fn pump(&mut self) {
         let report = self.sessions.pump();
         for text in report.clipboard_stores {
-            // OSC 52 is disabled by default; this is the only clipboard write path.
-            let _ = self.clipboard.set(ClipboardSelection::Clipboard, &text);
+            // OSC 52 is disabled by default; it queues on the same worker as every other
+            // write, so an application cannot freeze the window with a clipboard store.
+            let _ = self
+                .clipboard_writer
+                .set(ClipboardSelection::Clipboard, &text);
         }
         for (session, bytes) in report.replies {
             self.sessions.reply(session, &bytes);
@@ -1975,22 +1999,46 @@ impl Application {
         event_loop.exit();
     }
 
+    /// Copies the selection of the focused pane.
+    ///
+    /// This is the explicit copy (`ctrl+shift+c`) and it never waits: the helper runs
+    /// on the clipboard worker, which is what stopped an explicit copy from freezing
+    /// the window when the helper never returns.
     fn copy_selection(&mut self, window_id: WinitWindowId) {
-        let Some(pane) = self
+        let Some(text) = self.selection_text(window_id) else {
+            return;
+        };
+        self.queue_copy(window_id, text);
+    }
+
+    /// The selection text of the focused pane, if there is one.
+    fn selection_text(&self, window_id: WinitWindowId) -> Option<String> {
+        let pane = self
             .windows
             .get(&window_id)
-            .and_then(WindowUi::focused_pane)
-        else {
-            return;
-        };
-        let Some(text) = self
-            .sessions
-            .for_pane(pane)
-            .and_then(|session| session.selection_text())
-        else {
-            return;
-        };
-        let message = match self.clipboard.set(ClipboardSelection::Clipboard, &text) {
+            .and_then(WindowUi::focused_pane)?;
+        self.sessions.for_pane(pane).and_then(|s| s.selection_text())
+    }
+
+    /// Queues `text` on the clipboard worker and reports it in the status bar.
+    ///
+    /// The call returns as soon as the text is queued; the helper's own failure, if it
+    /// comes at all, arrives later as [`UserEvent::ClipboardWriteFailed`].
+    fn queue_copy(&mut self, window_id: WinitWindowId, text: String) {
+        let proxy = self.proxy.clone();
+        let queued = self.clipboard_writer.set_reported(
+            ClipboardSelection::Clipboard,
+            &text,
+            move |result| {
+                if let Err(message) = result {
+                    let _ = proxy.send_event(UserEvent::ClipboardWriteFailed {
+                        window: window_id,
+                        message,
+                    });
+                }
+            },
+        );
+        let message = match queued {
             Ok(()) => format!("copied {} character(s)", text.chars().count()),
             // The platform distinguishes a missing helper from a helper that ran and
             // failed, so a broken TMPDIR no longer sends anyone to install what they
@@ -2822,8 +2870,14 @@ impl Application {
                 .map(|ui| matches!(ui.drag, DragState::Selection { .. }))
                 .unwrap_or(false);
             self.with_window(window_id, |ui| ui.drag = DragState::None);
-            if selecting && self.config.config().terminal.copy_on_select {
-                self.copy_selection(window_id);
+            // The release ends the gesture, so this is the moment a selection exists to
+            // copy: the motions that grew it never reach the clipboard.
+            if selecting {
+                let enabled = self.config.config().terminal.copy_on_select;
+                let text = self.selection_text(window_id);
+                if let Some(text) = self.copy_on_select.completed(enabled, text) {
+                    self.queue_copy(window_id, text);
+                }
             }
         }
     }
@@ -2919,6 +2973,9 @@ impl Application {
         };
         match drag {
             DragState::Selection { pane } => {
+                // Motion only grows the selection. The clipboard write belongs to the
+                // release that completes the gesture (`CopyOnSelect`), so a drag that
+                // moves the pointer fifty times queues nothing.
                 let cell = self
                     .windows
                     .get(&window_id)
@@ -3150,6 +3207,9 @@ impl ApplicationHandler<UserEvent> for Application {
                 pane,
                 result,
             } => self.finish_paste(window, pane, result),
+            UserEvent::ClipboardWriteFailed { window, message } => {
+                self.with_window(window, |ui| ui.set_status(message));
+            }
         }
     }
 
