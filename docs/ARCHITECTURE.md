@@ -270,7 +270,6 @@ Notes:
   scheme. It is only called from an explicit Ctrl+click, on the target that
   `ui::link_target` resolves: the cell's OSC 8 hyperlink when it has one, the
   visible http(s) text otherwise.
-  URL.
 - `StatePaths` derives from `astraterm_config::state_dir()`
   (`$XDG_STATE_HOME/astraterm`, default `~/.local/state/astraterm`).
   `geometry_file()` exists but is not written today; window size is stored in

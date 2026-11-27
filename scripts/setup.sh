@@ -8,7 +8,7 @@
 #   2. checks the Rust toolchain (1.85+, edition 2024) and refuses to continue
 #      instead of downloading a toolchain behind your back;
 #   3. checks the default font family (JetBrainsMono Nerd Font) and the optional
-#      desktop integration tools (`notify-send`, `wl-copy`/`wl-paste`);
+#      desktop notifications (`notify-send`); the clipboard is linked in;
 #   4. builds with `cargo build --release --locked`;
 #   5. with `--install`, runs `packaging/linux/install.sh` to put the binary,
 #      the desktop entry and the icons in your XDG directories.
@@ -429,11 +429,12 @@ install_system_packages() {
     local -a install_cmd=()
     case $manager in
     pacman)
-        # build tools, Wayland/X11 + font/Vulkan runtime libraries, clipboard,
-        # desktop notifications, git, and the default Nerd Font family.
+        # build tools, Wayland/X11 + font/Vulkan runtime libraries, desktop
+        # notifications, git, and the default Nerd Font family. The clipboard
+        # needs no package: it is linked into the binary (arboard).
         packages=(
             base-devel wayland libxkbcommon fontconfig freetype2 mesa
-            vulkan-icd-loader libx11 wl-clipboard libnotify git
+            vulkan-icd-loader libx11 libnotify git
             ttf-jetbrains-mono-nerd
         )
         install_cmd=(pacman -S --needed)
@@ -449,7 +450,7 @@ install_system_packages() {
         packages=(
             build-essential pkg-config git libwayland-dev libxkbcommon-dev
             libfontconfig1-dev libfreetype6-dev libvulkan1 mesa-vulkan-drivers
-            libgl1-mesa-dri libx11-dev wl-clipboard libnotify-bin
+            libgl1-mesa-dri libx11-dev libnotify-bin
         )
         install_cmd=(apt-get install -y --no-install-recommends)
         ;;
@@ -458,7 +459,7 @@ install_system_packages() {
         packages=(
             gcc gcc-c++ make pkgconf-pkg-config git wayland-devel
             libxkbcommon-devel fontconfig-devel freetype-devel vulkan-loader
-            mesa-vulkan-drivers libX11-devel wl-clipboard libnotify
+            mesa-vulkan-drivers libX11-devel libnotify
         )
         install_cmd=(dnf install -y)
         ;;
@@ -605,14 +606,6 @@ check_desktop_tools() {
         missing=1
     fi
 
-    if command -v wl-copy >/dev/null 2>&1 && command -v wl-paste >/dev/null 2>&1; then
-        ok "wl-copy and wl-paste found (clipboard)"
-    else
-        warn "wl-copy/wl-paste not found (wl-clipboard): clipboard copy/paste on Wayland will not work."
-        info "package: wl-clipboard"
-        missing=1
-    fi
-
     if [ "$missing" -eq 1 ]; then
         info "these are runtime features, not build dependencies: the build below still works without them"
     fi
@@ -671,7 +664,7 @@ main() {
         info "install these capabilities with your own package manager:"
         info "  Rust 1.85+, a C toolchain, pkg-config; wayland + libxkbcommon,"
         info "  fontconfig + freetype2, a Vulkan ICD (Mesa is enough), libX11;"
-        info "  wl-clipboard, libnotify, git, and a Nerd Font (default: $DEFAULT_FONT_FAMILY)"
+        info "  libnotify, git, and a Nerd Font (default: $DEFAULT_FONT_FAMILY)"
         info "see docs/INSTALL.md for the mapping per distribution"
     fi
 

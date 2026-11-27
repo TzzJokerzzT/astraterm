@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "astraterm"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "astraterm-config",
@@ -244,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "astraterm-config"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "astraterm-core",
  "crossbeam-channel",
@@ -259,14 +259,14 @@ dependencies = [
 
 [[package]]
 name = "astraterm-core"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "astraterm-platform"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "arboard",
  "astraterm-config",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "astraterm-pty"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "astraterm-core",
  "crossbeam-channel",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "astraterm-renderer"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "alacritty_terminal",
  "astraterm-config",
@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "astraterm-session"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "astraterm-config",
  "astraterm-core",
@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "astraterm-settings-ui"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "astraterm-config",
  "astraterm-core",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "astraterm-terminal"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "alacritty_terminal",
  "astraterm-core",
@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "astraterm-workspace"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "astraterm-core",
  "serde",
