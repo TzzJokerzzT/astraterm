@@ -164,7 +164,7 @@ impl RowCache {
     }
 }
 
-/// Lower bound on cached cluster advances.
+/// Maximum on cached cluster advances.
 ///
 /// The cache evicts its oldest measurements when it reaches this count instead of
 /// dropping everything, so the bound has to be larger than the number of distinct

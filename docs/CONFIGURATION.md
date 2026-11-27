@@ -206,6 +206,7 @@ The shell, emulation and session behaviour.
 | `working_directory` | string | `"home"` | `"home"`, `"current"`, `"inherit"`, `""`, or an absolute path | Directory a new session starts in, in this precedence: an absolute path is used as written and outranks everything; otherwise a pane created from another pane — a new tab or the floating terminal — starts in that pane's live directory, so a `cd` in the parent is inherited; otherwise the policy applies: `home`/`""` = `$HOME`, `current`/`inherit` = the directory of the pane the session is created from (or `--working-directory`). A relative value that is not a policy is an error; a configured directory that does not exist warns and the session falls back to `$HOME`, then to the pane's directory. Needs a new session. |
 | `confirm_on_close` | bool | `true` | `true`, `false` | Asks before closing a pane or tab whose child is still running, and before quitting with live sessions. Read at the moment of the action, so it applies live. |
 | `copy_on_select` | bool | `false` | `true`, `false` | Copies the selection to the system clipboard (the same one `copy` fills) when the selection gesture completes — on the mouse release that ends the drag, not on the pointer motions inside it — and only when the selected text differs from the last one copied, so selecting the same text twice writes once. The write goes through the native clipboard library on a background thread, so a slow or stuck compositor never freezes the window, and a newer selection replaces one that has not started yet. Applies live. |
+| `copy_on_select_target` | string | `"clipboard"` | `"clipboard"`, `"primary"`; any other value is an error | Which selection the copy-on-select gesture writes. `clipboard` is the regular clipboard that `ctrl+shift+c` fills and every application reads; `primary` is the X11/Wayland primary selection that the middle mouse button pastes. Only the gesture follows this key: the explicit copy (`ctrl+shift+c`) always writes the regular clipboard, whatever this says. A middle mouse button click pastes the primary selection — the read runs on the same background thread as the `paste` command, so it never blocks the frame, and an empty primary selection pastes nothing and only reports `the clipboard holds no text or image` in the status bar. Changing the target makes the next gesture write the same text again, because the newly configured selection does not hold it yet. Applies live. |
 | `open_urls_on_click` | bool | `true` | `true`, `false` | Enables Ctrl+click to open a link with `xdg-open`: the cell's OSC 8 hyperlink when it carries one, otherwise a detected `http`/`https` URL in the visible text. A hyperlink whose scheme is refused opens nothing — there is no fallback to the text under the pointer — and a plain click never opens anything. Applies live. |
 | `word_delimiters` | string | `" /\\()\"'-.,:;<>~!@#$%^&*\|+=[]{}~?"` | any string | **Accepted but not applied.** Double-click word selection uses the terminal core's own rules; no code reads this value. |
 
@@ -523,7 +524,8 @@ divider thickness, tab bar position, strip width, compact tabs, status bar and i
 segments, clock format, font family/size/weight/line height/letter spacing,
 ligatures, `integer_cell_width`, `hinting`, `solid_shades`,
 opacity, `terminal.images`, all keybindings, `confirm_on_close`, `copy_on_select`,
-`open_urls_on_click`, `close_pane_when_shell_exits`, `notifications.on`.
+`copy_on_select_target`, `open_urls_on_click`, `close_pane_when_shell_exits`,
+`notifications.on`.
 
 Requires a new session or window (`Field::requires_restart()`):
 `terminal.term`, `terminal.scrollback_lines`, `terminal.working_directory`,
@@ -557,6 +559,7 @@ scrollback_lines = 20000    # history lines per session (100-1000000)
 working_directory = "home"  # "home", "current"/"inherit" or an absolute path
 confirm_on_close = true     # ask before closing a pane with a live child
 copy_on_select = false      # copy when a mouse selection gesture ends
+copy_on_select_target = "clipboard"  # gesture target: "clipboard" or "primary"
 open_urls_on_click = true   # Ctrl+click on a URL opens it with xdg-open
 word_delimiters = " /\\()\"'-.,:;<>~!@#$%^&*|+=[]{}~?"  # accepted; not applied
 

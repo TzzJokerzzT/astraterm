@@ -424,9 +424,12 @@ struct Job {
 /// Called once with the outcome of the write that ran the copy.
 type Done = Box<dyn FnOnce(Result<(), String>) + Send + 'static>;
 
-/// Performs one clipboard write; injected in tests so no real clipboard is touched and
-/// so a stalled write can be simulated exactly.
-type Runner = dyn Fn(Selection, &str) -> Result<(), String> + Send + Sync + 'static;
+/// Performs one clipboard write.
+///
+/// Injected so no test needs a real clipboard and so a stalled write can be simulated
+/// exactly. Public because the application's own copy paths are tested from its crate,
+/// through this seam and not through the compositor.
+pub type Runner = dyn Fn(Selection, &str) -> Result<(), String> + Send + Sync + 'static;
 
 /// State shared with the worker thread.
 struct Shared {
@@ -454,7 +457,12 @@ impl std::fmt::Debug for ClipboardWriter {
 }
 
 impl ClipboardWriter {
-    fn start(runner: Arc<Runner>) -> Self {
+    /// A writer that runs `runner` for every queued write.
+    ///
+    /// [`Clipboard::writer`] is what production uses; this is the seam that lets a test
+    /// in another crate stand in for the native clipboard, so the copy paths are asserted
+    /// without a compositor and without timing.
+    pub fn start(runner: Arc<Runner>) -> Self {
         let shared = Arc::new(Shared {
             pending: Mutex::new(None),
             ready: Condvar::new(),
@@ -922,6 +930,60 @@ mod tests {
             image_dir_with(Some(present.clone()), |_| true),
             present,
             "a real directory is used as it is"
+        );
+    }
+
+    #[test]
+    fn an_empty_primary_selection_reports_a_message_instead_of_panicking() {
+        // Middle-click paste reads the primary selection. With nothing selected it holds
+        // no text and no image, so the read fails with the same message an empty clipboard
+        // reports and the paste sends nothing; the regular clipboard is untouched.
+        let clipboard_text = Arc::new(Mutex::new(Some("clipboard text".to_owned())));
+        let text = Arc::clone(&clipboard_text);
+        let reader: Arc<Reader> = Arc::new(move |selection| match selection {
+            Selection::Clipboard => match lock(&text).clone() {
+                Some(text) => Ok(Raw::Text(text)),
+                None => Err(EMPTY.to_owned()),
+            },
+            // An empty primary selection offers neither format.
+            Selection::Primary => Err(EMPTY.to_owned()),
+        });
+        let clipboard = Clipboard {
+            backend: Backend::Native,
+            reader,
+        };
+
+        assert_eq!(clipboard.read(Selection::Primary).unwrap_err(), EMPTY);
+        assert_eq!(
+            clipboard.read(Selection::Clipboard).unwrap(),
+            Paste::Text("clipboard text".to_owned()),
+            "the empty primary selection leaves the clipboard alone"
+        );
+    }
+
+    #[test]
+    fn a_primary_write_reaches_the_runner_as_the_primary_selection() {
+        // The write side uses one backend for both selections: the job carries the
+        // selection through to the runner instead of hard-coding the clipboard.
+        let seen = Arc::new(Mutex::new(Vec::<(Selection, String)>::new()));
+        let recorded = Arc::clone(&seen);
+        let writer = ClipboardWriter::start(Arc::new(move |selection, text: &str| {
+            lock(&recorded).push((selection, text.to_owned()));
+            Ok(())
+        }));
+        let (report, reported) = mpsc::channel();
+
+        assert!(
+            writer
+                .set_reported(Selection::Primary, "selected", move |result| {
+                    let _ = report.send(result);
+                })
+                .is_ok()
+        );
+        assert!(receive(&reported, "the primary write").is_ok());
+        assert_eq!(
+            *lock(&seen),
+            vec![(Selection::Primary, "selected".to_owned())]
         );
     }
 

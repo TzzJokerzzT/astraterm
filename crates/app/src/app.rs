@@ -38,7 +38,7 @@ use winit::keyboard::ModifiersState;
 use winit::window::{ImePurpose, UserAttentionType, Window, WindowId as WinitWindowId};
 
 use crate::cli::Cli;
-use crate::copy_on_select::CopyOnSelect;
+use crate::copy_on_select::{CopyOnSelect, gesture_target};
 use crate::keys;
 use crate::paste;
 use crate::prefs::{FONT_SIZE_STEP, Preferences, next_font_size};
@@ -48,6 +48,21 @@ use crate::ui::{
     closes_floating, divider_drag_at, open_clicked_url, plan_exit_cleanup, plan_floating_press,
     split_lands_in_floating,
 };
+
+/// Selection the explicit copy and the keyboard paste always use.
+///
+/// Pointing copy-on-select at the primary selection changes the gesture only: an
+/// explicit `ctrl+shift+c` is a request for the regular clipboard, the one every other
+/// application reads, so it never follows `terminal.copy_on_select_target`.
+const EXPLICIT_CLIPBOARD: ClipboardSelection = ClipboardSelection::Clipboard;
+
+/// Selection a middle-button press pastes.
+///
+/// The X11/Wayland convention: the middle button pastes what was selected last, which is
+/// the primary selection, the one a copy-on-select gesture configured for `primary`
+/// fills. The read runs on the paste thread like every other paste, so an empty primary
+/// selection only produces its status message and never blocks the frame.
+const MIDDLE_CLICK_PASTE_SELECTION: ClipboardSelection = ClipboardSelection::Primary;
 
 /// Characters of notification body repeated in the status bar.
 ///
@@ -1208,7 +1223,7 @@ impl Application {
                 self.with_window(window_id, |ui| ui.window.request_redraw());
             }
             AppCommand::CopySelection => self.copy_selection(window_id),
-            AppCommand::Paste => self.paste(window_id),
+            AppCommand::Paste => self.paste(window_id, EXPLICIT_CLIPBOARD),
             AppCommand::Search { .. } => {
                 self.with_window(window_id, |ui| {
                     ui.overlay = Overlay::Search(SearchOverlay::default());
@@ -2014,7 +2029,7 @@ impl Application {
         let Some(text) = self.selection_text(window_id) else {
             return;
         };
-        self.queue_copy(window_id, text);
+        self.queue_copy(window_id, EXPLICIT_CLIPBOARD, text);
     }
 
     /// The selection text of the focused pane, if there is one.
@@ -2026,14 +2041,20 @@ impl Application {
         self.sessions.for_pane(pane).and_then(|s| s.selection_text())
     }
 
-    /// Queues `text` on the clipboard worker and reports it in the status bar.
+    /// Queues `text` for `selection` on the clipboard worker and reports it in the status
+    /// bar.
     ///
     /// The call returns as soon as the text is queued; the write's own failure, if it
     /// comes at all, arrives later as [`UserEvent::ClipboardWriteFailed`].
-    fn queue_copy(&mut self, window_id: WinitWindowId, text: String) {
+    fn queue_copy(
+        &mut self,
+        window_id: WinitWindowId,
+        selection: ClipboardSelection,
+        text: String,
+    ) {
         let proxy = self.proxy.clone();
         let queued = self.clipboard_writer.set_reported(
-            ClipboardSelection::Clipboard,
+            selection,
             &text,
             move |result| {
                 if let Err(message) = result {
@@ -2053,7 +2074,7 @@ impl Application {
         self.with_window(window_id, |ui| ui.set_status(message));
     }
 
-    fn paste(&mut self, window_id: WinitWindowId) {
+    fn paste(&mut self, window_id: WinitWindowId, selection: ClipboardSelection) {
         let Some(pane) = self
             .windows
             .get(&window_id)
@@ -2066,7 +2087,7 @@ impl Application {
         let clipboard = self.clipboard.clone();
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            let result = clipboard.read(ClipboardSelection::Clipboard);
+            let result = clipboard.read(selection);
             let _ = proxy.send_event(UserEvent::PasteReady {
                 window: window_id,
                 pane,
@@ -2864,6 +2885,13 @@ impl Application {
         }
 
         if state == ElementState::Pressed {
+            // A middle click pastes the primary selection, the pairing of the X11/Wayland
+            // selection with copy-on-select. Placed after the mouse-reporting branch, so a
+            // program that asked for mouse input still receives the middle press itself.
+            if button == MouseButton::Middle {
+                self.paste(window_id, MIDDLE_CLICK_PASTE_SELECTION);
+                return;
+            }
             if button != MouseButton::Left {
                 return;
             }
@@ -2885,10 +2913,15 @@ impl Application {
             // The release ends the gesture, so this is the moment a selection exists to
             // copy: the motions that grew it never reach the clipboard.
             if selecting {
-                let enabled = self.config.config().terminal.copy_on_select;
+                let config = self.config.config();
+                let enabled = config.terminal.copy_on_select;
+                // The gesture follows the configured target; the explicit copy above never
+                // does. Copying the target out of the config ends the borrow of `self`
+                // before the queue below.
+                let target = gesture_target(config.terminal.copy_on_select_target);
                 let text = self.selection_text(window_id);
-                if let Some(text) = self.copy_on_select.completed(enabled, text) {
-                    self.queue_copy(window_id, text);
+                if let Some(text) = self.copy_on_select.completed(enabled, target, text) {
+                    self.queue_copy(window_id, target, text);
                 }
             }
         }
@@ -3619,5 +3652,89 @@ mod persistence_tests {
             workspace_snapshot(&windows).is_none(),
             "a failed startup must not overwrite the saved layout"
         );
+    }
+}
+
+#[cfg(test)]
+mod clipboard_target_tests {
+    use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+    use std::time::Duration;
+
+    use astraterm_config::schema::CopyOnSelectTarget;
+
+    use super::{
+        ClipboardSelection, ClipboardWriter, EXPLICIT_CLIPBOARD, MIDDLE_CLICK_PASTE_SELECTION,
+    };
+    use crate::copy_on_select::gesture_target;
+
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// A writer whose worker records the selection each queued write named, through the
+    /// platform's injectable runner.
+    type Recorded = Arc<Mutex<Vec<(ClipboardSelection, String)>>>;
+
+    fn recording_writer() -> (
+        ClipboardWriter,
+        Recorded,
+        mpsc::Receiver<ClipboardSelection>,
+    ) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (signal, signalled) = mpsc::channel();
+        let recorded = Arc::clone(&seen);
+        let writer = ClipboardWriter::start(Arc::new(move |selection, text: &str| {
+            lock(&recorded).push((selection, text.to_owned()));
+            let _ = signal.send(selection);
+            Ok(())
+        }));
+        (writer, seen, signalled)
+    }
+
+    fn receive(worker: &mpsc::Receiver<ClipboardSelection>, what: &str) -> ClipboardSelection {
+        worker
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|error| panic!("the worker never ran {what}: {error}"))
+    }
+
+    #[test]
+    fn the_explicit_copy_uses_the_clipboard_while_the_gesture_follows_the_setting() {
+        // The two call sites are the whole difference: `copy_selection` names the
+        // clipboard and the gesture names `gesture_target`, so the write path itself never
+        // has to know which one asked.
+        for target in CopyOnSelectTarget::ALL {
+            let (writer, seen, worker) = recording_writer();
+
+            assert!(
+                writer.set(EXPLICIT_CLIPBOARD, "same text").is_ok(),
+                "the explicit copy is queued"
+            );
+            assert_eq!(
+                receive(&worker, "the explicit copy"),
+                ClipboardSelection::Clipboard,
+                "`ctrl+shift+c` writes the regular clipboard for {target:?}"
+            );
+
+            let gesture = gesture_target(target);
+            assert!(writer.set(gesture, "same text").is_ok());
+            assert_eq!(
+                receive(&worker, "the gesture"),
+                gesture,
+                "the gesture writes the configured selection for {target:?}"
+            );
+
+            // Both writes ran, with the same text: the target is not something the worker
+            // dedupes.
+            assert_eq!(lock(&seen).len(), 2);
+        }
+    }
+
+    #[test]
+    fn a_middle_click_pastes_the_primary_selection() {
+        // B7: middle-click paste reads the primary selection, which is where a gesture
+        // configured for `primary` wrote.
+        assert_eq!(MIDDLE_CLICK_PASTE_SELECTION, ClipboardSelection::Primary);
+        assert_eq!(EXPLICIT_CLIPBOARD, ClipboardSelection::Clipboard);
+        assert_ne!(EXPLICIT_CLIPBOARD, MIDDLE_CLICK_PASTE_SELECTION);
     }
 }

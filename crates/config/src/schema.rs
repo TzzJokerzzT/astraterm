@@ -74,6 +74,34 @@ impl Default for WindowConfig {
     }
 }
 
+/// Where the copy-on-select gesture writes.
+///
+/// Two selections exist on Linux: the `Ctrl+C`/`Ctrl+V` clipboard, which every
+/// application reads and writes, and the primary selection, which is set by selecting text
+/// and pasted with the middle mouse button. The explicit copy always uses the clipboard;
+/// this only chooses the target of the selection gesture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CopyOnSelectTarget {
+    /// The regular clipboard, the same one `ctrl+shift+c` fills.
+    #[default]
+    Clipboard,
+    /// The X11/Wayland primary selection, which middle-click pasting reads.
+    Primary,
+}
+
+impl CopyOnSelectTarget {
+    pub fn label(self) -> &'static str {
+        match self {
+            CopyOnSelectTarget::Clipboard => "clipboard",
+            CopyOnSelectTarget::Primary => "primary",
+        }
+    }
+
+    pub const ALL: [CopyOnSelectTarget; 2] =
+        [CopyOnSelectTarget::Clipboard, CopyOnSelectTarget::Primary];
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalConfig {
@@ -97,8 +125,16 @@ pub struct TerminalConfig {
     pub working_directory: WorkingDirectory,
     /// Ask before closing a tab/pane with live child processes.
     pub confirm_on_close: bool,
-    /// Copy the selection to the primary clipboard as soon as it is made.
+    /// Copy the selection to the clipboard as soon as it is made.
     pub copy_on_select: bool,
+    /// Where the copy-on-select gesture writes.
+    ///
+    /// The explicit copy keeps its own frame — it always sets the regular clipboard, so
+    /// `ctrl+shift+c` behaves the same whatever this says. Only the selection gesture
+    /// follows this target. Linux users expect a selection to land in the primary
+    /// selection, which is what a middle click pastes; the regular clipboard stays the
+    /// default because it is what every other application reads.
+    pub copy_on_select_target: CopyOnSelectTarget,
     /// Open a third-party process when the user clicks a detected URL.
     pub open_urls_on_click: bool,
     /// Characters that terminate a word for double-click selection.
@@ -117,6 +153,7 @@ impl Default for TerminalConfig {
             working_directory: WorkingDirectory::home(),
             confirm_on_close: true,
             copy_on_select: false,
+            copy_on_select_target: CopyOnSelectTarget::Clipboard,
             open_urls_on_click: true,
             word_delimiters: " /\\()\"'-.,:;<>~!@#$%^&*|+=[]{}~?".to_owned(),
         }
@@ -694,6 +731,60 @@ mod tests {
             outcome.validation().is_valid(),
             "an unknown key stays a warning: {:?}",
             outcome.issues
+        );
+    }
+
+    #[test]
+    fn copy_on_select_target_defaults_to_the_clipboard() {
+        assert_eq!(
+            TerminalConfig::default().copy_on_select_target,
+            CopyOnSelectTarget::Clipboard,
+            "the regular clipboard is what every copy wrote before the key existed"
+        );
+        assert_eq!(
+            Config::default().terminal.copy_on_select_target,
+            CopyOnSelectTarget::Clipboard
+        );
+
+        // Absent key and absent table both keep the default.
+        let config: Config = toml::from_str("[terminal]\ncopy_on_select = true\n").unwrap();
+        assert_eq!(config.terminal.copy_on_select_target, CopyOnSelectTarget::Clipboard);
+        let config: Config = toml::from_str("[font]\nsize = 12.0\n").unwrap();
+        assert_eq!(config.terminal.copy_on_select_target, CopyOnSelectTarget::Clipboard);
+    }
+
+    #[test]
+    fn copy_on_select_target_parses_both_accepted_values() {
+        let config: Config =
+            toml::from_str("[terminal]\ncopy_on_select_target = \"primary\"\n").unwrap();
+        assert_eq!(config.terminal.copy_on_select_target, CopyOnSelectTarget::Primary);
+        let config: Config =
+            toml::from_str("[terminal]\ncopy_on_select_target = \"clipboard\"\n").unwrap();
+        assert_eq!(config.terminal.copy_on_select_target, CopyOnSelectTarget::Clipboard);
+    }
+
+    #[test]
+    fn an_unknown_copy_on_select_target_is_rejected_by_the_loader() {
+        // The key is enum-valued, so a typo is an error the user has to fix rather than a
+        // warning about an ignored setting: the loader refuses the file the way it does
+        // for `cursor`.
+        let error = crate::loader::parse_str(
+            "[terminal]\ncopy_on_select_target = \"mouse\"\n",
+            "test",
+        )
+        .expect_err("an unknown target is not a valid configuration");
+        let message = error.to_string();
+        assert!(
+            matches!(error, crate::loader::LoadError::Parse { .. }),
+            "a bad value is a parse error, not an io error: {message}"
+        );
+        assert!(
+            message.contains("copy_on_select_target"),
+            "the error names the key: {message}"
+        );
+        assert!(
+            message.contains("clipboard") && message.contains("primary"),
+            "the error lists the accepted values: {message}"
         );
     }
 
