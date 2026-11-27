@@ -12,11 +12,12 @@ con specs `S#` y slices, como se hizo con `astraterm-terminal-capabilities.md`.
 Rama `main`. **639 tests**, `cargo clippy --workspace --all-targets` sin advertencias,
 `cargo fmt --check` limpio.
 
-Versión publicada: **1.0.0** — tag `v1.0.0` (que apunta al commit `3806289`) y release
-en https://github.com/TzzJokerzzT/astraterm/releases/tag/v1.0.0 con las notas del
-`CHANGELOG.md`. La instalación por versión está verificada:
-`./scripts/setup.sh --version v1.0.0` desde un checkout del tag devuelve
-`ok: the working tree is exactly v1.0.0 and clean`.
+Versión publicada: **1.2.3**. Cada release lleva su sección en `CHANGELOG.md` y el tag
+apunta al commit que la contiene; la instalación por versión
+(`./scripts/setup.sh --version vX.Y.Z`) verifica y no mueve el checkout, así que el
+camino limpio es un worktree. Ojo con `Cargo.lock`: la 1.2.2 salió con el lock
+desfasado y no compilaba con `--locked`; ya está corregido, pero conviene comprobar
+`cargo metadata --locked` antes de etiquetar.
 
 Ya implementado y cerrado:
 
@@ -55,9 +56,10 @@ Ya implementado y cerrado:
 | Hyperlinks OSC 8 clicables (B6)                        | `f49a155`                       |
 | Portapapeles nativo con pegado de imagen               | `f9b0025`                       |
 | Recorrido por clústeres sin asignación por celda (B19) | `f49a155`                       |
-| Triviales de revisión (R4-004, comentarios, L7)        | pendiente de commit             |
-| Copy-on-select a la selección primaria (B7)            | pendiente de commit             |
-| Passthrough del PTY sin copia por lectura (B15)        | pendiente de commit, parcial     |
+| Triviales de revisión (R4-004, comentarios, L7)        | `428ebab`                       |
+| Copy-on-select a la selección primaria y botón central (B7) | `428ebab`                   |
+| Passthrough del PTY sin copia por lectura (B15, parcial)     | `d61cbc0`                   |
+| Precedencia del cursor: el programa manda (neovim)           | `102efa2`                   |
 
 De la lista de mejoras B1–B18 de este documento, **solo las notificaciones OSC 9/777
 y el kitty por chunks están hechas**. Todo lo demás sigue pendiente.
@@ -383,6 +385,21 @@ flag. Coste S, riesgo de romper atajos si se hace mal.
 - **Verificación**: una pantalla de más filas distintas que el techo no vuelve a
   formar todo cada frame; y con la opción apagada, seleccionar en un scrollback
   grande no asigna.
+
+
+### B23. Pegado de imagen por kitty graphics
+
+- **Por qué**: hoy pegar una captura inserta la **ruta** de un PNG en un temporal, que
+  es lo que entiende cualquier programa. Enviar los bytes por el protocolo de gráficos
+  permite que el programa reciba la imagen sin tocar el disco, pero solo sirve con
+  programas que hablan ese protocolo y hay que respetar `terminal.images`.
+- **Dónde**: `crates/app/src/paste.rs` (donde hoy se codifica la ruta) y
+  `crates/terminal/src/image.rs` para el formato de la secuencia.
+- **Qué**: ofrecer el envío como gráfico cuando el programa haya habilitado imágenes, y
+  mantener la ruta como comportamiento por defecto.
+- **Coste**: M.
+- **Verificación**: pegar una captura en un programa que soporte el protocolo y ver la
+  imagen; y en uno que no, comprobar que sigue llegando la ruta.
 
 ---
 
