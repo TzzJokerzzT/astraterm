@@ -3,7 +3,8 @@
 //!
 //! Every external program is executed with an explicit argument vector, never
 //! through `sh -c`, and every service degrades gracefully when the underlying
-//! tool is unavailable: a missing clipboard helper must not crash the terminal.
+//! tool is unavailable: a missing `notify-send` must not crash the terminal.
+//! The clipboard uses `arboard`, so its absence is a build-time matter.
 
 pub mod clipboard;
 pub mod fonts;

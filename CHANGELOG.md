@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-11-26
+
+### Added
+
+- Ctrl+click opens an OSC 8 hyperlink: the destination travels in `CellSnapshot`,
+  so a click opens what the program linked rather than the text under the cursor.
+  A refused scheme opens nothing — there is no fallback to the visible text — and a
+  cell without a hyperlink keeps the previous behaviour of opening a detected URL.
+
+### Changed
+
+- The clipboard backend is `arboard` instead of a spawned helper: no `wl-copy`,
+  `wl-paste`, `xclip` or `xsel` process is created, so copy and paste can no longer
+  block the UI thread waiting on a child. `wl-clipboard` is no longer a runtime
+  dependency.
+- Pasting when the clipboard holds an image writes the PNG to a temporary file and
+  inserts its path, so any program can open it. The payload is validated against a
+  16 MiB and 16 megapixel limit, and the file is created exclusively with a name
+  built only from numbers, so a shared temp directory is safe.
+
+### Performance
+
+- The row walk no longer allocates per cell or looks up an advance for a plain
+  one-column ASCII cell, and the cluster cache evicts its oldest entry instead of
+  wiping itself at the bound, which now covers a 4K screen. Measured per frame on a
+  200x50 pane: dense CJK 55.6 ms -> 0.87 ms, plain ASCII 0.95 ms -> 0.28 ms, emoji
+  0.60 ms -> 0.25 ms. Scene digests over five content scenarios are identical
+  before and after, so anchoring and glyph placement did not change.
+
 ## [1.2.1] - 2026-11-26
 
 ### Added

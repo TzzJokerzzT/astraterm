@@ -262,10 +262,14 @@ Entry points: `Clipboard` (`clipboard.rs`: `detect`, `set`, `get`, `backend`),
 
 Notes:
 
-- Clipboard backends are `wl-copy`/`wl-paste`, then `xclip`, then `xsel`; with
-  none installed the service reports `Backend::Unavailable` instead of failing.
+- Clipboard reads and writes go through the `arboard` library, which reaches the
+  compositor over the Wayland data-control protocol when the session offers it
+  and falls back to X11; no helper process is spawned. When the session offers
+  no clipboard the service reports `Backend::Unavailable` instead of failing.
 - `open_url` runs `xdg-open <url>` with a single argument after validating the
-  scheme. It is only called from an explicit Ctrl+click on a detected http(s)
+  scheme. It is only called from an explicit Ctrl+click, on the target that
+  `ui::link_target` resolves: the cell's OSC 8 hyperlink when it has one, the
+  visible http(s) text otherwise.
   URL.
 - `StatePaths` derives from `astraterm_config::state_dir()`
   (`$XDG_STATE_HOME/astraterm`, default `~/.local/state/astraterm`).

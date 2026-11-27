@@ -30,10 +30,10 @@ In order, on every run:
 3. **Font.** Checks that the default family `JetBrainsMono Nerd Font` is visible
    to fontconfig and prints the per-distribution way to install it. It never
    downloads font files.
-4. **Desktop integration.** Checks `notify-send` (libnotify) and
-   `wl-copy`/`wl-paste` (wl-clipboard). Both are runtime features — save and
-   reload notifications, and clipboard copy/paste on Wayland — so a missing one
-   is a warning, not a failure.
+4. **Desktop integration.** Checks `notify-send` (libnotify). It is a runtime
+   feature — save and reload notifications are lost without it — so a missing
+   one is a warning, not a failure. Clipboard copy and paste need no helper
+   program.
 5. **Build.** Runs `cargo build --release --locked` from the repository root.
 6. **Install (optional).** With `--install`, runs
    [packaging/linux/install.sh](#installing-for-the-current-user).
@@ -147,7 +147,6 @@ Vulkan or OpenGL driver for wgpu.
 | X11 (winit backend) | `libx11` | `libx11-dev` | `libX11-devel` |
 | OpenGL / Vulkan driver | `mesa` | `mesa-vulkan-drivers libgl1-mesa-dri` | `mesa-vulkan-drivers` |
 | Vulkan loader | `vulkan-icd-loader` | `libvulkan1` | `vulkan-loader` |
-| Clipboard | `wl-clipboard` | `wl-clipboard` | `wl-clipboard` |
 | Notifications | `libnotify` | `libnotify-bin` | `libnotify` |
 | VCS | `git` | `git` | `git` |
 | Font | `ttf-jetbrains-mono-nerd` | see [Font](#font) | see [Font](#font) |
@@ -186,10 +185,12 @@ family = "JetBrains Mono"
 
 ## Clipboard and notifications
 
-Both are runtime features, not build dependencies:
+The clipboard needs nothing at runtime: copy and paste go through the `arboard`
+library, which talks to the compositor directly, so `Ctrl+Shift+C`/`Ctrl+Shift+V`
+work without a helper program.
 
-- `wl-clipboard` (`wl-copy`, `wl-paste`) backs copy and paste on Wayland.
-  Without it, `Ctrl+Shift+C`/`Ctrl+Shift+V` cannot reach the system clipboard.
+Notifications are a runtime feature, not a build dependency:
+
 - `libnotify` (`notify-send`) shows the desktop notification when the
   configuration is saved or reloaded, and it is also the fallback for
   application notifications; the terminal's own `OSC 9`/`OSC 777` notifications
@@ -245,7 +246,7 @@ in the real checksums before publishing a package.
 | Build fails in `wayland-sys` / `xkbcommon` | Install the Wayland and libxkbcommon development packages |
 | Window opens but the text is boxes | No usable font: install a Nerd Font or set `[font] family` |
 | `failed to create surface` / no adapter | No Vulkan ICD or OpenGL driver for this GPU; install `mesa` (or the vendor driver) and check `vulkaninfo` |
-| Clipboard does nothing on Wayland | `wl-clipboard` is missing, or the app is not running under Wayland |
+| Clipboard does nothing | The session offers no clipboard: neither the Wayland data-control protocol nor an X11 display is available |
 | No save/reload notification | `libnotify` / `notify-send` is missing |
 | `error: the tag vX.Y.Z is not in this clone` | The clone predates the tag: `git fetch --tags`, or run without `--version` to build the tree as it is |
 | `error: this checkout is not at vX.Y.Z` | `HEAD` is elsewhere: the message says how many commits ahead/behind and prints both fixes — `git checkout vX.Y.Z` yourself, or `git worktree add /tmp/astraterm-vX.Y.Z vX.Y.Z` and build there; the script deliberately moves nothing |

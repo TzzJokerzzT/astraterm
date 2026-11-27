@@ -173,11 +173,12 @@ after sanitizing is dropped rather than sent.
 
 The application only calls it from an explicit Ctrl+click on a cell, and only
 when `terminal.open_urls_on_click = true`
-(`Application::handle_mouse_input` → `try_open_url`). Cell text recognition
-(`ui::url_at`) accepts only `http://` and `https://`, so the UI path is narrower
-than the platform function. There is no automatic link opening, no shell
-involvement and no `file://`/`javascript:` handling. A URL is never launched from
-an OSC 8 hyperlink because hyperlinks are not styled or activated at all.
+(`Application::handle_mouse_input` → `try_open_url`). The target is the cell's
+OSC 8 hyperlink when it has one, otherwise the visible text under the cursor
+(`ui::link_target`); both are screened by `platform::linux::is_safe_url`, which
+accepts only `http://` and `https://` and returns an error for anything else. A
+hyperlinked cell whose scheme is refused opens nothing: there is no fallback to
+the visible text. There is no automatic link opening and no shell involvement.
 
 ### Scrollback and queues are bounded
 
@@ -209,8 +210,8 @@ enables debug logs for the application crates). All call sites were reviewed:
   errors.
 
 No call site logs PTY bytes, terminal snapshots, clipboard contents, pasted text,
-environment variables or SSH data. The clipboard service writes and reads via
-stdin/stdout of the helper process with logging disabled (`Stdio::null()`), and
+environment variables or SSH data. The clipboard service passes the payload to the
+`arboard` library, which talks to the compositor directly; it spawns no helper and
 never prints the content.
 
 ### Child processes are terminated on shutdown
