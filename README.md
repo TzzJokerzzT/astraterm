@@ -11,7 +11,7 @@ Visual identity: dark, minimal, productivity-first. The default theme is
 ## Status
 
 **Usable MVP: a real terminal with native tabs and splits.** The whole stack is
-implemented and covered by 489 automated tests plus manual verification on
+implemented and covered by 571 automated tests plus manual verification on
 Wayland/Hyprland with Neovim, zsh and the Omarchy prompt:
 
 | Crate | Contents | State |
@@ -33,6 +33,28 @@ about 1 % idle CPU with one pane and roughly 129 MB RSS in a debug build. See
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the measurement method and
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together.
 Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+
+What 1.2.0 added on top of that base:
+
+- **A floating terminal that is a real workspace.** It opens in the directory of
+the pane you are in, holds its own split tree with dividers and per-pane sizes,
+and clicking a floating pane focuses it. It stays outside the mosaic: reflow,
+layout and the restored workspace never see it.
+- **Directory inheritance.** A new tab starts where the active tab is; a floating
+pane starts where you opened it from. Both follow the pane's live directory,
+refreshed from `/proc`, so a `cd` in the parent is inherited rather than the
+directory the parent started in. An explicit `working_directory` path still wins.
+- **Grid-anchored glyphs.** A cell whose glyph does not advance exactly one cell
+— emoji, CJK, a fallback script — is placed on its grid column instead of pushing
+the rest of the row, which is what keeps a powerlevel10k prompt and a Neovim
+status line aligned.
+- **A correct colour space for text.** Glyph colours shared one colour space with
+the cell backgrounds; before that every glyph was drawn darker than the theme
+asked, which flattened gradients and dimmed thin ink.
+- **Three typography controls**: `[font] integer_cell_width` snaps the cell
+advance to whole pixels, `[font] hinting` (off by default) keeps real glyph
+weight instead of snapping outlines, and `[font] solid_shades` paints `░▒▓` as a
+flat blend the way foot does.
 
 ## What AstraTerm is (and is not)
 
@@ -154,7 +176,15 @@ Guarantees of the configuration service (`crates/config/src/service.rs`):
 - a broken edit keeps the last known-good configuration active.
 
 Sections: `[window]`, `[terminal]`, `[font]`, `[appearance]`, `[workspace]`,
-`[performance]`, `[keys]` and `[[profiles]]`.
+`[performance]`, `[notifications]`, `[keys]` and `[[profiles]]`. Every key, its
+type, default, accepted values and effect is documented in
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
+The typography keys worth knowing first, because they decide how text looks:
+`[font] size` is in **logical pixels**, not points; `integer_cell_width` trades a
+few columns for a cell advance on a whole pixel; `hinting` is off by default so
+thin ink keeps its weight; and `solid_shades` emulates foot's flat shade blocks
+instead of the font's dither.
 
 Themes live under `${XDG_CONFIG_HOME:-~/.config}/astraterm/themes/*.toml`.
 Exports of the two built-in themes are in [`assets/themes`](assets/themes)
@@ -287,8 +317,8 @@ checksums before publishing** (see the comment at the top of the file).
 ## Known limitations
 
 - IME preedit is not drawn: composed text arrives through the input method and is
-  written to the pane, but the composition in progress is only traced, and the
-  candidate window is not positioned at the cursor.
+  written to the pane, and the candidate window is now positioned at the cursor
+  cell, but the composition in progress is still only traced rather than drawn.
 - Ligatures are opt-in (`font.ligatures`, off by default) and images are opt-in
   (`terminal.images`, off by default because the payload is untrusted input).
 - Image protocols cover kitty single-chunk PNG and raw frames, iTerm2

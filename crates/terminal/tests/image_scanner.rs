@@ -227,9 +227,53 @@ fn unterminated_sequence_past_the_pending_bound_is_dropped() {
     let mut passthrough = first.passthrough;
     passthrough.extend(second.passthrough);
     assert_eq!(
-        passthrough, b"after",
-        "the scanner must resync so later text is not swallowed"
+        passthrough, b"Aafter",
+        "the scanner must resync at the hold bound so later text is not swallowed; the byte past \
+         the budget is text again"
     );
+}
+
+// 7b. The same promise *inside one chunk*: what follows an abandoned sequence in
+//     the same read must not be swallowed either.
+//
+//     This is the shrunk case from the B4 property test (`scanner_properties.rs`,
+//     `an_unterminated_sequence_is_abandoned_at_the_pending_bound`). The invariant
+//     it broke: S5.3 and `docs/SECURITY.md` promise that an unterminated sequence
+//     "cannot swallow the text that follows it", but the abort dropped every
+//     remaining byte of the current chunk, so whether the text came out depended
+//     on where the read boundary fell — the desynchronisation class B12, moved to
+//     the hold bound.
+#[test]
+fn text_after_an_abandoned_sequence_in_the_same_chunk_is_not_swallowed() {
+    let mut input = Vec::with_capacity(MAX_IMAGE_BYTES + 16 * 1024);
+    input.extend_from_slice(b"\x1b_G");
+    input.extend(vec![b'A'; MAX_IMAGE_BYTES + 8 * 1024 + 1]);
+    input.extend_from_slice(b"tail");
+
+    let mut scanner = ImageScanner::new();
+    let output = scanner.scan(&input);
+
+    assert!(output.messages.is_empty(), "nothing to decode");
+    assert_eq!(output.dropped, 1, "the abandoned sequence is counted once");
+    assert_eq!(scanner.pending_bytes(), 0, "nothing stays held");
+    assert_eq!(
+        output.passthrough, b"Atail",
+        "the text after the abandoned sequence must reach the parser: the scanner pays the \
+         bounded budget and no more"
+    );
+
+    // The same stream cut at the hold bound reports the same bytes, so the visible
+    // output no longer depends on the read boundary.
+    let mut chunked = ImageScanner::new();
+    let head = chunked.scan(&input[..MAX_IMAGE_BYTES + 8 * 1024 + 3]);
+    let tail = chunked.scan(&input[MAX_IMAGE_BYTES + 8 * 1024 + 3..]);
+    let mut passthrough = head.passthrough;
+    passthrough.extend(tail.passthrough);
+    assert_eq!(
+        passthrough, output.passthrough,
+        "one chunk and two chunks must report the same bytes"
+    );
+    assert_eq!(head.dropped + tail.dropped, output.dropped);
 }
 
 // 8. The anchoring model evicts by budget and follows the grid life cycle.

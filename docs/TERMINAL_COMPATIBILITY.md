@@ -328,13 +328,42 @@ or the application.
   and a layout's third level no longer matches an `alt+1`-style binding. `crates/app/src/keys.rs`
   owns that decision (`altgr_composition`, `chord_modifiers`) and the guard that
   drops a commit repeating the text a key press just wrote
-  (`commit_repeats_key`). What remains missing:
+  (`commit_repeats_key`).
+
+  The **candidate window is positioned at the cursor cell**. `Window::set_ime_cursor_area`
+  is called with the physical rectangle of the terminal cursor cell, computed by
+  `crates/app/src/ime.rs` from the same geometry the renderer paints it with: the
+  pane rectangle without its focus border, plus the terminal padding, plus
+  `column * cell width` and `row * cell height`. That covers mosaic panes and the
+  floating terminal, a nonzero `appearance.padding_*`, a fractional cell advance
+  (the painted cell is one whole pixel wider than the advance, and the area is that
+  cell, never the glyph), and it is clamped into the pane when the cell would fall
+  past its edge — the frames between a window resize and the session's own resize.
+  It is recomputed from the events that move it (output, a key, a command, a click
+  that moves the focus, a wheel scroll, a window resize, a scale or font change, a
+  tab or pane switch, the floating terminal appearing or disappearing) and only sent
+  when the rectangle differs from the last one, so it costs the pane rectangle the
+  frame being drawn already needs and never requests a redraw of its own. Two moments
+  re-send it unchanged, because the platform has forgotten it: a newly enabled input
+  method and each preedit update.
+
+  One position is one cell off. While the cursor sits on the trailing half of a wide
+  glyph, the renderer paints the cursor on the glyph's own cell but the rectangle is
+  computed from the grid column the engine reports (read without a full snapshot), so
+  the candidate window is one cell to the right until the cursor moves off that cell.
+
+  With **no cursor on screen** — the program turned `DECTCEM` off, or the cursor row
+  is scrolled out of view — what is sent is a **zero-size rectangle at the pane's
+  inner corner**. There is no cell to align to, winit has no "clear the area" call,
+  and a zero-size rectangle is what tells an input method there is no caret: the
+  candidate window then falls back to the platform's own placement instead of
+  anchoring to a stale cell of the last composition, and the origin keeps that
+  fallback inside the terminal rather than over the tab strip.
+
+  What remains missing:
   - the **preedit** is not drawn. The text being composed (`´` waiting for a
     vowel, the pinyin buffer) is invisible until it is committed; there is no
     inline composition at the cursor and no reflected preedit anywhere else;
-  - the **candidate window is not positioned**: `Window::set_ime_cursor_area` is
-    never called, so a platform that shows candidates places them at the
-    window's default spot instead of at the terminal cursor;
   - while an **overlay** (search, settings, rename, confirmation) is open, commits
     are dropped rather than typed into the overlay, because those panels read
     their own text from key events.

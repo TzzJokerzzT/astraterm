@@ -89,16 +89,27 @@ mod tests {
     }
 
     #[test]
-    fn reported_version_is_the_package_version() {
+    fn reported_version_is_the_workspace_version() {
         // One version for the whole project: the workspace version in the root
         // Cargo.toml, which the binary inherits, so `astraterm --version` cannot
-        // drift from the packaged release.
-        assert_eq!(env!("CARGO_PKG_VERSION"), "1.1.5");
+        // drift from the packaged release. Read the declared version instead of
+        // hard-coding it, or this guard rots on every bump.
+        let workspace = include_str!("../../../Cargo.toml");
+        let declared = workspace
+            .lines()
+            .find_map(|line| line.strip_prefix("version = \""))
+            .and_then(|rest| rest.split('"').next())
+            .expect("the root Cargo.toml declares the workspace version");
+        assert_eq!(env!("CARGO_PKG_VERSION"), declared);
 
         let error = Cli::try_parse_from(["astraterm", "--version"])
             .expect_err("--version prints the version instead of parsing arguments");
         assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
-        assert_eq!(error.to_string(), "astraterm 1.1.5\n");
+        assert_eq!(
+            error.to_string(),
+            format!("astraterm {}\n", env!("CARGO_PKG_VERSION")),
+            "--version must print the version the binary was built with"
+        );
     }
 
     #[test]

@@ -27,6 +27,8 @@ use astraterm_workspace::tree::SplitId;
 use astraterm_workspace::{LayoutConfig, Pane, Tab, WindowState};
 
 use crate::chrome;
+use crate::ime::{self, CursorCell};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::window::Window;
 
 /// Height of the tab strip in cell rows.
@@ -595,6 +597,12 @@ pub struct WindowUi {
     pub session_bindings: BTreeMap<PaneId, astraterm_core::SessionId>,
     /// The floating terminal, if one was opened in this window.
     pub floating: Option<Floating>,
+    /// Last rectangle handed to the platform for the input method's candidate window.
+    ///
+    /// `None` means nothing was sent yet. Kept so the same caret is not reported again
+    /// on every keystroke and every frame of output: `set_ime_cursor_area` is a platform
+    /// call the compositor cannot make anything new of.
+    last_ime_area: Option<Rect>,
 }
 
 impl WindowUi {
@@ -631,6 +639,7 @@ impl WindowUi {
             last_key_text: None,
             session_bindings: BTreeMap::new(),
             floating: None,
+            last_ime_area: None,
         }
     }
 
@@ -839,6 +848,83 @@ impl WindowUi {
             .into_iter()
             .find(|(id, _)| *id == pane)
             .map(|(_, rect)| rect)
+    }
+
+    /// The pane's rectangle without its one-pixel focus border.
+    ///
+    /// `paint::paint_pane` shrinks a framed pane before it places a single cell, and a
+    /// pane is framed when the mosaic is split and always when it is the floating
+    /// terminal. This is that same inner rectangle, shared by everything that has to
+    /// land on the grid instead of on the frame.
+    pub fn pane_inner_rect(&self, pane: PaneId) -> Option<Rect> {
+        let rect = self.pane_rect(pane)?;
+        let bordered = match self.floating.as_ref() {
+            Some(floating) if floating.contains(pane) => {
+                pane_shows_border(true, floating.pane_count())
+            }
+            _ => self
+                .workspace
+                .active_tab()
+                .is_some_and(|tab| pane_shows_border(false, tab.pane_count())),
+        };
+        Some(if bordered { rect.shrunk(1) } else { rect })
+    }
+
+    /// Rectangle the platform should anchor the input method's candidate window to.
+    ///
+    /// `cursor` is the cursor cell of [`WindowUi::focused_pane`]'s session. With no
+    /// cursor on screen the answer is a zero-size area inside the same pane (see
+    /// [`crate::ime::no_cursor_area`]): there is no cell to follow, so the platform
+    /// places the candidate list itself, but it is still told where the terminal is.
+    pub fn ime_area(&self, cursor: Option<CursorCell>) -> Rect {
+        let padding = self.padding();
+        let Some(inner) = self
+            .focused_pane()
+            .and_then(|pane| self.pane_inner_rect(pane))
+        else {
+            return ime::no_cursor_area(self.terminal_rect(), padding);
+        };
+        ime::cursor_area(inner, padding, self.metrics, cursor)
+            .unwrap_or_else(|| ime::no_cursor_area(inner, padding))
+    }
+
+    /// Cursor cell the renderer draws for the pane that owns the keyboard.
+    ///
+    /// Read through the engine's cheap accessors instead of a snapshot: a snapshot
+    /// walks and allocates the whole visible grid, and this runs on every batch of
+    /// output as well as on every key. [`ime::cursor_cell`] owns the rule, and a test
+    /// pins it against the snapshot the renderer draws from.
+    pub fn cursor_cell(&self, sessions: &SessionManager) -> Option<CursorCell> {
+        let engine = &sessions.for_pane(self.focused_pane()?)?.engine;
+        let point = engine.cursor_point();
+        let (cols, rows) = engine.size();
+        ime::cursor_cell(
+            point.line.0,
+            point.column.0,
+            engine.display_offset(),
+            cols,
+            rows,
+            engine.modes().show_cursor,
+        )
+    }
+
+    /// Tells the platform where the candidate window should follow, when it moved.
+    ///
+    /// `force` sends the rectangle even when it did not change, for the two moments the
+    /// platform has forgotten it: a newly enabled input method and every preedit
+    /// update, which re-anchors the popup at the caret. The cost is the same pane
+    /// rectangle the frame being drawn already needs — no snapshot, no redraw request —
+    /// and the platform is only called when the rectangle actually changed.
+    pub fn sync_ime_area(&mut self, sessions: &SessionManager, force: bool) {
+        let area = self.ime_area(self.cursor_cell(sessions));
+        if !force && !ime::needs_update(self.last_ime_area, area) {
+            return;
+        }
+        self.last_ime_area = Some(area);
+        self.window.set_ime_cursor_area(
+            PhysicalPosition::new(area.x, area.y),
+            PhysicalSize::new(area.width, area.height),
+        );
     }
 
     /// Cell coordinates inside a pane for a pointer position.

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-26
+
+### Added
+
+- The input method's candidate window is positioned at the terminal cursor: the
+  painted cursor cell, in physical pixels, recomputed from the events that can
+  move it — output, keys, tab or pane switches, resize, scale and font changes,
+  scrolling, clicks, showing or hiding the floating terminal, and the window
+  regaining focus — and sent only when it changes. A hidden cursor sends a
+  zero-size area at the pane's inner corner, which is how an input method is told
+  there is no caret.
+- The image and notification scanner is now property-tested: byte-exact
+  passthrough with arbitrary chunk boundaries, and no panic or unbounded growth on
+  arbitrary, truncated and interleaved input.
+
+### Fixed
+
+- An unterminated sequence that hit the pending-byte bound swallowed the rest of
+  the current read instead of resyncing at the bound, so whether the text after an
+  abandoned sequence reached the parser depended on where the read was cut. The
+  bytes past the bound are text again, which is what already happened for every
+  later chunk. Found by the new property tests.
+- `astraterm --version` no longer has a test that hard-codes the version: it now
+  compares the binary against the workspace version, so a bump cannot leave the
+  suite red.
+
 ## [1.2.0] - 2026-11-26
 
 ### Added

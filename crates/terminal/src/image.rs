@@ -410,8 +410,15 @@ impl ImageScanner {
             if !self.esc_pending {
                 let stop = next_delimiter(&bytes[pos..], bel_terminates);
                 if stop > 0 {
-                    if !self.append_payload(&bytes[pos..pos + stop], out) {
-                        return pos + stop;
+                    let accepted = self.append_payload(&bytes[pos..pos + stop]);
+                    if accepted < stop {
+                        // Abandoned at the hold bound. The bytes that did not fit
+                        // are not payload any more: they are re-scanned from the
+                        // ground state, so the text after an unterminated
+                        // sequence still comes out (S5.3). Swallowing them until
+                        // the next chunk would make the visible output depend on
+                        // where the reads happened to be cut.
+                        return pos + accepted;
                     }
                     pos += stop;
                 }
@@ -430,8 +437,10 @@ impl ImageScanner {
                 }
                 // A stray `ESC` inside the payload is data, and does not end the
                 // sequence, so nothing after it is swallowed.
-                if !self.append_payload(&[ESC], out) {
-                    return pos;
+                if self.append_payload(&[ESC]) == 0 {
+                    // Abandoned here: `ESC` is dropped with the payload and the
+                    // byte after it is re-scanned as ground, never swallowed.
+                    return pos - 1;
                 }
                 if byte == ESC {
                     self.esc_pending = true;
@@ -447,8 +456,10 @@ impl ImageScanner {
                 self.abort_payload();
                 return pos;
             }
-            if !self.append_payload(&[byte], out) {
-                return pos;
+            if self.append_payload(&[byte]) == 0 {
+                // Same as above: the byte that overflowed the hold bound is
+                // re-scanned instead of being dropped with the sequence.
+                return pos - 1;
             }
         }
         pos
@@ -471,18 +482,20 @@ impl ImageScanner {
         self.state = State::Foreign { osc: false };
     }
 
-    /// Adds payload bytes, abandoning the sequence when the hold bound is reached.
+    /// Adds payload bytes, accepting only as many as fit under the hold bound.
     ///
-    /// Returns `false` when the sequence was abandoned, so the caller stops
-    /// treating the remaining bytes as payload.
-    fn append_payload(&mut self, bytes: &[u8], _out: &mut ScanOutput) -> bool {
+    /// Returns how many bytes were accepted. A short count means the sequence
+    /// reached [`MAX_PENDING_BYTES`]: it is abandoned and counted, and the caller
+    /// must rescan the rejected bytes from the ground state, so the text that
+    /// follows an unterminated sequence still reaches the parser (S5.3).
+    fn append_payload(&mut self, bytes: &[u8]) -> usize {
         let room = MAX_PENDING_BYTES.saturating_sub(self.payload.len());
-        if bytes.len() > room {
+        let accepted = room.min(bytes.len());
+        self.payload.extend_from_slice(&bytes[..accepted]);
+        if accepted < bytes.len() {
             self.abort_payload();
-            return false;
         }
-        self.payload.extend_from_slice(bytes);
-        true
+        accepted
     }
 
     fn abort_payload(&mut self) {
@@ -867,8 +880,9 @@ link\x1b]8;;\x1b\\\x1b]1337;SetMark\x07\x1b]52;c;YWJj\x07text";
         let mut passthrough = first.passthrough;
         passthrough.extend(second.passthrough);
         assert_eq!(
-            passthrough, b"after",
-            "the scanner must resync instead of swallowing later text"
+            passthrough, b"Aafter",
+            "the scanner must resync at the hold bound instead of swallowing what follows: the \
+             byte past the budget is the first byte of text again, not part of the sequence"
         );
     }
 }

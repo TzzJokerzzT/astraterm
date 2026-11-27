@@ -529,8 +529,11 @@ impl Application {
         }
         self.intake_images();
         if report.bytes_processed > 0 || report.exits > 0 {
-            for ui in self.windows.values() {
+            for ui in self.windows.values_mut() {
                 ui.window.request_redraw();
+                // Output is what moves the cursor, so the candidate window follows it
+                // here instead of on a poll.
+                ui.sync_ime_area(&self.sessions, false);
             }
         }
     }
@@ -950,11 +953,34 @@ impl Application {
         if resized && let Some(ui) = self.windows.get(&window_id) {
             ui.window.request_redraw();
         }
+        // Every caller got here because the rectangles the terminal is painted in
+        // changed, and the IME candidate window follows one of those cells, so it is
+        // refreshed from the same call instead of from each site.
+        self.sync_ime_area(window_id);
     }
 
     fn sync_all_sizes(&mut self) {
         for id in self.windows.keys().copied().collect::<Vec<_>>() {
             self.sync_sizes(id);
+        }
+    }
+
+    /// Pushes the rectangle the input method's candidate window follows, when it moved.
+    fn sync_ime_area(&mut self, window_id: WinitWindowId) {
+        self.update_ime_area(window_id, false);
+    }
+
+    /// Pushes it even when it did not move.
+    ///
+    /// The platform forgets the caret at the start of every input-method session, and a
+    /// preedit re-anchors the candidate window, so those two moments re-send it.
+    fn resend_ime_area(&mut self, window_id: WinitWindowId) {
+        self.update_ime_area(window_id, true);
+    }
+
+    fn update_ime_area(&mut self, window_id: WinitWindowId, force: bool) {
+        if let Some(ui) = self.windows.get_mut(&window_id) {
+            ui.sync_ime_area(&self.sessions, force);
         }
     }
 
@@ -1221,6 +1247,11 @@ impl Application {
                 });
             }
         }
+
+        // Any command can move the focus, the cursor, the split rectangles or the cell
+        // metrics the candidate window follows; doing it once here keeps every arm from
+        // having to remember it. It is a no-op when nothing moved.
+        self.sync_ime_area(window_id);
     }
 
     /// Divider the resize shortcuts act on, in the layout the keyboard drives.
@@ -2157,6 +2188,7 @@ impl Application {
             // A release only has a meaning for an application that asked for event
             // types; panels never see it and keep their own key handling.
             self.handle_key_release(window_id, event);
+            self.sync_ime_area(window_id);
             return;
         }
         let overlay = self.windows.get(&window_id).map(|ui| match ui.overlay {
@@ -2173,6 +2205,10 @@ impl Application {
             Some(4) => self.handle_rename_key(window_id, event),
             _ => self.handle_terminal_key(event_loop, window_id, event),
         }
+        // A key can move the cursor through the child's echo (which arrives as output),
+        // through a shortcut that switched pane or tab, or through a scroll; the area
+        // is re-derived here and sent only if the cell actually changed.
+        self.sync_ime_area(window_id);
     }
 
     fn handle_settings_key(&mut self, window_id: WinitWindowId, event: &winit::event::KeyEvent) {
@@ -2583,10 +2619,20 @@ impl Application {
     /// child process unchanged.
     fn handle_ime(&mut self, window_id: WinitWindowId, ime: Ime) {
         match ime {
-            Ime::Commit(text) => self.commit_composed_text(window_id, &text),
+            Ime::Commit(text) => {
+                self.commit_composed_text(window_id, &text);
+                self.sync_ime_area(window_id);
+            }
             // Preedit is not drawn: the composition is visible once committed.
-            Ime::Preedit(text, _) => tracing::trace!(preedit = %text, "ime preedit"),
-            Ime::Enabled | Ime::Disabled => {}
+            Ime::Preedit(text, _) => {
+                tracing::trace!(preedit = %text, "ime preedit");
+                // A preedit update re-anchors the candidate window at the caret, so the
+                // platform is told again even though the cell did not move.
+                self.resend_ime_area(window_id);
+            }
+            // A fresh input-method session starts with no caret at all.
+            Ime::Enabled => self.resend_ime_area(window_id),
+            Ime::Disabled => {}
         }
     }
 
@@ -2715,6 +2761,9 @@ impl Application {
         }) else {
             return;
         };
+        // A click can move the focus to another pane, mosaic or floating, and the
+        // candidate window follows the cursor of the pane that owns the keyboard.
+        self.sync_ime_area(window_id);
         let Some(modes) = self
             .sessions
             .for_pane(pane)
@@ -2968,6 +3017,9 @@ impl Application {
             session.engine.scroll_display(steps * 3);
         }
         self.with_window(window_id, |ui| ui.window.request_redraw());
+        // Scrolling the viewport moves or hides the cursor row the candidate window
+        // follows.
+        self.sync_ime_area(window_id);
     }
 
     /// Reports focus in/out when the application asked for focus reporting (1004).
@@ -3142,6 +3194,9 @@ impl ApplicationHandler<UserEvent> for Application {
                         ui.window.request_redraw();
                     });
                     self.report_focus(window_id, true);
+                    // The input method starts a new session with no caret, so the area
+                    // is sent again even though the cursor did not move.
+                    self.resend_ime_area(window_id);
                 } else {
                     self.focused_windows.remove(&window_id);
                     self.report_focus(window_id, false);

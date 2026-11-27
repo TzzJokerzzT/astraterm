@@ -6,6 +6,7 @@
 mod app;
 mod chrome;
 mod cli;
+mod ime;
 mod keys;
 mod paste;
 mod prefs;
