@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Repeatable checks for the `--version` paths and the font step of
-# scripts/setup.sh.
+# Repeatable checks for the `--version` paths and the font and toolchain steps
+# of scripts/setup.sh.
 #
 # Every case builds a throwaway git repository in `mktemp -d` with a stub
 # `Cargo.toml` and a copy of `scripts/setup.sh`, then runs that copy. Nothing is
@@ -113,8 +113,68 @@ invoke() {
         env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
             GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= \
             XDG_CONFIG_HOME="$repo/config" \
+            XDG_BIN_HOME="$repo/xdg/bin" \
+            XDG_DATA_HOME="$repo/xdg/data" \
             PATH="$repo/bin:$PATH" \
-            "$repo/scripts/setup.sh" "$@" 2>&1
+            "$repo/scripts/setup.sh" "$@" </dev/null 2>&1
+    )
+    last_code=$?
+}
+
+# hide_commands: extra command names the next invoke_without_cargo leaves out of
+# the fixture PATH, on top of cargo. Reset it to empty after that call.
+hide_commands=""
+
+# build_minbin <repo> <hide>: prints a directory of symlinks to every executable
+# this machine resolves except `cargo` and <hide>. Dropping whole PATH entries
+# would not do: cargo lives in /usr/bin here, next to bash and git.
+build_minbin() {
+    local repo=$1 hide=$2 minbin dir f name
+    local -a entries=()
+    minbin=$repo/minbin${hide:+-no-$hide}
+    mkdir -p "$minbin"
+    assert_inside_tmp "$minbin"
+    IFS=: read -r -a entries <<<"$PATH"
+    for dir in "${entries[@]}"; do
+        [ -d "$dir" ] || continue
+        for f in "$dir"/*; do
+            # An unmatched glob stays literal; a dangling symlink still owns its name.
+            [ -e "$f" ] || [ -L "$f" ] || continue
+            name=${f##*/}
+            if [ "$name" = cargo ] || { [ -n "$hide" ] && [ "$name" = "$hide" ]; }; then
+                continue
+            fi
+            if [ -e "$minbin/$name" ] || [ -L "$minbin/$name" ]; then
+                continue
+            fi
+            ln -s "$f" "$minbin/$name"
+        done
+    done
+    printf '%s' "$minbin"
+}
+
+# invoke_without_cargo <repo> <setup-args>...: same as invoke, on a PATH that
+# resolves every tool the machine has except `cargo` (and $hide_commands), so the
+# copy runs as on a machine with no toolchain. HOME points into the fixture and
+# stdin is /dev/null: an accepted offer installs into the fixture instead of the
+# real ~/.cargo, and a prompt can never block the suite — which is what makes the
+# decline case deterministic even when the suite is started from a terminal.
+invoke_without_cargo() {
+    local repo=$1 minbin
+    shift
+    mkdir -p "$repo/home"
+    assert_inside_tmp "$repo/home"
+    minbin=$(build_minbin "$repo" "$hide_commands")
+    last_output=$(
+        cd "$repo" || exit 1
+        env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+            GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= \
+            HOME="$repo/home" \
+            XDG_CONFIG_HOME="$repo/config" \
+            XDG_BIN_HOME="$repo/xdg/bin" \
+            XDG_DATA_HOME="$repo/xdg/data" \
+            PATH="$repo/bin:$minbin" \
+            "$repo/scripts/setup.sh" "$@" </dev/null 2>&1
     )
     last_code=$?
 }
@@ -178,6 +238,33 @@ install_stub() {
         printf 'exit 0\n'
     } >"$repo/bin/pacman"
     chmod +x "$repo/bin/sudo" "$repo/bin/pacman"
+}
+
+# rustup_stub <repo> <mode>: a `curl` that never reaches the network. `ok`
+# leaves the cargo the real installer would have produced in the fixture HOME,
+# `fail` exits like a refused download, `empty` succeeds without installing
+# anything — the case where rustup claims success and changes nothing.
+rustup_stub() {
+    local repo=$1 mode=$2
+    mkdir -p "$repo/bin"
+    assert_inside_tmp "$repo/bin"
+    case $mode in
+    ok)
+        cat >"$repo/bin/curl" <<'STUB'
+#!/bin/sh
+mkdir -p "$HOME/.cargo/bin"
+cat >"$HOME/.cargo/bin/cargo" <<'CARGO'
+#!/bin/sh
+echo "cargo 1.90.0 (fake 2025-01-01)"
+CARGO
+chmod +x "$HOME/.cargo/bin/cargo"
+exit 0
+STUB
+        ;;
+    fail) printf '#!/bin/sh\nexit 7\n' >"$repo/bin/curl" ;;
+    empty) printf '#!/bin/sh\nexit 0\n' >"$repo/bin/curl" ;;
+    esac
+    chmod +x "$repo/bin/curl"
 }
 
 # expect <case-name> <expected-code> [pattern]...
@@ -476,6 +563,119 @@ main() {
     invoke "$repo" --yes --no-build
     expect "--yes installs the font package without pacman prompting" 0 \
         "(stub sudo) pacman -S --needed --noconfirm ttf-jetbrains-mono-nerd"
+
+    # 18. A machine without cargo is not a dead end: the toolchain step offers the
+    #     rustup installation, and a dry run prints the plan without fetching
+    #     anything, so no case in this file touches the network.
+    repo=$(make_repo toolchain-missing-dry-run)
+    font_stub "$repo" 'JetBrainsMono Nerd Font'
+    invoke_without_cargo "$repo" --dry-run --no-build
+    expect "missing toolchain: the rustup offer is planned" 3 \
+        "cargo was not found" \
+        "would ask: install the Rust toolchain with rustup?" \
+        "would run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs" \
+        "!running: curl"
+
+    # 19. Declining it is not a silent success: stdin is /dev/null here, which
+    #     answers no, and the script says what to do and exits 3.
+    invoke_without_cargo "$repo" --no-build
+    expect "missing toolchain: declining still exits 3" 3 \
+        "stdin is not a terminal: assuming no" \
+        "skipped the toolchain installation" \
+        "the Rust toolchain is still missing" \
+        "!running: curl"
+
+    # 20. An accepted install: the stub leaves what rustup would have installed,
+    #     and the very same run has to see it — otherwise the build would run
+    #     without a toolchain.
+    repo=$(make_repo toolchain-install)
+    font_stub "$repo" 'JetBrainsMono Nerd Font'
+    noop_stub "$repo"
+    rustup_stub "$repo" ok
+    invoke_without_cargo "$repo" --yes --no-build
+    expect "missing toolchain: an accepted install serves the same run" 0 \
+        "ok: cargo 1.90.0 installed" \
+        "this fetches the rustup installer and puts the toolchain in ~/.cargo" \
+        "skipped (--no-build)"
+
+    # 21. A failing installer is reported as a failure, never as an install.
+    repo=$(make_repo toolchain-install-fails)
+    font_stub "$repo" 'JetBrainsMono Nerd Font'
+    noop_stub "$repo"
+    rustup_stub "$repo" fail
+    invoke_without_cargo "$repo" --yes --no-build
+    expect "missing toolchain: a failed install exits 3" 3 \
+        "the rustup installer failed" \
+        "!installed"
+
+    # 22. rustup succeeded and left nothing on PATH: a failure with its own
+    #     message, and no crash on the directory that was never created.
+    repo=$(make_repo toolchain-install-empty)
+    font_stub "$repo" 'JetBrainsMono Nerd Font'
+    noop_stub "$repo"
+    rustup_stub "$repo" empty
+    invoke_without_cargo "$repo" --yes --no-build
+    expect "missing toolchain: an empty install is reported" 3 \
+        "rustup finished but cargo is still not on PATH" \
+        "the Rust toolchain is still missing"
+
+    # 23. No curl: the offer cannot be honoured, and it says so instead of
+    #     offering a download it could not perform.
+    repo=$(make_repo toolchain-no-curl)
+    font_stub "$repo" 'JetBrainsMono Nerd Font'
+    hide_commands=curl
+    invoke_without_cargo "$repo" --dry-run --no-build
+    hide_commands=""
+    expect "missing toolchain: without curl the offer explains itself" 3 \
+        "curl is not installed" \
+        "!would ask: install the Rust toolchain"
+
+    # 24. The point of the script: after one run the terminal is usable from PATH
+    #     and from the application menu. The fixture carries the release binary the
+    #     build would have produced, and the XDG directories the install writes to
+    #     are the fixture's own, never the real ~/.local.
+    repo=$(make_repo install-default)
+    font_stub "$repo" 'JetBrainsMono Nerd Font'
+    noop_stub "$repo"
+    mkdir -p "$repo/target/release" "$repo/packaging" "$repo/assets/icons"
+    printf '#!/bin/sh\nexit 0\n' >"$repo/target/release/astraterm"
+    chmod +x "$repo/target/release/astraterm"
+    cp -r "$REPO_ROOT/packaging/." "$repo/packaging/"
+    cp -r "$REPO_ROOT/assets/icons/hicolor" "$repo/assets/icons/"
+    invoke "$repo" --no-build
+    expect "the default run installs for the user" 0 \
+        "installed $repo/xdg/bin/astraterm" \
+        "installed $repo/xdg/data/applications/astraterm.desktop" \
+        "installed $repo/xdg/data/icons/hicolor/128x128/apps/astraterm.png" \
+        "it now appears in the application menu" \
+        "is installed: run" \
+        "pick \"AstraTerm\" from the application menu"
+
+    # 25. --no-install leaves the build in the tree and touches no XDG directory.
+    repo=$(make_repo install-skipped)
+    font_stub "$repo" 'JetBrainsMono Nerd Font'
+    noop_stub "$repo"
+    invoke "$repo" --no-build --no-install
+    expect "--no-install leaves the tree alone" 0 \
+        "not installed (--no-install)" \
+        "!it now appears in the application menu"
+    expect_no_file "--no-install writes no binary" "$repo/xdg/bin/astraterm"
+
+    # 26. A failing installer is a failure: the script stops with the installer's
+    #     own status instead of falling through to the closing summary, which would
+    #     report a success that never happened.
+    repo=$(make_repo install-fails)
+    font_stub "$repo" 'JetBrainsMono Nerd Font'
+    noop_stub "$repo"
+    mkdir -p "$repo/target/release" "$repo/packaging/linux"
+    printf '#!/bin/sh\nexit 0\n' >"$repo/target/release/astraterm"
+    chmod +x "$repo/target/release/astraterm"
+    printf '#!/bin/sh\nexit 9\n' >"$repo/packaging/linux/install.sh"
+    invoke "$repo" --no-build
+    expect "a failing installer stops the script" 9 \
+        "running: sh $repo/packaging/linux/install.sh" \
+        "!nothing was installed" \
+        "!==> Done"
 
     printf '\n%d checks: %d passed, %d failed\n' "$total" "$passed" "$failed"
     if [ "$failed" -ne 0 ]; then

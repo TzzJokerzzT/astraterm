@@ -100,11 +100,13 @@ through another package (Omarchy's `ttf-jetbrains-mono-nerd-basic` provides it
 and conflicts with it) out of a `pacman` conflict. Declining that offer makes the
 script detect a family the machine already has and create
 `~/.config/astraterm/config.toml` with it. Nothing is downloaded from the
-network, and the binary is built from the tree:
+network apart from the `rustup` installer, which is fetched only when you accept
+the toolchain offer that appears when `cargo` is missing, and the binary is built
+from the tree:
 
 ```sh
-./scripts/setup.sh            # asks before installing packages, then builds
-./scripts/setup.sh --install  # … and installs it for the current user
+./scripts/setup.sh               # asks before installing packages, builds, installs
+./scripts/setup.sh --no-install  # … builds only, leaving target/release/astraterm
 ```
 
 [docs/INSTALL.md](docs/INSTALL.md) documents the requirements per distribution,
@@ -309,7 +311,7 @@ To build a tagged release instead of the working tree, `scripts/setup.sh`
 verifies the tag and leaves your checkout alone:
 
 ```sh
-./scripts/setup.sh --version v1.3.0 --install
+./scripts/setup.sh --version v1.3.0
 ```
 
 It refuses unless `HEAD` is exactly that tag and the working tree is clean, never

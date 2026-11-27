@@ -5,8 +5,10 @@
 #
 #   1. detects the package manager (pacman, apt, dnf) and either installs or
 #      prints the exact dependency set for that distribution;
-#   2. checks the Rust toolchain (1.85+, edition 2024) and refuses to continue
-#      instead of downloading a toolchain behind your back;
+#   2. checks the Rust toolchain (1.85+, edition 2024); when cargo is missing it
+#      offers the rustup installation instead of installing one behind your
+#      back. That offer is the only download this script makes besides an
+#      explicitly accepted `git fetch --tags`;
 #   3. checks the font: the default family (JetBrainsMono Nerd Font) is asked of
 #      fontconfig, never assumed from the distribution. When it is missing the
 #      script offers the distribution's own font package, and when that offer is
@@ -19,27 +21,33 @@
 #   4. checks the optional desktop notifications (`notify-send`); the clipboard
 #      is linked into the binary;
 #   5. builds with `cargo build --release --locked`;
-#   6. with `--install`, runs `packaging/linux/install.sh` to put the binary,
-#      the desktop entry and the icons in your XDG directories.
+#   6. installs it for the current user by default, through
+#      `packaging/linux/install.sh`: the binary in your XDG bin directory and the
+#      desktop entry plus every icon size in your XDG data directory, so the
+#      terminal is ready to use both from PATH and from the application menu.
+#      `--no-install` skips this step.
 #
 # It never overwrites an existing ~/.config/astraterm/config.toml (it only
 # offers to create one when there is none), never runs the build as root, never
-# installs a Rust toolchain on its own, never adds a third-party repository and
-# never downloads files from the network. Every step is a check plus an
+# installs a Rust toolchain unless that offer was accepted, never adds a
+# third-party repository and never downloads anything except the rustup
+# installer, each after an explicit yes. Every step is a check plus an
 # idempotent command, so running it again on a prepared machine changes nothing.
 #
 # Usage:
-#   ./scripts/setup.sh [--dry-run] [--yes] [--install] [--no-build] [--version <tag>]
+#   ./scripts/setup.sh [--dry-run] [--yes] [--no-install] [--no-build] [--version <tag>]
 #
 #   --dry-run        print every command that would change the system or the
 #                    tree and execute none of them. Read-only probes (`command
 #                    -v`, `cargo --version`, `fc-list`) still run so that the
 #                    plan matches this machine; they change nothing.
-#   --yes            do not ask for confirmation before installing packages
-#                    (intended for scripted setups; still asks sudo for the
-#                    password)
-#   --install        after a successful build, install the binary for the
-#                    current user with packaging/linux/install.sh
+#   --yes            do not ask for confirmation before installing packages or
+#                    the Rust toolchain, and accept the font offers (intended
+#                    for scripted setups; still asks sudo for the password)
+#   --install        still accepted, and a no-op: installing is what the script
+#                    does by default
+#   --no-install     do not install the binary, the desktop entry or the icons;
+#                    leave the build in target/release
 #   --no-build       skip `cargo build --release --locked`
 #   --version <tag>  build a specific release (`v1.0.0` or `1.0.0`). The script
 #                    verifies that HEAD is exactly that tag and that the working
@@ -50,7 +58,8 @@
 #   0  success, nothing left to do (declining the package installation is not
 #      an error: the step is skipped and the build still runs)
 #   2  usage error or wrong user (root)
-#   3  Rust toolchain missing or older than 1.85
+#   3  the Rust toolchain is missing (installation declined or failed) or older
+#      than 1.85
 #   4  the requested `--version` tag is missing, HEAD is not at that tag, or the
 #      working tree has changes
 #   other  the exit status of the command that failed (cargo, pacman, ...)
@@ -60,6 +69,8 @@
 set -euo pipefail
 
 readonly MIN_RUST_MINOR=85
+# The official rustup installer; the only download besides `git fetch --tags`.
+readonly RUSTUP_INSTALLER_URL="https://sh.rustup.rs"
 readonly DEFAULT_FONT_FAMILY="JetBrainsMono Nerd Font"
 # The package that carries the default family in the distributions that package
 # it at all. Only ever installed after an explicit offer: see
@@ -73,7 +84,12 @@ readonly EXIT_VERSION=4
 
 dry_run=0
 assume_yes=0
-install_binary=0
+# The point of the script is a usable terminal, so the install runs by default.
+install_binary=1
+# Set by install_for_user once the files really are in the XDG directories, so the
+# closing summary can tell an install from a skipped one. A failed installer never
+# reaches it: the failure propagates and stops the script.
+install_done=0
 do_build=1
 # Canonical `vX.Y.Z` tag requested with --version; empty means "build the tree".
 requested_version=""
@@ -87,18 +103,20 @@ usage() {
 setup.sh - build AstraTerm from a fresh clone and install its dependencies
 
 Usage:
-  ./scripts/setup.sh [--dry-run] [--yes] [--install] [--no-build] [--version <tag>]
+  ./scripts/setup.sh [--dry-run] [--yes] [--no-install] [--no-build] [--version <tag>]
 
 Options:
   --dry-run        print every command that would change the system or the tree and
                    execute none of them. Read-only probes (command -v, cargo
                    --version, fc-list, pacman -T) still run so the plan matches
                    this machine.
-  --yes, -y        do not ask for confirmation before installing packages, and
-                   accept the font offer and the fallback configuration offer
-                   without prompting
-  --install        after a successful build, install the binary for the current user
-                   with packaging/linux/install.sh
+  --yes, -y        do not ask for confirmation before installing packages or the
+                   Rust toolchain with rustup, and accept the font offer and the
+                   fallback configuration offer without prompting
+  --install        do nothing extra: installing is the default. Kept so existing
+                   invocations keep working
+  --no-install     do not install the binary, the desktop entry and the icons; leave
+                   the build in target/release
   --no-build       skip the release build
   --version <tag>  build a specific release (v1.0.0, or 1.0.0). The tag must exist,
                    HEAD must be exactly at it and the working tree must be clean;
@@ -106,11 +124,12 @@ Options:
                    switch itself.
   -h, --help       show this help
 
-Exit codes: 0 success, 2 usage error or root, 3 Rust toolchain missing or
-            older than 1.85, 4 the --version tag is missing, HEAD is not at it,
-            or the working tree has changes; a failing command exits with its
-            own status. Declining the package installation, the font offer or the
-            fallback configuration is not a failure.
+Exit codes: 0 success, 2 usage error or root, 3 the Rust toolchain is missing
+            (declined or failed) or older than 1.85, 4 the --version tag is
+            missing, HEAD is not at it, or the working tree has changes;
+            a failing command exits with its own status. Declining the package
+            installation, the font offer or the fallback configuration is not a
+            failure.
 
 Documentation: docs/INSTALL.md
 EOF
@@ -242,6 +261,7 @@ parse_args() {
         --dry-run) dry_run=1 ;;
         --yes | -y) assume_yes=1 ;;
         --install) install_binary=1 ;;
+        --no-install) install_binary=0 ;;
         --no-build) do_build=0 ;;
         --version)
             shift
@@ -522,16 +542,77 @@ install_system_packages() {
     run "$sudo_cmd" "${install_cmd[@]}" "${packages[@]}"
 }
 
+# Runs the official rustup installer. `-y` answers rustup's own prompts because
+# this script already asked, and it accepts rustup's default of appending
+# ~/.cargo/bin to the shell profile: that is exactly what running the pipeline
+# printed in the instructions by hand does, so a later shell finds cargo too.
+install_rustup() {
+    curl --proto '=https' --tlsv1.2 -sSf "$RUSTUP_INSTALLER_URL" | sh -s -- -y
+}
+
+offer_rust_install() {
+    # Offers the toolchain installation and returns 0 only when cargo runs
+    # afterwards, so the caller can keep going instead of assuming success.
+    if ! command -v curl >/dev/null 2>&1; then
+        warn "curl is not installed, so the rustup installer cannot be fetched."
+        info "install curl with your package manager (it is in the list above), or"
+        info "install Rust yourself and re-run this script:"
+        info "  curl --proto '=https' --tlsv1.2 -sSf $RUSTUP_INSTALLER_URL | sh"
+        return 1
+    fi
+
+    # Spelled out here rather than left to confirm(): in a dry run the answer is
+    # never a real yes, so the plan is printed and nothing is fetched.
+    if [ "$dry_run" -eq 1 ]; then
+        printf '  would ask: install the Rust toolchain with rustup? [y/N]\n'
+        printf '  would run: curl --proto '\''=https'\'' --tlsv1.2 -sSf %s | sh -s -- -y\n' \
+            "$RUSTUP_INSTALLER_URL"
+        printf '  would run: export PATH="$HOME/.cargo/bin:$PATH"\n'
+        info "this is the only download the script makes; a real run asks first"
+        return 1
+    fi
+
+    if ! confirm "install the Rust toolchain with rustup? it downloads from $RUSTUP_INSTALLER_URL"; then
+        info "skipped the toolchain installation"
+        return 1
+    fi
+
+    info "this fetches the rustup installer and puts the toolchain in ~/.cargo"
+    if ! install_rustup; then
+        warn "the rustup installer failed (see the output above)."
+        return 1
+    fi
+
+    # rustup writes to ~/.cargo/bin and only edits the shell profile for new
+    # shells, so this run has to be told before the version check and the build
+    # can see it.
+    if [ -d "$HOME/.cargo/bin" ]; then
+        PATH="$HOME/.cargo/bin:$PATH"
+        export PATH
+    fi
+
+    if ! command -v cargo >/dev/null 2>&1; then
+        warn "rustup finished but cargo is still not on PATH."
+        info "open a new shell and re-run this script."
+        return 1
+    fi
+    ok "cargo $(cargo --version | awk '{print $2}') installed"
+    return 0
+}
+
 check_toolchain() {
     step "Rust toolchain"
 
     if ! command -v cargo >/dev/null 2>&1; then
-        fail "$EXIT_TOOLCHAIN" \
-            "cargo was not found." \
-            "AstraTerm needs Rust 1.85+ (edition 2024). Install it yourself with:" \
-            "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" \
-            "or your distribution's rust package, then open a new shell and re-run" \
-            "this script. This script never installs a toolchain on its own."
+        warn "cargo was not found."
+        info "AstraTerm needs Rust 1.85+ (edition 2024)."
+        if ! offer_rust_install; then
+            fail "$EXIT_TOOLCHAIN" \
+                "the Rust toolchain is still missing, so nothing can be built." \
+                "Install Rust 1.85+ yourself and re-run this script:" \
+                "  curl --proto '=https' --tlsv1.2 -sSf $RUSTUP_INSTALLER_URL | sh" \
+                "or install your distribution's rust package, then open a new shell."
+        fi
     fi
 
     local version major minor
@@ -550,7 +631,7 @@ check_toolchain() {
             "cargo $version is too old: AstraTerm needs Rust 1.85+ (edition 2024)." \
             "Update it yourself with:" \
             "  rustup update stable" \
-            "This script never downloads a toolchain on its own."
+            "This script does not update an existing toolchain for you."
     fi
     ok "cargo $version"
 
@@ -838,9 +919,28 @@ build_binary() {
 
 install_for_user() {
     step "Install for the current user"
-    info "packaging/linux/install.sh writes to your XDG bin/data directories and"
-    info "never touches ~/.config/astraterm."
+    # The build is the only step that can be skipped, so a missing binary is the one
+    # case where the install has nothing to do. It is reported as the skip it is —
+    # in a dry run too, so the printed plan never promises an install that a real
+    # run would not perform — instead of letting the installer fail on a missing
+    # file. It stays a skip, not a failure: the build step already reported that.
+    if [ ! -x "$root_dir/target/release/astraterm" ]; then
+        if [ "$dry_run" -eq 1 ]; then
+            info "would skip the install: target/release/astraterm does not exist yet"
+        else
+            warn "target/release/astraterm is missing, so nothing was installed."
+            info "drop --no-build (or build it) and re-run this script."
+        fi
+        return 0
+    fi
+    info "packaging/linux/install.sh writes the binary, the desktop entry and every"
+    info "icon size to your XDG directories; it needs no root and never touches"
+    info "~/.config/astraterm."
+    # Called directly, never behind an `if`: a failing installer has to stop the
+    # script with its own status. Read as a condition it would look like "nothing to
+    # do", and the closing summary would report success for a failed install.
     run sh "$root_dir/packaging/linux/install.sh"
+    install_done=1
 }
 
 main() {
@@ -896,16 +996,16 @@ main() {
     step "Done"
     if [ "$dry_run" -eq 1 ]; then
         info "dry run finished: no package was installed, nothing was built or copied"
-    elif [ "$do_build" -eq 1 ] && [ "$install_binary" -eq 1 ]; then
+    elif [ "$install_done" -eq 1 ]; then
         if [ -n "$requested_version" ]; then
-            info "astraterm $requested_version is installed; run \`astraterm\` or pick it from the application menu"
+            info "astraterm $requested_version is installed: run \`astraterm\` or pick \"AstraTerm\" from the application menu"
         else
-            info "astraterm is installed; run \`astraterm\` or pick it from the application menu"
+            info "astraterm is installed: run \`astraterm\` or pick \"AstraTerm\" from the application menu"
         fi
-    elif [ "$do_build" -eq 1 ]; then
-        info "run ./target/release/astraterm, or re-run this script with --install"
+    elif [ "$install_binary" -eq 1 ]; then
+        info "nothing was installed; run this script without --no-build to build it first"
     else
-        info "nothing was built; re-run without --no-build to build the binary"
+        info "not installed (--no-install): run ./target/release/astraterm, or re-run without --no-install"
     fi
     return "$EXIT_OK"
 }

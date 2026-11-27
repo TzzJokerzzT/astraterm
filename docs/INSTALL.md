@@ -6,8 +6,8 @@ build. Both end with the same binary, `target/release/astraterm`.
 ```sh
 git clone <repository> astraterm
 cd astraterm
-./scripts/setup.sh              # asks before installing packages, then builds
-./scripts/setup.sh --install    # … and puts the binary on your PATH
+./scripts/setup.sh              # asks before installing packages, builds, installs
+./scripts/setup.sh --no-install # … builds only, leaving target/release/astraterm
 ```
 
 ## What `scripts/setup.sh` does
@@ -22,11 +22,13 @@ In order, on every run:
    Debian/Ubuntu it runs `apt-get update` right before the install, because apt
    needs current lists to resolve the packages.
 2. **Rust toolchain.** Requires `cargo` and reports the toolchain version.
-   AstraTerm needs **Rust 1.85+** (edition 2024). If cargo is missing or older,
-   the script prints the `rustup` instructions and exits with code `3`; it never
-   downloads or installs a toolchain on its own. It also checks that `cc` and
-   `pkg-config` are present, because crates with C dependencies (`fontconfig`,
-   `freetype`, `wayland`) need them.
+   AstraTerm needs **Rust 1.85+** (edition 2024). When `cargo` is missing it
+   offers the `rustup` installation and asks first: that installer is the only
+   download the script makes, and declining it exits with code `3` without
+   installing anything. When `cargo` is there but older, it prints the
+   `rustup update stable` instruction and exits with code `3`. It also checks
+   that `cc` and `pkg-config` are present, because crates with C dependencies
+   (`fontconfig`, `freetype`, `wayland`) need them.
 3. **Font.** Asks fontconfig for the default family `JetBrainsMono Nerd Font`
    instead of assuming the distribution provides it, and only when it is
    genuinely missing offers to install the distribution's font package. If you
@@ -39,8 +41,13 @@ In order, on every run:
    one is a warning, not a failure. Clipboard copy and paste need no helper
    program.
 5. **Build.** Runs `cargo build --release --locked` from the repository root.
-6. **Install (optional).** With `--install`, runs
-   [packaging/linux/install.sh](#installing-for-the-current-user).
+6. **Install.** Runs
+   [packaging/linux/install.sh](#installing-for-the-current-user), which puts the
+   binary on your `PATH`, the desktop entry in your application menu and the icon
+   at every shipped size. This is the step that makes the terminal usable right
+   after the script finishes; `--no-install` skips it and leaves the build in
+   `target/release`. With `--no-build` there is nothing to install unless an
+   earlier build is still there, and the script says so instead of failing.
 
 With `--version <tag>` a version check runs before step 1 and stops the script
 if the checkout is not at that release; see
@@ -50,10 +57,11 @@ if the checkout is not at that release; see
 
 | Flag | Effect |
 |---|---|
-| *(none)* | Check, ask before installing packages, build |
+| *(none)* | Check, ask before installing packages, build, install for the current user |
 | `--dry-run` | Print every command that would change the system or the tree and execute none of them |
-| `--yes`, `-y` | Do not ask for confirmation before installing packages, and accept the font offer and the fallback configuration offer without prompting (`sudo` still asks for your password) |
-| `--install` | After a successful build, install the binary, desktop entry and icons for the current user |
+| `--yes`, `-y` | Do not ask for confirmation before installing packages or the Rust toolchain, and accept the font offer and the fallback configuration offer without prompting (`sudo` still asks for your password) |
+| `--no-install` | Skip the install: leave the binary in `target/release` instead of writing it, the desktop entry and the icons into your XDG directories |
+| `--install` | Accepted and a no-op: installing is what the script does by default |
 | `--no-build` | Skip `cargo build --release --locked` |
 | `--version <tag>` | Build a specific release (`v1.0.0`, or `1.0.0`). The tag must exist, `HEAD` must be exactly at it and the working tree must be clean; the script stops with code `4` otherwise and never changes your checkout |
 | `--help` | Show the help text |
@@ -108,14 +116,14 @@ a side effect of an installer. What it does instead:
    at another commit is reported as "not at that version", not as "the tag is
    here with changes". If it fails the script exits with code `4` and lists the
    offending paths.
-5. Only then continues with the normal flow (checks, build, `--install`).
+5. Only then continues with the normal flow (checks, build, install).
 
 The intended flow, with the checkout step owned by you:
 
 ```sh
 cd astraterm
 git checkout v1.0.0
-./scripts/setup.sh --version v1.0.0 --install
+./scripts/setup.sh --version v1.0.0
 ```
 
 Preview it first with `--dry-run --version v1.0.0`, which uses no network.
@@ -126,7 +134,7 @@ Preview it first with `--dry-run --version v1.0.0`, which uses no network.
 |---|---|
 | `0` | Success; nothing left to do. Declining the package installation is not a failure: the step is skipped and the build still runs |
 | `2` | Usage error, unknown flag, `--version` without a value, or the script was started as root |
-| `3` | Rust toolchain missing, or older than 1.85 |
+| `3` | Rust toolchain missing (the installation was declined or failed), or older than 1.85 |
 | `4` | The `--version` tag does not exist, the checkout is not a git checkout, `HEAD` is not at that tag, or the working tree has changes |
 | other | The exit status of the command that failed (`cargo`, `pacman`, `apt-get`, `dnf`) |
 
@@ -135,7 +143,8 @@ The script refuses to run as root: compile as your own user, and let it ask
 `~/.config/astraterm/config.toml` — it only offers to create one when there is
 none — and never writes to the themes directory, never enables third-party
 repositories (such as the Nerd Fonts COPR), and never installs anything from the
-network apart from distribution packages.
+network apart from distribution packages and the rustup installer it was
+accepted to fetch.
 
 ## Requirements
 
@@ -237,6 +246,10 @@ information; expect a first build of several minutes.
 
 ## Installing for the current user
 
+`./scripts/setup.sh` runs this after the build, so a single run leaves the
+terminal ready to use; `--no-install` skips it. The installer can also be run on
+its own, against a build that already exists:
+
 ```sh
 cargo build --release --locked
 sh packaging/linux/install.sh
@@ -250,7 +263,7 @@ in every shipped size to
 refreshes the desktop and icon caches. No root, no configuration changes.
 Remove it again with `sh packaging/linux/uninstall.sh`.
 
-`./scripts/setup.sh --install` runs exactly this script after the build.
+`./scripts/setup.sh` runs exactly this script after the build.
 
 ## Arch package
 
@@ -268,7 +281,8 @@ in the real checksums before publishing a package.
 
 | Symptom | Cause and fix |
 |---|---|
-| `error: cargo was not found` / `cargo 1.8x is too old` | Install Rust 1.85+ with rustup (`rustup update stable`), open a new shell, re-run |
+| `error: the Rust toolchain is still missing` | The rustup offer was declined, `curl` is missing, or the installer failed. Install Rust 1.85+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh`), open a new shell, re-run |
+| `error: cargo 1.8x is too old` | `rustup update stable`, open a new shell, re-run |
 | `error: do not run this script as root` | Run it as your user; it calls `sudo` itself for package installation |
 | Build fails in `fontconfig-sys` / `freetype-sys` | `pkg-config` or the `-dev` packages are missing |
 | Build fails in `wayland-sys` / `xkbcommon` | Install the Wayland and libxkbcommon development packages |

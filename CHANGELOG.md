@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`scripts/setup.sh` installs the terminal by default.** One run now builds and
+  then installs for the current user through `packaging/linux/install.sh`: the
+  binary in `$XDG_BIN_HOME` (`~/.local/bin`), the desktop entry in
+  `$XDG_DATA_HOME/applications` and the icon at every shipped size in
+  `$XDG_DATA_HOME/icons/hicolor`, followed by the desktop and icon cache refresh
+  the installer already did. The point is that the script leaves an AstraTerm
+  ready from the `PATH` and from the application menu instead of a binary buried
+  in `target/release`. `--no-install` restores the old behavior and `--install`
+  is still accepted as a no-op. With `--no-build` and no earlier build there is
+  nothing to install, and the script says so instead of letting the installer
+  fail on a missing file.
+- **`scripts/setup.sh` offers to install the Rust toolchain instead of giving up.**
+  When `cargo` is not on `PATH` the script now asks whether to install it with
+  `rustup`, which is the only download it makes besides an accepted
+  `git fetch --tags`. It honours `--dry-run` (prints the offer and the pipeline,
+  executes neither) and `--yes` (accepts without prompting), answers no when
+  stdin is not a terminal, and still exits with code `3` when the installation is
+  declined or fails. After a successful install it prepends `~/.cargo/bin` to
+  `PATH`, so the version check and the build in the same run see the new
+  toolchain. An existing but older toolchain is unchanged: still
+  `rustup update stable` and exit code `3`.
 - **The font step in `scripts/setup.sh` is interactive.** When `JetBrainsMono Nerd
   Font` is not visible to fontconfig the script offers the distribution's font
   package; declining it makes the script detect a family the machine already has
