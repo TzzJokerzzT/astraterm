@@ -4,6 +4,8 @@
 //! once per frame, and they carry the set of damaged rows so the renderer can
 //! rebuild just the text buffers that changed.
 
+use std::sync::Arc;
+
 /// Cell colour, resolved by the renderer against the active theme.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotColor {
@@ -32,6 +34,11 @@ pub struct CellFlags {
 /// but `zerowidth` and `hyperlink` is a scalar, and both are `None` for almost
 /// every cell: `zerowidth` only for the handful that carry a grapheme
 /// continuation, `hyperlink` only for the ones inside an `OSC 8` span.
+///
+/// S8/B21: the `OSC 8` destination is not stored per cell. Every cell of one run
+/// holds a clone of the same [`Arc`], so a screen linked to a long URI costs the
+/// URI once per run instead of once per cell, and cloning a snapshot for another
+/// owner is a refcount bump rather than a deep copy of the text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CellSnapshot {
     pub ch: char,
@@ -51,8 +58,9 @@ pub struct CellSnapshot {
     ///
     /// The destination is untrusted program input and is not part of the text:
     /// the click path screens it with the opener's scheme allow-list before
-    /// anything is launched, and nothing is ever opened without a click.
-    pub hyperlink: Option<Box<str>>,
+    /// anything is launched, and nothing is ever opened without a click. The
+    /// cells of one linked run share the same [`Arc`] (see [`Self::hyperlink`]).
+    pub hyperlink: Option<Arc<str>>,
 }
 
 impl Default for CellSnapshot {
@@ -149,6 +157,50 @@ pub struct SelectionSpan {
     pub is_block: bool,
 }
 
+/// Which boundary of a shell's own output an `OSC 133` mark reports.
+///
+/// A shell with shell integration enabled brackets its output so the terminal can
+/// tell a prompt from the typed command from the command's output:
+///
+/// ```text
+/// OSC 133;A   prompt start
+/// $ echo hi
+/// OSC 133;B   prompt end: the user's input starts here
+/// echo hi
+/// OSC 133;C   the command started running
+/// hi
+/// OSC 133;D;0 the command finished, with its exit code
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SemanticMarkKind {
+    /// `A`: the prompt starts on this row.
+    PromptStart,
+    /// `B`: the prompt ends and the command input starts.
+    PromptEnd,
+    /// `C`: the command started running.
+    CommandStart,
+    /// `D`: the command finished; the mark may carry its exit code.
+    CommandFinished,
+}
+
+/// One `OSC 133` mark, recorded against the buffer row it arrived on.
+///
+/// The row is a *buffer* coordinate, exactly like [`SelectionSpan`]: scrolling
+/// the view does not change it, and `line + Snapshot::display_offset` is the row
+/// on screen it belongs to. What happens to it afterwards is the engine's
+/// decision: it follows the content while the buffer scrolls, it is dropped when
+/// the scrollback trims the row (or when the buffer moves further than the engine
+/// can measure, so the row can no longer be trusted), and a resize, which reflows
+/// the buffer through the core, clears it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SemanticMark {
+    pub kind: SemanticMarkKind,
+    /// Buffer line the mark arrived on, oldest first.
+    pub line: i32,
+    /// Exit code the shell reported with `D`, when it sent a readable one.
+    pub exit_code: Option<i32>,
+}
+
 /// Kitty keyboard protocol flags, as requested by the running application.
 ///
 /// Every flag is off by default: an application that never sends `CSI > u` keeps
@@ -217,6 +269,12 @@ pub struct Snapshot {
     pub damaged_rows: Vec<usize>,
     /// Current selection, in buffer coordinates.
     pub selection: Option<SelectionSpan>,
+    /// `OSC 133` shell-integration marks, in stream order.
+    ///
+    /// Empty for a program that never sends the sequence, which leaves the rest
+    /// of the snapshot exactly as it always was. The rows are buffer
+    /// coordinates; `line + display_offset` is the visible row.
+    pub marks: Vec<SemanticMark>,
 }
 
 impl Snapshot {

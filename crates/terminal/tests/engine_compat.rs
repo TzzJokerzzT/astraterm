@@ -295,6 +295,47 @@ fn line_selection_includes_whole_lines() {
 }
 
 #[test]
+fn a_block_selection_copies_the_rectangle_padded_to_its_width() {
+    // S2: the rectangle is the cells between the two corners, one line per row.
+    // A row shorter than the rectangle is padded, so the copy keeps its shape
+    // instead of collapsing the columns.
+    let mut engine = engine(20, 3);
+    feed(&mut engine, "ab\r\ncdef\r\n");
+    engine.update_selection(0, 0, SelectionKind::Block, Side::Left);
+    engine.update_selection(3, 1, SelectionKind::SimpleOrExisting, Side::Right);
+    assert_eq!(engine.selection_text().as_deref(), Some("ab  \ncdef"));
+}
+
+#[test]
+fn a_block_selection_pads_a_blank_row_to_the_rectangle_width() {
+    let mut engine = engine(20, 3);
+    feed(&mut engine, "abcd\r\n\r\n");
+    engine.update_selection(0, 0, SelectionKind::Block, Side::Left);
+    engine.update_selection(3, 1, SelectionKind::SimpleOrExisting, Side::Right);
+    assert_eq!(engine.selection_text().as_deref(), Some("abcd\n    "));
+}
+
+#[test]
+fn a_block_selection_of_one_row_is_just_that_rectangle() {
+    let mut engine = engine(20, 3);
+    feed(&mut engine, "xy\r\nabcdef\r\n");
+    engine.update_selection(1, 1, SelectionKind::Block, Side::Left);
+    engine.update_selection(3, 1, SelectionKind::SimpleOrExisting, Side::Right);
+    assert_eq!(engine.selection_text().as_deref(), Some("bcd"));
+}
+
+#[test]
+fn a_linear_selection_keeps_its_trailing_blank_trimming() {
+    // S2 preserves the linear kind exactly: trailing blanks of the selected text
+    // are still trimmed, which is what a copy of one visual line is expected to do.
+    let mut engine = engine(20, 3);
+    feed(&mut engine, "hello   \r\nworld");
+    engine.update_selection(0, 0, SelectionKind::Simple, Side::Left);
+    engine.update_selection(7, 0, SelectionKind::SimpleOrExisting, Side::Right);
+    assert_eq!(engine.selection_text().as_deref(), Some("hello"));
+}
+
+#[test]
 fn damage_reports_rows_that_changed() {
     let mut engine = engine(10, 4);
     feed(&mut engine, "first\r\n");

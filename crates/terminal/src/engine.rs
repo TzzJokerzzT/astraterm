@@ -15,18 +15,35 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 pub use alacritty_terminal::vte::ansi::CursorShape;
-use alacritty_terminal::vte::ansi::{
-    Color as AnsiColor, CursorStyle, NamedColor, Processor,
-};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorStyle, NamedColor, Processor};
 
 use crate::image::{ImageMessage, ImageScanner};
+use crate::shell::{ShellMark, ShellMarkScanner, ShellPiece};
 use crate::snapshot::{
     CellFlags, CellSnapshot, CursorSnapshot, CursorVisual, KittyFlags, ModeFlags, RowSnapshot,
-    Snapshot, SnapshotColor,
+    SemanticMark, Snapshot, SnapshotColor,
 };
 
 /// Number of distinct colours the terminal core can report.
 const COLOR_COUNT: usize = 269;
+
+/// Most `OSC 133` marks the engine keeps at once.
+///
+/// A shell emits a handful per command, so a real session never reaches this. The
+/// cap only bounds a program that floods the sequence: without it the mark list
+/// would grow for the lifetime of the session, because marks of rows that are
+/// still in the scrollback are kept.
+pub const MAX_SEMANTIC_MARKS: usize = 4096;
+
+/// Lines of history the core is allowed above the configured scrollback.
+///
+/// [`TerminalEngine::reanchor_marks`] has to know how far the buffer scrolled, and
+/// the only thing the core reports is how far its scrollback *grew*: once the
+/// history limit is reached it stops growing and a scroll becomes invisible. The
+/// core is therefore given this small allowance and the engine trims the history
+/// back after every measurement, so a scroll always shows up as growth and the
+/// retained scrollback is still exactly the configured number of lines.
+const HISTORY_MEASUREMENT_SLACK: usize = 64;
 
 /// Grid dimensions handed to the emulation core.
 ///
@@ -193,6 +210,15 @@ pub struct TerminalEngine {
     images: ImageScanner,
     /// Image sequences captured since the last [`Self::take_images`].
     image_messages: Vec<ImageMessage>,
+    /// Splits `OSC 133` marks out of the stream in front of the VT parser, which
+    /// has no hook for them.
+    marks: ShellMarkScanner,
+    /// Marks recorded so far, in arrival order, capped by
+    /// [`MAX_SEMANTIC_MARKS`] and pruned when their row is trimmed away.
+    semantic_marks: Vec<SemanticMark>,
+    /// Scrollback length the marks were last re-anchored against. The difference
+    /// to the grid's `history_size()` is how far the content moved since.
+    measured_history: usize,
     base: Point,
     cols: u16,
     rows: u16,
@@ -205,7 +231,7 @@ impl TerminalEngine {
     pub fn new(options: EngineOptions) -> Self {
         let listener = Listener::default();
         let config = TermConfig {
-            scrolling_history: options.scrollback,
+            scrolling_history: options.scrollback.saturating_add(HISTORY_MEASUREMENT_SLACK),
             // The configured shape is only a default: `Term::cursor_style` falls
             // back to it while no program has set one, so what a program asks for
             // with `DECSCUSR` always wins.
@@ -236,6 +262,9 @@ impl TerminalEngine {
             listener,
             images: ImageScanner::new(),
             image_messages: Vec::new(),
+            marks: ShellMarkScanner::new(),
+            semantic_marks: Vec::new(),
+            measured_history: 0,
             base: Point::new(Line(0), Column(0)),
             cols,
             rows,
@@ -260,7 +289,23 @@ impl TerminalEngine {
             self.image_messages.extend(output.messages);
         }
         if !output.passthrough.is_empty() {
-            self.parser.advance(&mut self.term, &output.passthrough);
+            // S1: `OSC 133` marks are cut out of the stream and recorded against
+            // the row the cursor is on when they arrive, so one read that carries
+            // several prompts puts each mark on its own row. The text between two
+            // marks is fed line by line, so a scroll is measured where it happens
+            // and the marks recorded before it stay on their content.
+            for piece in self.marks.split(&output.passthrough) {
+                match piece {
+                    ShellPiece::Text(text) => {
+                        for line in text.split_inclusive(|&byte| byte == b'\n') {
+                            self.parser.advance(&mut self.term, line);
+                            self.reanchor_marks();
+                        }
+                    }
+                    ShellPiece::Mark(mark) => self.record_mark(mark),
+                }
+            }
+            self.prune_marks();
         }
         // Notifications go straight to the event sink: unlike images they carry no
         // payload for another subsystem, so `drain_events` is enough. Pushing them
@@ -299,6 +344,14 @@ impl TerminalEngine {
         });
         self.cols = cols;
         self.rows = rows;
+        // A resize reflows the buffer through the core, which does not report how
+        // the lines moved, so a stored row would point at whatever reflow put
+        // there. The marks are cleared rather than shown against the wrong row,
+        // and the history is trimmed back to the configured bound in case the
+        // reflow left it above.
+        self.semantic_marks.clear();
+        let history = self.term.grid().history_size();
+        self.trim_history(history);
         self.dirty = true;
     }
 
@@ -361,6 +414,103 @@ impl TerminalEngine {
         }
     }
 
+    /// Marks recorded so far, oldest first, in buffer coordinates.
+    ///
+    /// This is what [`Snapshot::marks`] carries; the snapshot is the normal way to
+    /// read them, and this accessor exists for callers that hold the engine and
+    /// want the list without building a snapshot.
+    pub fn semantic_marks(&self) -> &[SemanticMark] {
+        &self.semantic_marks
+    }
+
+    // --- Shell integration ---------------------------------------------------
+
+    /// Records an `OSC 133` mark against the row the cursor is on.
+    ///
+    /// A mark belongs to the row that was current when the sequence arrived: `A`
+    /// is written before the prompt is drawn, and `D` arrives on the last line the
+    /// command printed. The row is a buffer coordinate, which
+    /// [`Self::reanchor_marks`] keeps aligned with the content it names.
+    ///
+    /// Nothing is recorded while the alternate screen is up: those rows belong to
+    /// a different grid and would name unrelated content back on the main screen.
+    fn record_mark(&mut self, mark: ShellMark) {
+        if self.is_alternate_screen() {
+            return;
+        }
+        self.semantic_marks.push(SemanticMark {
+            kind: mark.kind,
+            line: self.term.grid().cursor.point.line.0,
+            exit_code: mark.exit_code,
+        });
+        let excess = self.semantic_marks.len().saturating_sub(MAX_SEMANTIC_MARKS);
+        if excess > 0 {
+            self.semantic_marks.drain(..excess);
+        }
+    }
+
+    /// Keeps the stored marks on the rows they were recorded against.
+    ///
+    /// `alacritty_terminal` has no scroll counter: the only observable is how far
+    /// the scrollback grew, and each line that scrolls off the screen moves every
+    /// row of content up by one and grows the history by one. Once the history
+    /// limit is reached the core stops growing it and keeps rotating the buffer,
+    /// which would make a scroll invisible. The engine hands the core
+    /// [`HISTORY_MEASUREMENT_SLACK`] lines above the configured scrollback and trims
+    /// them back after every measurement (see [`Self::trim_history`]), so the growth
+    /// it reads is always the real movement and the retained scrollback is
+    /// unchanged.
+    ///
+    /// A movement larger than the slack cannot be measured. The marks are then
+    /// dropped, because a stale row is worse than no row at all.
+    fn reanchor_marks(&mut self) {
+        if self.is_alternate_screen() {
+            // The alternate grid has no scrollback and the main grid is untouched
+            // while it is up, so nothing moved.
+            return;
+        }
+        let history = self.term.grid().history_size();
+        let growth = history.saturating_sub(self.measured_history);
+        if growth >= HISTORY_MEASUREMENT_SLACK || history < self.measured_history {
+            // Either the buffer moved further than the slack can show, or it lost
+            // lines the engine cannot account for (a history clear). Neither can be
+            // re-anchored, so the marks go.
+            self.semantic_marks.clear();
+        } else if growth > 0 {
+            for mark in &mut self.semantic_marks {
+                mark.line -= growth as i32;
+            }
+        }
+        self.trim_history(history);
+    }
+
+    /// Trims the history back to the configured scrollback, then restores the
+    /// measurement slack.
+    ///
+    /// The lines dropped here are the oldest, which is exactly the set the core
+    /// would drop itself at its limit, so the retained scrollback is the configured
+    /// number of lines. The core conflates "retain this many lines" with "do not
+    /// grow past this many", so the limit has to be raised again afterwards.
+    fn trim_history(&mut self, history: usize) {
+        let scrollback = self.options.scrollback;
+        let limit = scrollback.saturating_add(HISTORY_MEASUREMENT_SLACK);
+        if history > scrollback {
+            self.term.grid_mut().update_history(scrollback);
+            self.term.grid_mut().update_history(limit);
+        }
+        self.measured_history = self.term.grid().history_size();
+    }
+
+    /// Drops the marks of rows the scrollback trimmed away.
+    ///
+    /// The mark of a row that no longer exists would point at whatever content
+    /// took its place, so it goes with the row. Retained marks are also capped by
+    /// [`MAX_SEMANTIC_MARKS`], which is enforced when one is recorded.
+    fn prune_marks(&mut self) {
+        let topmost = self.term.topmost_line().0;
+        self.semantic_marks.retain(|mark| mark.line >= topmost);
+    }
+
     /// Drains emulator events (title changes, clipboard requests, bell, replies).
     pub fn drain_events(&mut self) -> Vec<TerminalEvent> {
         self.listener
@@ -387,6 +537,8 @@ impl TerminalEngine {
             });
         }
 
+        // S8: one `OSC 8` destination per linked run, shared by its cells.
+        let mut links = HyperlinkRun::default();
         for indexed in content.display_iter {
             let point = indexed.point;
             let cell = indexed.cell;
@@ -402,7 +554,7 @@ impl TerminalEngine {
             while row_entry.cells.len() < column {
                 row_entry.cells.push(CellSnapshot::default());
             }
-            row_entry.cells.push(convert_cell(cell));
+            row_entry.cells.push(convert_cell(cell, &mut links));
         }
         for row in &mut lines {
             row.cells
@@ -410,6 +562,8 @@ impl TerminalEngine {
         }
 
         let damaged_rows = collect_damage(&mut self.term, self.rows as usize);
+        self.prune_marks();
+        let marks = self.semantic_marks.clone();
 
         let cursor = {
             let cursor_row = cursor_info.point.line.0 + display_offset as i32;
@@ -445,6 +599,7 @@ impl TerminalEngine {
                 end: (range.end.line.0, range.end.column.0),
                 is_block: range.is_block,
             }),
+            marks,
         }
     }
 
@@ -494,8 +649,40 @@ impl TerminalEngine {
     }
 
     /// The selected text, if any.
+    ///
+    /// S2: a linear selection is handed to the core, which keeps its existing
+    /// traversal and its trailing-blank trimming. A block selection is a
+    /// rectangle: one line per row, each exactly as wide as the rectangle, so the
+    /// copy keeps its shape. Short rows are padded with blanks and long ones are
+    /// cut at the rectangle's edge.
     pub fn selection_text(&self) -> Option<String> {
-        self.term.selection_to_string()
+        match &self.term.selection {
+            Some(selection) if selection.ty == SelectionType::Block => self.block_selection_text(),
+            _ => self.term.selection_to_string(),
+        }
+    }
+
+    /// Text of the active block selection: the rectangle between its two corners.
+    fn block_selection_text(&self) -> Option<String> {
+        let range = self.term.selection.as_ref()?.to_range(&self.term)?;
+        let (start, end) = (range.start, range.end);
+        let mut text = String::new();
+        for line in start.line.0..=end.line.0 {
+            if line > start.line.0 {
+                text.push('\n');
+            }
+            for column in start.column.0..=end.column.0 {
+                let cell = &self.term.grid()[Point::new(Line(line), Column(column))];
+                // A wide character's spacer paints nothing of its own, and a
+                // blank cell is the rectangle's padding either way.
+                text.push(if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    ' '
+                } else {
+                    cell.c
+                });
+            }
+        }
+        Some(text)
     }
 
     /// Converts a screen position into a buffer position, honouring scrollback.
@@ -580,14 +767,43 @@ pub enum SelectionKind {
     Block,
 }
 
-fn convert_cell(cell: &alacritty_terminal::term::cell::Cell) -> CellSnapshot {
+/// Shares one `OSC 8` destination across the cells that carry it.
+///
+/// S8/B21: the destination used to be cloned into every cell of a span, so a
+/// screen linked to a long URI cost `cells × length`. The cells of a contiguous
+/// run now hold clones of one [`Arc`], which is a refcount bump, so the same
+/// screen costs the URI once per run plus one pointer per cell.
+#[derive(Default)]
+struct HyperlinkRun {
+    /// The destination of the previous linked cell, reused when the next one is
+    /// the same.
+    current: Option<Arc<str>>,
+}
+
+impl HyperlinkRun {
+    fn intern(&mut self, uri: &str) -> Arc<str> {
+        match &self.current {
+            Some(shared) if shared.as_ref() == uri => Arc::clone(shared),
+            _ => {
+                let shared: Arc<str> = Arc::from(uri);
+                self.current = Some(Arc::clone(&shared));
+                shared
+            }
+        }
+    }
+}
+
+fn convert_cell(
+    cell: &alacritty_terminal::term::cell::Cell,
+    links: &mut HyperlinkRun,
+) -> CellSnapshot {
     let flags = cell.flags;
     // B6: the `OSC 8` destination is not part of the visible text, so it has to
     // travel beside it or a click can only guess from the characters. The model
     // clears its cursor template on an empty URI, so a closed span yields `None`.
     let hyperlink = cell
         .hyperlink()
-        .map(|link| link.uri().to_owned().into_boxed_str())
+        .map(|link| links.intern(link.uri()))
         .filter(|uri| !uri.is_empty());
     CellSnapshot {
         ch: cell.c,
@@ -921,6 +1137,7 @@ mod zerowidth_snapshot_tests {
 #[cfg(test)]
 mod hyperlink_snapshot_tests {
     use super::{EngineOptions, TerminalEngine};
+    use crate::snapshot::CellSnapshot;
 
     /// A one-line engine wide enough for the whole link and the text after it.
     fn engine() -> TerminalEngine {
@@ -967,6 +1184,40 @@ mod hyperlink_snapshot_tests {
     }
 
     #[test]
+    fn a_row_of_linked_cells_shares_one_destination() {
+        // S8/B21: the destination used to be cloned into every cell of the span,
+        // so linking a row to a long URI cost `cells × length`. The cells of a run
+        // now refer to one string, which the equal data pointers prove from
+        // outside: the accessor still returns `&str`, unchanged.
+        let uri = "https://example.com/a-destination-long-enough-to-matter";
+        let text = "x".repeat(30);
+        let mut engine = engine();
+        engine.process(format!("\x1b]8;;{uri}\x1b\\{text}").as_bytes());
+
+        let snapshot = engine.snapshot();
+        let first = snapshot
+            .cell(0, 0)
+            .and_then(CellSnapshot::hyperlink)
+            .expect("the first cell of the span is linked");
+        assert_eq!(first, uri);
+        for column in 1..30 {
+            let link = snapshot
+                .cell(column, 0)
+                .and_then(CellSnapshot::hyperlink)
+                .unwrap_or_else(|| panic!("column {column} belongs to the span"));
+            assert!(
+                std::ptr::eq(link, first),
+                "column {column} points at the run's one allocation"
+            );
+        }
+        assert_eq!(
+            snapshot.cell(30, 0).and_then(CellSnapshot::hyperlink),
+            None,
+            "the cell after the span carries no destination"
+        );
+    }
+
+    #[test]
     fn a_cell_without_a_hyperlink_carries_none() {
         let mut engine = engine();
         engine.process(b"plain text");
@@ -978,9 +1229,7 @@ mod hyperlink_snapshot_tests {
         // `OSC 8 ; ; ST` with an empty URI ends the span: the model clears the
         // cursor template, so everything written afterwards is unlinked.
         let mut engine = engine();
-        engine.process(
-            b"\x1b]8;;https://example.com/target\x1b\\link\x1b]8;;\x1b\\plain",
-        );
+        engine.process(b"\x1b]8;;https://example.com/target\x1b\\link\x1b]8;;\x1b\\plain");
         assert_eq!(
             hyperlink_at(&mut engine, 0).as_deref(),
             Some("https://example.com/target"),

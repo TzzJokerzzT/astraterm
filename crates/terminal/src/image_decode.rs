@@ -17,9 +17,8 @@
 //!   the pixel buffer is allocated, so a lying PNG header cannot reserve an
 //!   enormous buffer;
 //! * a payload that claims a feature this slice does not implement (iTerm2
-//!   download-only, kitty formats other than PNG/RGB/RGBA, sixel HLS colour
-//!   spaces) is refused with [`DecodeError::Unsupported`] instead of being
-//!   decoded wrongly;
+//!   download-only, kitty formats other than PNG/RGB/RGBA) is refused with
+//!   [`DecodeError::Unsupported`] instead of being decoded wrongly;
 //! * the state a kitty chunked transfer needs is bounded too: [`ImageDecoder`]
 //!   holds at most [`MAX_IN_FLIGHT_TRANSFERS`] transfers, caps each one at
 //!   [`DecodeLimits::max_input_bytes`] and their total at twice that, and evicts
@@ -93,8 +92,7 @@ impl DecodedImage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeError {
     /// The protocol, or a feature of it, is outside this slice (iTerm2
-    /// download-only, kitty formats other than PNG/RGB/RGBA, sixel HLS colour
-    /// definitions).
+    /// download-only, kitty formats other than PNG/RGB/RGBA).
     Unsupported,
     /// The payload does not parse as the protocol it claims.
     Malformed(&'static str),
@@ -751,17 +749,17 @@ fn default_sixel_palette() -> [[u8; 4]; 256] {
     let mut palette = [[0u8; 4]; 256];
     for (index, entry) in palette.iter_mut().enumerate() {
         let base = BASE[index % BASE.len()];
-        entry[0] = scale_percent(base[0]);
-        entry[1] = scale_percent(base[1]);
-        entry[2] = scale_percent(base[2]);
+        entry[0] = scale_percent(u32::from(base[0]));
+        entry[1] = scale_percent(u32::from(base[1]));
+        entry[2] = scale_percent(u32::from(base[2]));
         entry[3] = 0xff;
     }
     palette
 }
 
 /// Converts a 0-100 sixel colour component to 0-255, clamping out-of-range input.
-fn scale_percent(value: u8) -> u8 {
-    (u32::from(value.min(100)) * 255 / 100) as u8
+fn scale_percent(value: u32) -> u8 {
+    (value.min(100) * 255 / 100) as u8
 }
 
 /// Decodes a sixel DCS payload into an RGBA image with a transparent background.
@@ -932,7 +930,8 @@ fn parse_raster_attributes(
     Ok(pos)
 }
 
-/// Parses `#Pc` (select) and `#Pc;2;Pr;Pg;Pb` (define RGB, components 0-100).
+/// Parses `#Pc` (select), `#Pc;2;Pr;Pg;Pb` (define RGB, components 0-100) and
+/// `#Pc;1;Ph;Pl;Ps` (define HLS).
 fn parse_sixel_color(
     payload: &[u8],
     pos: usize,
@@ -951,27 +950,59 @@ fn parse_sixel_color(
     let (space, next) = parse_number_at(payload, pos + 1)?;
     pos = next;
     match space {
-        // HLS colour space is legal sixel but not implemented in this slice.
-        1 => return Err(DecodeError::Unsupported),
-        2 => {}
+        // 1 is HLS and 2 is RGB.
+        1 | 2 => {}
         _ => return Err(DecodeError::Malformed("sixel colour space")),
     }
-    let mut components = [0u8; 3];
+    let mut components = [0u32; 3];
     for component in &mut components {
         if pos >= payload.len() || payload[pos] != b';' {
             return Err(DecodeError::Malformed("sixel colour definition"));
         }
         let (value, next) = parse_number_at(payload, pos + 1)?;
-        *component = value.min(100) as u8;
+        *component = value;
         pos = next;
     }
-    palette[*color] = [
-        scale_percent(components[0]),
-        scale_percent(components[1]),
-        scale_percent(components[2]),
-        0xff,
-    ];
+    palette[*color] = match space {
+        // HLS: the hue is an angle in degrees, so it is not a 0-100 component and
+        // is not clamped like one.
+        1 => hls_to_rgba(components[0], components[1], components[2]),
+        _ => [
+            scale_percent(components[0]),
+            scale_percent(components[1]),
+            scale_percent(components[2]),
+            0xff,
+        ],
+    };
     Ok(pos)
+}
+
+/// Converts an HLS triple to RGBA: hue in degrees, lightness and saturation in
+/// percent, as the sixel specification defines them.
+///
+/// The hue is an angle, so a value outside `0..360` wraps around the circle
+/// (`480°` is `120°`) instead of being refused; lightness and saturation are
+/// clamped to `0..=100` like the RGB components. No input can panic: the result is
+/// clamped to the byte range.
+fn hls_to_rgba(hue: u32, lightness: u32, saturation: u32) -> [u8; 4] {
+    let sector = (hue % 360) as f32 / 60.0;
+    let lightness = f32::from(lightness.min(100) as u8) / 100.0;
+    let saturation = f32::from(saturation.min(100) as u8) / 100.0;
+
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let second = chroma * (1.0 - ((sector % 2.0) - 1.0).abs());
+    let (red, green, blue) = match sector as u32 {
+        0 => (chroma, second, 0.0),
+        1 => (second, chroma, 0.0),
+        2 => (0.0, chroma, second),
+        3 => (0.0, second, chroma),
+        4 => (second, 0.0, chroma),
+        _ => (chroma, 0.0, second),
+    };
+
+    let base = lightness - chroma / 2.0;
+    let channel = |value: f32| ((value + base) * 255.0).round().clamp(0.0, 255.0) as u8;
+    [channel(red), channel(green), channel(blue), 0xff]
 }
 
 // --- byte helpers ------------------------------------------------------------
@@ -1295,6 +1326,81 @@ mod tests {
             matches!(err, DecodeError::TooLarge { .. }),
             "expected TooLarge, got {err:?}"
         );
+    }
+
+    /// Decodes one sixel payload defining its palette through `definitions`.
+    fn sixel_with(definitions: &[u8]) -> Result<DecodedImage, DecodeError> {
+        decode(
+            &message(ImageProtocol::Sixel, definitions.to_vec()),
+            &DecodeLimits::default(),
+        )
+    }
+
+    #[test]
+    fn sixel_hls_palette_paints_the_encoded_colours() {
+        // S5: `#Pc;1;Ph;Pl;Ps` is HLS, with the hue in degrees; before this the
+        // decoder refused it with `Unsupported` and the image was dropped.
+        let image = sixel_with(b"#0;1;0;50;100#0@#1;1;120;50;100#1@#2;1;240;50;100#2@").unwrap();
+        assert_eq!((image.width, image.height), (3, 1));
+        assert_eq!(image.pixel(0, 0), Some([255, 0, 0, 255]), "hue 0 is red");
+        assert_eq!(
+            image.pixel(1, 0),
+            Some([0, 255, 0, 255]),
+            "hue 120 is green"
+        );
+        assert_eq!(image.pixel(2, 0), Some([0, 0, 255, 255]), "hue 240 is blue");
+    }
+
+    #[test]
+    fn sixel_hls_lightness_is_the_grey_ramp() {
+        let image = sixel_with(b"#0;1;0;40;0#0@#1;1;0;0;0#1@#2;1;0;100;0#2@").unwrap();
+        assert_eq!(image.pixel(0, 0), Some([102, 102, 102, 255]), "L 40");
+        assert_eq!(image.pixel(1, 0), Some([0, 0, 0, 255]), "L 0 is black");
+        assert_eq!(
+            image.pixel(2, 0),
+            Some([255, 255, 255, 255]),
+            "L 100 is white whatever the hue"
+        );
+    }
+
+    #[test]
+    fn sixel_hls_hue_matches_the_rgb_form_of_the_same_colour() {
+        // The fidelity claim of S5: an HLS definition and the RGB definition of the
+        // same colour must paint the same pixels.
+        let hls = sixel_with(b"#0;1;60;50;100#0@").unwrap();
+        let rgb = sixel_with(b"#0;2;100;100;0#0@").unwrap();
+        assert_eq!(hls.pixel(0, 0), Some([255, 255, 0, 255]));
+        assert_eq!(hls.pixel(0, 0), rgb.pixel(0, 0));
+    }
+
+    #[test]
+    fn sixel_hls_hue_wraps_around_the_circle() {
+        let image = sixel_with(b"#0;1;360;50;100#0@#1;1;480;50;100#1@").unwrap();
+        assert_eq!(image.pixel(0, 0), Some([255, 0, 0, 255]), "360 == 0");
+        assert_eq!(image.pixel(1, 0), Some([0, 255, 0, 255]), "480 == 120");
+    }
+
+    #[test]
+    fn an_unrepresentable_sixel_palette_is_refused_without_panicking() {
+        for payload in [
+            // Truncated definitions: a component is missing.
+            &b"#0;1;0;50"[..],
+            &b"#0;1;0;50;"[..],
+            // A hue that cannot be decoded into a number.
+            &b"#0;1;99999999999999999999;50;100"[..],
+            // A colour space that is neither RGB nor HLS.
+            &b"#0;3;0;50;100"[..],
+            // A register outside the 256 the protocol addresses.
+            &b"#256;1;0;50;100"[..],
+        ] {
+            let err = sixel_with(payload)
+                .err()
+                .unwrap_or_else(|| panic!("{payload:?} must be refused, not decoded"));
+            assert!(
+                matches!(err, DecodeError::Malformed(_)),
+                "{payload:?} gave {err:?}"
+            );
+        }
     }
 
     // --- kitty chunked transfers (S1.1 - S1.4) -------------------------------
