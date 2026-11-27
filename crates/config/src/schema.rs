@@ -102,6 +102,44 @@ impl CopyOnSelectTarget {
         [CopyOnSelectTarget::Clipboard, CopyOnSelectTarget::Primary];
 }
 
+/// What a program's bell (`BEL`, `0x07`) does.
+///
+/// The bell is the oldest notification a terminal has, and each value buys a
+/// different kind of attention:
+///
+/// * `none` — the bell is dropped: no status message, no flash, no sound.
+/// * `visual` (the default) — the bell is answered on screen: the status bar reports
+///   `bell: <title>` for the session that rang it, as it does today, and the pane's
+///   border flashes.
+/// * `audible` — the bell rings the speaker instead of drawing attention on screen.
+///
+/// `visual` is the default because a `BEL` already becomes a status message today, so
+/// an existing configuration keeps a visible answer to the bell rather than falling
+/// silent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BellMode {
+    /// Ignore the bell entirely.
+    None,
+    /// Answer on screen: the status message as today, plus a border flash.
+    #[default]
+    Visual,
+    /// Ring the speaker.
+    Audible,
+}
+
+impl BellMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            BellMode::None => "none",
+            BellMode::Visual => "visual",
+            BellMode::Audible => "audible",
+        }
+    }
+
+    pub const ALL: [BellMode; 3] = [BellMode::None, BellMode::Visual, BellMode::Audible];
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalConfig {
@@ -139,6 +177,10 @@ pub struct TerminalConfig {
     pub open_urls_on_click: bool,
     /// Characters that terminate a word for double-click selection.
     pub word_delimiters: String,
+    /// What a program's bell does: `none`, `visual` (a border flash, the default) or
+    /// `audible`. The default keeps today's behaviour, a `BEL` becoming a status
+    /// message.
+    pub bell: BellMode,
 }
 
 impl Default for TerminalConfig {
@@ -156,6 +198,7 @@ impl Default for TerminalConfig {
             copy_on_select_target: CopyOnSelectTarget::Clipboard,
             open_urls_on_click: true,
             word_delimiters: " /\\()\"'-.,:;<>~!@#$%^&*|+=[]{}~?".to_owned(),
+            bell: BellMode::Visual,
         }
     }
 }
@@ -437,9 +480,9 @@ pub struct PerformanceConfig {
     pub gpu_acceleration: bool,
     /// Reduce work: no cursor blink, no effects, batched redraws.
     pub low_power_mode: bool,
-    /// Intended upper bound for idle redraws per second. Accepted and validated but
-    /// not read yet: idle redraws are still governed by the blink timer alone, so any
-    /// value here has no effect today.
+    /// Upper bound for idle redraws per second, `0` meaning no cap. It only limits
+    /// redraws while nothing happens: output, input and a resize always request their
+    /// frame immediately.
     pub max_fps_when_idle: u32,
 }
 
@@ -795,5 +838,63 @@ mod tests {
 
         let config: Config = toml::from_str("[terminal]\nkitty_keyboard = false\n").unwrap();
         assert!(!config.terminal.kitty_keyboard);
+    }
+
+    #[test]
+    fn bell_defaults_to_visual_because_a_bell_is_visible_today() {
+        assert_eq!(
+            TerminalConfig::default().bell,
+            BellMode::Visual,
+            "a BEL already becomes a status message, so the default has to keep a \
+             visible response instead of dropping it"
+        );
+        assert_eq!(Config::default().terminal.bell, BellMode::Visual);
+
+        // Absent key and absent table both keep the default.
+        let config: Config = toml::from_str("[terminal]\nscrollback_lines = 500\n").unwrap();
+        assert_eq!(config.terminal.bell, BellMode::Visual);
+        let config: Config = toml::from_str("[font]\nsize = 12.0\n").unwrap();
+        assert_eq!(config.terminal.bell, BellMode::Visual);
+    }
+
+    #[test]
+    fn bell_parses_all_three_accepted_values() {
+        for (text, expected) in [
+            ("none", BellMode::None),
+            ("visual", BellMode::Visual),
+            ("audible", BellMode::Audible),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[terminal]\nbell = \"{text}\"\n")).unwrap();
+            assert_eq!(config.terminal.bell, expected, "{text}");
+            assert_eq!(expected.label(), text);
+        }
+        assert_eq!(
+            BellMode::ALL.map(BellMode::label),
+            ["none", "visual", "audible"],
+            "the panel cycles through exactly these three values"
+        );
+    }
+
+    #[test]
+    fn an_unknown_bell_value_is_rejected_by_the_loader() {
+        // Enum-valued, so a typo is an error the user has to fix rather than a warning
+        // about an ignored setting: the loader refuses the file the way it does for
+        // `cursor` and `copy_on_select_target`.
+        let error = crate::loader::parse_str("[terminal]\nbell = \"beep\"\n", "test")
+            .expect_err("an unknown bell is not a valid configuration");
+        let message = error.to_string();
+        assert!(
+            matches!(error, crate::loader::LoadError::Parse { .. }),
+            "a bad value is a parse error, not an io error: {message}"
+        );
+        assert!(
+            message.contains("bell"),
+            "the error names the key: {message}"
+        );
+        assert!(
+            message.contains("none") && message.contains("visual") && message.contains("audible"),
+            "the error lists the accepted values: {message}"
+        );
     }
 }

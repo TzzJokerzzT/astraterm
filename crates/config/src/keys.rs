@@ -389,6 +389,8 @@ pub enum ActionId {
     ScrollPageDown,
     ScrollToTop,
     ScrollToBottom,
+    JumpToPreviousPrompt,
+    JumpToNextPrompt,
     OpenSettings,
     ReloadConfig,
     ToggleStatusBar,
@@ -399,7 +401,7 @@ pub enum ActionId {
 }
 
 impl ActionId {
-    pub const ALL: [ActionId; 48] = [
+    pub const ALL: [ActionId; 50] = [
         ActionId::NewTab,
         ActionId::CloseTab,
         ActionId::RenameTab,
@@ -441,6 +443,8 @@ impl ActionId {
         ActionId::ScrollPageDown,
         ActionId::ScrollToTop,
         ActionId::ScrollToBottom,
+        ActionId::JumpToPreviousPrompt,
+        ActionId::JumpToNextPrompt,
         ActionId::OpenSettings,
         ActionId::ReloadConfig,
         ActionId::ToggleStatusBar,
@@ -494,6 +498,8 @@ impl ActionId {
             ActionId::ScrollPageDown => "scroll-page-down",
             ActionId::ScrollToTop => "scroll-to-top",
             ActionId::ScrollToBottom => "scroll-to-bottom",
+            ActionId::JumpToPreviousPrompt => "jump-to-previous-prompt",
+            ActionId::JumpToNextPrompt => "jump-to-next-prompt",
             ActionId::OpenSettings => "open-settings",
             ActionId::ReloadConfig => "reload-config",
             ActionId::ToggleStatusBar => "toggle-status-bar",
@@ -548,6 +554,8 @@ impl ActionId {
             ActionId::ScrollPageDown => "Scroll page down",
             ActionId::ScrollToTop => "Scroll to top",
             ActionId::ScrollToBottom => "Scroll to bottom",
+            ActionId::JumpToPreviousPrompt => "Jump to previous prompt",
+            ActionId::JumpToNextPrompt => "Jump to next prompt",
             ActionId::OpenSettings => "Open settings",
             ActionId::ReloadConfig => "Reload configuration",
             ActionId::ToggleStatusBar => "Toggle status bar",
@@ -622,6 +630,8 @@ pub fn default_keybindings() -> BTreeMap<String, String> {
         (ScrollPageDown, "shift+pagedown"),
         (ScrollToTop, "ctrl+shift+home"),
         (ScrollToBottom, "ctrl+shift+end"),
+        (JumpToPreviousPrompt, "ctrl+shift+up"),
+        (JumpToNextPrompt, "ctrl+shift+down"),
         (OpenSettings, "ctrl+comma"),
         (ReloadConfig, "ctrl+shift+comma"),
         (ToggleStatusBar, "ctrl+shift+s"),
@@ -813,6 +823,43 @@ mod tests {
                 .get("toggle-floating")
                 .map(String::as_str),
             Some("ctrl+shift+grave")
+        );
+    }
+
+    /// S1: the two prompt jumps are real, remappable bindings, and their chords must not
+    /// shadow the navigation chords they sit between.
+    #[test]
+    fn the_prompt_jumps_are_bound_and_shadow_nothing() {
+        let keymap = Keymap::build(&default_keybindings());
+        let previous: Chord = "ctrl+shift+up".parse().unwrap();
+        let next: Chord = "ctrl+shift+down".parse().unwrap();
+        assert_eq!(
+            keymap.action_for(&previous),
+            Some(ActionId::JumpToPreviousPrompt)
+        );
+        assert_eq!(keymap.action_for(&next), Some(ActionId::JumpToNextPrompt));
+        assert_eq!(
+            ActionId::JumpToPreviousPrompt.as_str(),
+            "jump-to-previous-prompt"
+        );
+        assert_eq!(ActionId::JumpToNextPrompt.as_str(), "jump-to-next-prompt");
+        assert!(
+            keymap.conflicts().is_empty(),
+            "the default keymap has no two actions on one chord"
+        );
+        // The chords around them still mean what they did: pane focus is Alt, the
+        // divider resize is Ctrl+Alt, and neither was claimed by the new bindings.
+        assert_eq!(
+            keymap.action_for(&"alt+up".parse().unwrap()),
+            Some(ActionId::FocusUp)
+        );
+        assert_eq!(
+            keymap.action_for(&"ctrl+alt+up".parse().unwrap()),
+            Some(ActionId::ResizeUp)
+        );
+        assert_eq!(
+            keymap.action_for(&"ctrl+alt+down".parse().unwrap()),
+            Some(ActionId::ResizeDown)
         );
     }
 

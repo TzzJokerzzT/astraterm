@@ -98,6 +98,7 @@ impl Section {
                 Field::WorkingDirectory,
                 Field::ConfirmOnClose,
                 Field::CopyOnSelect,
+                Field::Bell,
                 Field::OpenUrlsOnClick,
                 Field::WordDelimiters,
             ],
@@ -983,6 +984,32 @@ mod tests {
         let draft = panel.draft().clone();
         panel.on_saved(&draft, Vec::new());
         assert!(!panel.is_dirty());
+    }
+
+    #[test]
+    fn the_bell_row_lives_in_the_terminal_section_and_applies_live() {
+        let mut panel = panel();
+        panel.section = Section::Terminal;
+        while panel.focused_field() != Some(Field::Bell) {
+            panel.handle_key(PanelKey::Down);
+        }
+        let row = panel
+            .lines()
+            .into_iter()
+            .find(|line| line.text.trim_start() == "Bell")
+            .expect("the Terminal section shows a Bell row");
+        assert_eq!(
+            row.value.as_deref(),
+            Some("visual"),
+            "the default keeps today's visible answer to a BEL"
+        );
+
+        panel.handle_key(PanelKey::Right);
+        assert_eq!(panel.draft().terminal.bell, astraterm_config::BellMode::Audible);
+        assert!(
+            !panel.needs_restart(),
+            "the bell is read when a BEL arrives, so no new session is needed"
+        );
     }
 
     #[test]

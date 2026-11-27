@@ -5,7 +5,7 @@
 //! variant here and one row in its section, which keeps the panel and the TOML
 //! schema in step (they share the same typed model).
 
-use astraterm_config::schema::CursorStyle;
+use astraterm_config::schema::{BellMode, CursorStyle};
 use astraterm_config::{Config, Palette, Rgb, TabBarPosition};
 
 /// Which palette colour the theme editor is changing.
@@ -129,6 +129,7 @@ pub enum Field {
     WorkingDirectory,
     ConfirmOnClose,
     CopyOnSelect,
+    Bell,
     OpenUrlsOnClick,
     WordDelimiters,
     // Window
@@ -185,6 +186,7 @@ impl Field {
             Field::WorkingDirectory => "working-directory",
             Field::ConfirmOnClose => "confirm-on-close",
             Field::CopyOnSelect => "copy-on-select",
+            Field::Bell => "bell",
             Field::OpenUrlsOnClick => "open-urls-on-click",
             Field::WordDelimiters => "word-delimiters",
             Field::WindowWidth => "window-width",
@@ -237,6 +239,7 @@ impl Field {
             Field::WorkingDirectory => "Working directory",
             Field::ConfirmOnClose => "Confirm before closing",
             Field::CopyOnSelect => "Copy on select",
+            Field::Bell => "Bell",
             Field::OpenUrlsOnClick => "Open URLs on click",
             Field::WordDelimiters => "Word delimiters",
             Field::WindowWidth => "Window width",
@@ -289,6 +292,7 @@ impl Field {
             | Field::WorkingDirectory
             | Field::ConfirmOnClose
             | Field::CopyOnSelect
+            | Field::Bell
             | Field::OpenUrlsOnClick
             | Field::WordDelimiters => "terminal",
             Field::WindowWidth
@@ -323,6 +327,7 @@ impl Field {
             Field::Theme | Field::CursorStyle | Field::TabBarPosition | Field::PaletteEntry => {
                 FieldKind::Choice
             }
+            Field::Bell => FieldKind::Choice,
             Field::PaddingX
             | Field::PaddingY
             | Field::PaneGap
@@ -382,6 +387,7 @@ impl Field {
             Field::WorkingDirectory => config.terminal.working_directory.label(),
             Field::ConfirmOnClose => yes_no(config.terminal.confirm_on_close),
             Field::CopyOnSelect => yes_no(config.terminal.copy_on_select),
+            Field::Bell => config.terminal.bell.label().to_owned(),
             Field::OpenUrlsOnClick => yes_no(config.terminal.open_urls_on_click),
             Field::WordDelimiters => config.terminal.word_delimiters.clone(),
             Field::WindowWidth => config.window.width.to_string(),
@@ -461,6 +467,14 @@ impl Field {
                 config.terminal.confirm_on_close = !config.terminal.confirm_on_close;
             }
             Field::CopyOnSelect => config.terminal.copy_on_select = !config.terminal.copy_on_select,
+            Field::Bell => {
+                let current = BellMode::ALL
+                    .iter()
+                    .position(|mode| *mode == config.terminal.bell)
+                    .unwrap_or(0);
+                let next = step_index(current, BellMode::ALL.len(), up);
+                config.terminal.bell = BellMode::ALL[next];
+            }
             Field::OpenUrlsOnClick => {
                 config.terminal.open_urls_on_click = !config.terminal.open_urls_on_click;
             }
@@ -634,6 +648,7 @@ impl Field {
             Field::CopyOnSelect => {
                 config.terminal.copy_on_select = defaults.terminal.copy_on_select
             }
+            Field::Bell => config.terminal.bell = defaults.terminal.bell,
             Field::OpenUrlsOnClick => {
                 config.terminal.open_urls_on_click = defaults.terminal.open_urls_on_click
             }
@@ -895,6 +910,53 @@ mod tests {
         assert!(Field::ScrollbackLines.requires_restart());
         assert!(!Field::FontSize.requires_restart());
         assert!(!Field::ShowStatusBar.requires_restart());
+        assert!(
+            !Field::Bell.requires_restart(),
+            "the bell is read when a BEL arrives, so every session alive follows the \
+             configured value at the next bell"
+        );
+    }
+
+    #[test]
+    fn the_bell_field_cycles_through_exactly_the_three_values() {
+        let mut config = Config::default();
+        assert_eq!(
+            config.terminal.bell,
+            BellMode::Visual,
+            "the panel starts from the configured default"
+        );
+        assert_eq!(Field::Bell.path(), "terminal");
+        assert_eq!(Field::Bell.kind(), FieldKind::Choice);
+        assert_eq!(Field::Bell.value(&config), "visual");
+
+        let start = config.terminal.bell;
+        let mut seen = vec![start];
+        for _ in 0..BellMode::ALL.len() {
+            Field::Bell.step(&mut config, 1, &themes());
+            seen.push(config.terminal.bell);
+        }
+        assert_eq!(config.terminal.bell, start, "it wraps after the third value");
+        assert_eq!(config.terminal.bell, BellMode::Visual);
+        let mut labels: Vec<&str> = seen.iter().map(|mode| mode.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels,
+            ["audible", "none", "visual"],
+            "exactly the three documented values, nothing else"
+        );
+
+        // The value the row shows is the one the model holds, both ways.
+        Field::Bell.step(&mut config, -1, &themes());
+        assert_eq!(config.terminal.bell, BellMode::None);
+        Field::Bell.step(&mut config, -1, &themes());
+        assert_eq!(config.terminal.bell, BellMode::Audible);
+        assert_eq!(Field::Bell.value(&config), config.terminal.bell.label());
+        assert_eq!(Field::Bell.value(&config), "audible");
+
+        Field::Bell.reset(&mut config);
+        assert_eq!(config.terminal.bell, Config::default().terminal.bell);
+        assert_eq!(Field::Bell.value(&config), "visual");
     }
 
     #[test]

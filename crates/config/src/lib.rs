@@ -18,8 +18,8 @@ pub mod writer;
 pub use keys::{ActionId, Chord, Key, Keymap, Modifiers, NamedKey};
 pub use palette::{Color, Palette, Rgb};
 pub use schema::{
-    AppearanceConfig, Config, CursorStyle, FontConfig, PerformanceConfig, Profile, TabBarPosition,
-    TerminalConfig, WindowConfig, WorkingDirectory, WorkspaceConfig,
+    AppearanceConfig, BellMode, Config, CursorStyle, FontConfig, PerformanceConfig, Profile,
+    TabBarPosition, TerminalConfig, WindowConfig, WorkingDirectory, WorkspaceConfig,
 };
 pub use service::{ConfigService, SaveOutcome};
 pub use themes::{

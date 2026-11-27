@@ -100,6 +100,14 @@ pub enum AppCommand {
         delta: i32,
     },
     ScrollToBottom,
+    /// Scrolls the viewport to the previous or the next shell prompt.
+    ///
+    /// The prompts come from the `OSC 133` marks of the focused pane's session, so a
+    /// program that never sends them makes this command do nothing at all. `forward`
+    /// moves towards the live screen.
+    JumpToPrompt {
+        forward: bool,
+    },
     IncreaseFontSize,
     DecreaseFontSize,
     ResetFontSize,
