@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use astraterm_config::schema::{Config, CursorStyle, TabBarPosition};
+use astraterm_config::schema::{Config, TabBarPosition};
 use astraterm_config::themes::Theme;
 use astraterm_core::{
     CellMetrics, FocusDirection, PaneId, Rect, SessionId, Size, SplitAxis, TabId, WindowId,
@@ -23,7 +23,7 @@ use astraterm_settings_ui::panel::{PanelStyle, SettingsPanel};
 use astraterm_terminal::TerminalEngine;
 use astraterm_terminal::image::{ImagePlacement, ImageStore};
 use astraterm_terminal::image_decode::{DecodeLimits, ImageDecoder};
-use astraterm_terminal::snapshot::{CellSnapshot, CursorVisual, RowSnapshot, Snapshot};
+use astraterm_terminal::snapshot::{CellSnapshot, RowSnapshot, Snapshot};
 use astraterm_workspace::tree::SplitId;
 use astraterm_workspace::{LayoutConfig, Pane, Tab, WindowState};
 
@@ -1073,16 +1073,6 @@ impl WindowUi {
         self.window.request_redraw();
     }
 
-    /// Cursor visual style from configuration.
-    pub fn cursor_style(&self) -> CursorVisual {
-        match self.config.appearance.cursor {
-            CursorStyle::Block => CursorVisual::Block,
-            CursorStyle::Beam => CursorVisual::Beam,
-            CursorStyle::Underline => CursorVisual::Underline,
-            CursorStyle::Hollow => CursorVisual::HollowBlock,
-        }
-    }
-
     /// Composes the frame.
     ///
     /// The mosaic is composed first: tab strip, panes, status bar. Everything that
@@ -1118,7 +1108,6 @@ impl WindowUi {
             let options = PaintOptions {
                 padding: self.padding(),
                 draw_cursor: focused == Some(*pane) && self.cursor_phase,
-                cursor_override: Some(self.cursor_style()),
                 // The translucent terminal background is painted once by the scene
                 // clear; painting the pane background again would compound alpha and
                 // make the window look opaque.
@@ -1223,7 +1212,6 @@ impl WindowUi {
                 // A visible floating terminal always has the focus, so the cursor of
                 // its focused pane follows the same blink phase as any other pane.
                 draw_cursor: focused == pane && self.cursor_phase,
-                cursor_override: Some(self.cursor_style()),
                 // Opaque: the floating terminal covers the mosaic, and the mosaic must
                 // not show through its cells.
                 background_alpha: 1.0,

@@ -9,6 +9,7 @@ use astraterm_core::{PaneId, SessionEvent};
 use astraterm_pty::PtySpec;
 use astraterm_session::lifecycle::EngineSpec;
 use astraterm_session::{SessionManager, SessionSpec};
+use astraterm_terminal::CursorShape;
 
 fn flood_spec(program: &str, args: &[&str]) -> SessionSpec {
     SessionSpec {
@@ -21,6 +22,9 @@ fn flood_spec(program: &str, args: &[&str]) -> SessionSpec {
             scrollback: 1000,
             allow_osc52: false,
             kitty_keyboard: true,
+            // Not what these tests exercise: the cursor keeps today's default.
+            cursor_shape: CursorShape::Block,
+            cursor_blink: true,
         },
         profile: None,
         label: None,

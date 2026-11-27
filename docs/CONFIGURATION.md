@@ -237,8 +237,8 @@ Colours, chrome and cursor.
 | `background_blur` | bool | `false` | `true`, `false` | **Accepted but not applied.** Blur is a compositor rule and no request is sent. Validation warns while `[window] opacity >= 1.0`, where blur could not be visible anyway. |
 | `padding_x` | integer | `12` | 0–512; above 512 is an error, above 64 warns | Horizontal inner padding of every pane, in logical pixels (scaled by the display scale). Both padding keys report under the field name `appearance.padding_x`. Applies live. |
 | `padding_y` | integer | `10` | 0–512; above 512 is an error, above 64 warns | Vertical inner padding of every pane, same rules as `padding_x`. Applies live. |
-| `cursor` | string | `"block"` | `"block"`, `"beam"`, `"underline"`, `"hollow"` (lowercase exactly; anything else is a parse error) | Shape painted at the cursor of the focused pane; it overrides a shape the running program requests (`DECSCUSR`). `hollow` is an outlined block. Applies live. |
-| `cursor_blink` | bool | `true` | `true`, `false` | Toggles the cursor every 530 ms. Disabled while `[performance] low_power_mode` is on and while a panel or overlay is open. Applies live. |
+| `cursor` | string | `"block"` | `"block"`, `"beam"`, `"underline"`, `"hollow"` (lowercase exactly; anything else is a parse error) | **Default** cursor shape: the shape a pane starts with, before any program asks for one. A running program's `DECSCUSR` (`CSI Ps SP q`) outranks it, so an editor that switches its cursor per mode gets exactly that, and `CSI 0 SP q` returns to this value. `hollow` is an outlined block. Read when a pane's engine is created, so a change affects panes opened afterwards; a program's own shape is never replaced. |
+| `cursor_blink` | bool | `true` | `true`, `false` | Default blink flag for a new pane's engine, and the flag that drives the 530 ms toggle. Disabled while `[performance] low_power_mode` is on and while a panel or overlay is open. |
 | `style` | string | `"minimal-dark"` | any string | **Accepted but not applied.** Stored only, for forward compatibility; no code reads it. |
 | `show_status_bar` | bool | `false` | `true`, `false`; warns when it is on and all three `status_bar_*` keys are `false` | Shows the bottom bar: title, directory, grid size, `ALT`/`SEL`, search state and transient messages on the left; the enabled segments on the right. `toggle-status-bar` flips it and persists the result. Applies live. |
 | `status_bar_cpu` | bool | `true` | `true`, `false` | Adds `CPU nn%` from `/proc/stat`. Sampled once per second and only while the bar is visible. Applies live. |
@@ -519,13 +519,18 @@ rebuilds the keymap, resolves the theme, pushes the configuration into every
 window (font metrics, layout, palette, text-cache invalidation), resizes PTY
 grids and refreshes titles.
 
-Live without a restart: theme and palette, cursor shape/blink, padding, pane gap,
+Live without a restart: theme and palette, cursor blink, padding, pane gap,
 divider thickness, tab bar position, strip width, compact tabs, status bar and its
 segments, clock format, font family/size/weight/line height/letter spacing,
 ligatures, `integer_cell_width`, `hinting`, `solid_shades`,
 opacity, `terminal.images`, all keybindings, `confirm_on_close`, `copy_on_select`,
 `copy_on_select_target`, `open_urls_on_click`, `close_pane_when_shell_exits`,
 `notifications.on`.
+
+`appearance.cursor` is an exception inside that list: it is the default shape a
+pane's engine starts with, so a change reaches panes created after it. A pane that
+is already running keeps the shape its engine was built with until the program
+sets one with `DECSCUSR`, which always wins.
 
 Requires a new session or window (`Field::requires_restart()`):
 `terminal.term`, `terminal.scrollback_lines`, `terminal.working_directory`,
@@ -580,8 +585,8 @@ theme = "midnight"          # built-in or user theme, case-insensitive
 background_blur = false     # accepted; blur is a compositor rule
 padding_x = 12              # horizontal pane padding, logical pixels (max 512)
 padding_y = 10              # vertical pane padding, logical pixels (max 512)
-cursor = "block"            # block | beam | underline | hollow
-cursor_blink = true         # 530 ms toggle; off in low-power mode
+cursor = "block"            # block | beam | underline | hollow (default; DECSCUSR wins)
+cursor_blink = true         # 530 ms toggle; default flag for a new pane
 style = "minimal-dark"      # accepted; stored only
 show_status_bar = true      # bottom bar with session info and readings
 status_bar_cpu = true       # CPU segment from /proc/stat

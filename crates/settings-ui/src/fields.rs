@@ -686,6 +686,9 @@ impl Field {
                 | Field::GpuAcceleration
                 | Field::WorkingDirectory
                 | Field::Shell
+                // The shape a pane paints is settled when its engine is built, because
+                // it is only a default for programs that never send DECSCUSR.
+                | Field::CursorStyle
         )
     }
 }
@@ -885,6 +888,10 @@ mod tests {
     #[test]
     fn fields_that_need_a_new_session_are_declared() {
         assert!(Field::Term.requires_restart());
+        assert!(
+            Field::CursorStyle.requires_restart(),
+            "a cursor shape reaches panes created after the change, not the open ones"
+        );
         assert!(Field::ScrollbackLines.requires_restart());
         assert!(!Field::FontSize.requires_restart());
         assert!(!Field::ShowStatusBar.requires_restart());

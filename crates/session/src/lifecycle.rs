@@ -7,11 +7,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use astraterm_config::{Config, Profile, WorkingDirectory};
+use astraterm_config::{Config, CursorStyle, Profile, WorkingDirectory};
 use astraterm_core::ProfileId;
 use astraterm_pty::PtySpec;
 
-use astraterm_terminal::EngineOptions;
+use astraterm_terminal::{CursorShape, EngineOptions};
 
 /// Everything needed to create one session.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,6 +33,10 @@ pub struct EngineSpec {
     pub allow_osc52: bool,
     /// Advertise the Kitty keyboard protocol (on unless configured otherwise).
     pub kitty_keyboard: bool,
+    /// Default cursor shape; a program's `DECSCUSR` outranks it.
+    pub cursor_shape: CursorShape,
+    /// Default cursor blink flag; a program's `DECSCUSR` outranks it.
+    pub cursor_blink: bool,
 }
 
 impl SessionSpec {
@@ -41,10 +45,27 @@ impl SessionSpec {
             cols,
             rows,
             scrollback: self.engine.scrollback,
-            hollow_cursor: false,
+            cursor_shape: self.engine.cursor_shape,
+            cursor_blink: self.engine.cursor_blink,
             allow_osc52: self.engine.allow_osc52,
             kitty_keyboard: self.engine.kitty_keyboard,
         }
+    }
+}
+
+/// Maps the configured default cursor style onto the engine's shape.
+///
+/// Every value the configuration accepts has an engine equivalent, and the match
+/// is exhaustive on purpose: a configuration value with no mapping must fail to
+/// compile instead of falling back to a shape the user did not choose. The
+/// engine's wider set (it also knows `Hidden`) stays reachable through
+/// `DECSCUSR` alone.
+fn engine_cursor_shape(shape: CursorStyle) -> CursorShape {
+    match shape {
+        CursorStyle::Block => CursorShape::Block,
+        CursorStyle::Beam => CursorShape::Beam,
+        CursorStyle::Underline => CursorShape::Underline,
+        CursorStyle::Hollow => CursorShape::HollowBlock,
     }
 }
 
@@ -196,6 +217,8 @@ fn build_spec(
             // Escape sequences are untrusted input: OSC 52 stays off.
             allow_osc52: false,
             kitty_keyboard: config.terminal.kitty_keyboard,
+            cursor_shape: engine_cursor_shape(config.appearance.cursor),
+            cursor_blink: config.appearance.cursor_blink,
         },
         profile: profile_id,
         label: profile
@@ -225,6 +248,51 @@ fn resolve_directory(policy: &WorkingDirectory, current: Option<&Path>) -> Optio
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// Shape a new pane paints when no program has asked for one.
+    fn default_painted_shape(config: &Config) -> astraterm_terminal::CursorVisual {
+        let mut engine = astraterm_terminal::TerminalEngine::new(
+            session_spec(config, None, None, None, 40, 10, (8, 16)).engine_options(40, 10),
+        );
+        engine
+            .snapshot()
+            .cursor
+            .expect("a fresh pane shows its cursor")
+            .shape
+    }
+
+    #[test]
+    fn the_configured_cursor_is_the_shape_a_new_pane_paints() {
+        // S2: with no `DECSCUSR` written yet, the configured shape is the default,
+        // for every value the configuration accepts.
+        for (configured, expected) in [
+            (
+                astraterm_config::CursorStyle::Block,
+                astraterm_terminal::CursorVisual::Block,
+            ),
+            (
+                astraterm_config::CursorStyle::Beam,
+                astraterm_terminal::CursorVisual::Beam,
+            ),
+            (
+                astraterm_config::CursorStyle::Underline,
+                astraterm_terminal::CursorVisual::Underline,
+            ),
+            (
+                astraterm_config::CursorStyle::Hollow,
+                astraterm_terminal::CursorVisual::HollowBlock,
+            ),
+        ] {
+            let mut config = Config::default();
+            config.appearance.cursor = configured;
+            assert_eq!(
+                default_painted_shape(&config),
+                expected,
+                "configured `{}` must be the default a new pane paints",
+                configured.label()
+            );
+        }
+    }
 
     #[test]
     fn auto_shell_follows_the_environment() {

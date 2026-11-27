@@ -290,8 +290,6 @@ pub struct PaintOptions {
     pub padding: Padding,
     /// Draw the cursor (hidden when the pane is not focused, or while blinking off).
     pub draw_cursor: bool,
-    /// Cursor style override from configuration (`None` follows the application).
-    pub cursor_override: Option<CursorVisual>,
     /// Alpha multiplier for the pane background, so a translucent window still
     /// paints opaque text.
     pub background_alpha: f32,
@@ -309,7 +307,6 @@ impl Default for PaintOptions {
         Self {
             padding: Padding { x: 0, y: 0 },
             draw_cursor: true,
-            cursor_override: None,
             background_alpha: 1.0,
             focused: true,
             show_border: true,
@@ -1055,7 +1052,9 @@ fn paint_cursor(
     metrics: CellMetrics,
     options: PaintOptions,
 ) {
-    let style = options.cursor_override.unwrap_or(cursor.shape);
+    // The engine's snapshot is the only source of truth for the shape: the
+    // configured one when no program asked, the program's own after `DECSCUSR`.
+    let style = cursor.shape;
     if style == CursorVisual::Hidden {
         return;
     }
@@ -1231,7 +1230,7 @@ mod tests {
     use super::*;
     use astraterm_config::schema::FontConfig;
     use astraterm_terminal::TerminalEngine;
-    use astraterm_terminal::engine::EngineOptions;
+    use astraterm_terminal::engine::{CursorShape, EngineOptions};
     use cosmic_text::FontSystem;
 
     use crate::text::{ClusterMeasurer, ClusterWidths, TextStyle};
@@ -1275,13 +1274,59 @@ mod tests {
     }
 
     fn snapshot(text: &str, cols: u16, rows: u16) -> Snapshot {
+        snapshot_with_cursor(text, cols, rows, &EngineOptions::default())
+    }
+
+    /// A snapshot from an engine configured with `options`, after `text` was fed.
+    fn snapshot_with_cursor(
+        text: &str,
+        cols: u16,
+        rows: u16,
+        options: &EngineOptions,
+    ) -> Snapshot {
         let mut engine = TerminalEngine::new(EngineOptions {
             cols,
             rows,
-            ..Default::default()
+            ..options.clone()
         });
         engine.process(text.as_bytes());
         engine.snapshot()
+    }
+
+    /// The cursor-coloured quads of a scene that fit inside one cell. The focused
+    /// pane border shares the accent colour, so anything larger is chrome.
+    fn cursor_quads(scene: &Scene, metrics: CellMetrics) -> Vec<Quad> {
+        let cell_width = metrics.width.ceil().max(1.0) as u32;
+        scene
+            .quads
+            .iter()
+            .copied()
+            .filter(|quad| {
+                quad.color == rgba(theme().cursor, 1.0)
+                    && quad.rect.width <= cell_width
+                    && quad.rect.height <= metrics.height
+            })
+            .collect()
+    }
+
+    /// Paints one focused pane over an engine configured with `options` and returns
+    /// the cursor quads with the metrics they were painted with.
+    fn paint_configured(text: &str, options: &EngineOptions) -> (Vec<Quad>, CellMetrics) {
+        let snapshot = snapshot_with_cursor(text, 5, 1, options);
+        let mut font = TestFont::new();
+        let (metrics, mut measure) = font.painter();
+        let mut scene = Scene::default();
+        paint_pane(
+            &mut scene,
+            0,
+            Rect::new(0, 0, 100, 40),
+            &snapshot,
+            &theme(),
+            metrics,
+            PaintOptions::default(),
+            &mut measure,
+        );
+        (cursor_quads(&scene, metrics), metrics)
     }
 
     #[test]
@@ -2238,62 +2283,111 @@ mod tests {
     }
 
     #[test]
-    fn cursor_is_painted_in_its_configured_shape() {
-        let snapshot = snapshot("x", 5, 1);
-        let mut font = TestFont::new();
-        let (metrics, mut measure) = font.painter();
-        let mut block = Scene::default();
-        paint_pane(
-            &mut block,
-            0,
-            Rect::new(0, 0, 100, 40),
-            &snapshot,
-            &theme(),
-            metrics,
-            PaintOptions::default(),
-            &mut measure,
+    fn the_configured_shape_is_the_one_painted() {
+        // S2/S5: no program has written `DECSCUSR`, so the configured shape — any
+        // of the engine's shapes, not a block-or-hollow choice — is what paints.
+        let (block, metrics) = paint_configured(
+            "x",
+            &EngineOptions {
+                cursor_shape: CursorShape::Block,
+                ..Default::default()
+            },
         );
-        // The focused pane border shares the accent colour, so compare cell-sized
-        // quads only.
         let cell_width = metrics.width.ceil().max(1.0) as u32;
-        let cell_quads = |scene: &Scene| -> Vec<Quad> {
-            scene
-                .quads
-                .iter()
-                .copied()
-                .filter(|quad| {
-                    quad.color == rgba(theme().cursor, 1.0)
-                        && quad.rect.width <= cell_width
-                        && quad.rect.height <= metrics.height
-                })
-                .collect()
-        };
-        let block_quads = cell_quads(&block);
         assert_eq!(
-            block_quads.len(),
+            block.len(),
             1,
             "block cursor draws exactly one filled cell quad"
         );
-        assert_eq!(block_quads[0].rect.width, cell_width);
-        assert_eq!(block_quads[0].rect.height, metrics.height);
+        assert_eq!(block[0].rect.width, cell_width);
+        assert_eq!(block[0].rect.height, metrics.height);
 
-        let mut beam = Scene::default();
-        paint_pane(
-            &mut beam,
-            0,
-            Rect::new(0, 0, 100, 40),
-            &snapshot,
-            &theme(),
-            metrics,
-            PaintOptions {
-                cursor_override: Some(CursorVisual::Beam),
+        let (beam, metrics) = paint_configured(
+            "x",
+            &EngineOptions {
+                cursor_shape: CursorShape::Beam,
                 ..Default::default()
             },
-            &mut measure,
         );
-        let beam_quads = cell_quads(&beam);
-        assert_eq!(beam_quads.len(), 1);
-        assert!(beam_quads[0].rect.width <= 2, "beam cursor is a thin bar");
+        assert_eq!(beam.len(), 1);
+        assert!(beam[0].rect.width <= 2, "beam cursor is a thin bar");
+        assert_eq!(beam[0].rect.height, metrics.height);
+
+        let (underline, metrics) = paint_configured(
+            "x",
+            &EngineOptions {
+                cursor_shape: CursorShape::Underline,
+                ..Default::default()
+            },
+        );
+        assert_eq!(underline.len(), 1);
+        assert!(
+            underline[0].rect.height <= 2,
+            "underline cursor is a thin line at the cell's foot"
+        );
+        assert_eq!(underline[0].rect.width, cell_width);
+        assert_eq!(underline[0].rect.height, 2.min(metrics.height));
+
+        let (hollow, _) = paint_configured(
+            "x",
+            &EngineOptions {
+                cursor_shape: CursorShape::HollowBlock,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            hollow.len(),
+            4,
+            "hollow block cursor draws an outline of four bars"
+        );
+    }
+
+    #[test]
+    fn a_configured_hidden_cursor_paints_nothing() {
+        // S5: the engine's full shape set survives, `Hidden` included.
+        let (quads, _) = paint_configured(
+            "x",
+            &EngineOptions {
+                cursor_shape: CursorShape::Hidden,
+                ..Default::default()
+            },
+        );
+        assert!(quads.is_empty(), "a hidden cursor paints no quad");
+    }
+
+    #[test]
+    fn the_painted_shape_follows_the_program_in_both_directions() {
+        // S1/S4: the snapshot is the only source of truth. A program's `DECSCUSR`
+        // paints, and `CSI 0 SP q` restores the configured default.
+        let configured = EngineOptions {
+            cursor_shape: CursorShape::HollowBlock,
+            ..Default::default()
+        };
+        assert_eq!(paint_configured("x", &configured).0.len(), 4);
+
+        let (beam, metrics) = paint_configured("\x1b[5 q", &configured);
+        assert_eq!(
+            beam.len(),
+            1,
+            "the program's beam replaces the configured hollow block"
+        );
+        assert!(beam[0].rect.width <= 2);
+        assert_eq!(beam[0].rect.height, metrics.height);
+
+        let (back_to_block, metrics) = paint_configured("\x1b[5 q\x1b[2 q", &configured);
+        assert_eq!(back_to_block.len(), 1);
+        assert_eq!(
+            back_to_block[0].rect.width,
+            metrics.width.ceil().max(1.0) as u32
+        );
+        assert_eq!(back_to_block[0].rect.height, metrics.height);
+
+        let (restored, _) = paint_configured("\x1b[5 q\x1b[0 q", &configured);
+        assert_eq!(
+            restored.len(),
+            4,
+            "`CSI 0 SP q` restores the configured default shape"
+        );
     }
 
     #[test]

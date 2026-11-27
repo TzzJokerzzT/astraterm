@@ -14,8 +14,9 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
+pub use alacritty_terminal::vte::ansi::CursorShape;
 use alacritty_terminal::vte::ansi::{
-    Color as AnsiColor, CursorShape, CursorStyle, NamedColor, Processor,
+    Color as AnsiColor, CursorStyle, NamedColor, Processor,
 };
 
 use crate::image::{ImageMessage, ImageScanner};
@@ -147,8 +148,14 @@ pub struct EngineOptions {
     pub cols: u16,
     pub rows: u16,
     pub scrollback: usize,
-    /// Advertise a hollow block cursor instead of a filled block.
-    pub hollow_cursor: bool,
+    /// Default cursor shape, used until an application asks for another one.
+    ///
+    /// `DECSCUSR` (`CSI Ps SP q`) outranks this: the shape a program requests is
+    /// the shape painted, and `CSI 0 SP q` restores this default. Every shape the
+    /// emulator knows is carried, not just a block-or-hollow choice.
+    pub cursor_shape: CursorShape,
+    /// Blink the cursor by default, until an application overrides the style.
+    pub cursor_blink: bool,
     /// Allow applications to read and write the system clipboard with OSC 52.
     ///
     /// Off by default: OSC 52 is untrusted terminal input and writing the user's
@@ -168,7 +175,8 @@ impl Default for EngineOptions {
             cols: 80,
             rows: 24,
             scrollback: 10_000,
-            hollow_cursor: false,
+            cursor_shape: CursorShape::Block,
+            cursor_blink: true,
             allow_osc52: false,
             kitty_keyboard: true,
         }
@@ -198,13 +206,12 @@ impl TerminalEngine {
         let listener = Listener::default();
         let config = TermConfig {
             scrolling_history: options.scrollback,
+            // The configured shape is only a default: `Term::cursor_style` falls
+            // back to it while no program has set one, so what a program asks for
+            // with `DECSCUSR` always wins.
             default_cursor_style: CursorStyle {
-                shape: if options.hollow_cursor {
-                    CursorShape::HollowBlock
-                } else {
-                    CursorShape::Block
-                },
-                blinking: true,
+                shape: options.cursor_shape,
+                blinking: options.cursor_blink,
             },
             // Applications query this with `CSI ? u`; answering is what makes them
             // speak the protocol, and a test guards the xterm fallback.
@@ -1011,6 +1018,124 @@ mod hyperlink_snapshot_tests {
         assert!(
             snapshot.lines[0].cells[0].flags.underline,
             "a link the program did not style is still marked"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cursor_precedence_tests {
+    use super::{CursorShape, EngineOptions, TerminalEngine};
+    use crate::snapshot::CursorVisual;
+    use alacritty_terminal::vte::ansi::CursorStyle;
+
+    fn engine(cursor_shape: CursorShape, cursor_blink: bool) -> TerminalEngine {
+        TerminalEngine::new(EngineOptions {
+            cols: 8,
+            rows: 2,
+            cursor_shape,
+            cursor_blink,
+            ..Default::default()
+        })
+    }
+
+    /// Shape the renderer would paint, as the snapshot reports it.
+    fn painted_shape(engine: &mut TerminalEngine) -> Option<CursorVisual> {
+        engine.snapshot().cursor.map(|cursor| cursor.shape)
+    }
+
+    #[test]
+    fn the_configured_shape_is_the_default_for_every_engine_shape() {
+        // S2/S5: with nothing written yet, the configured shape is the default, and
+        // every shape the engine knows survives the mapping.
+        for (configured, expected) in [
+            (CursorShape::Block, CursorVisual::Block),
+            (CursorShape::Beam, CursorVisual::Beam),
+            (CursorShape::Underline, CursorVisual::Underline),
+            (CursorShape::HollowBlock, CursorVisual::HollowBlock),
+            (CursorShape::Hidden, CursorVisual::Hidden),
+        ] {
+            let mut engine = engine(configured, true);
+            assert_eq!(
+                painted_shape(&mut engine),
+                Some(expected),
+                "configured {configured:?} with no DECSCUSR"
+            );
+        }
+    }
+
+    #[test]
+    fn the_program_shape_wins_and_the_default_comes_back() {
+        // S1: `DECSCUSR` is recorded and outranks the configured default in both
+        // directions; `CSI 0 SP q` drops the program's choice and restores it.
+        let mut engine = engine(CursorShape::HollowBlock, true);
+
+        engine.process(b"\x1b[5 q");
+        assert_eq!(painted_shape(&mut engine), Some(CursorVisual::Beam));
+
+        engine.process(b"\x1b[2 q");
+        assert_eq!(painted_shape(&mut engine), Some(CursorVisual::Block));
+
+        engine.process(b"\x1b[0 q");
+        assert_eq!(
+            painted_shape(&mut engine),
+            Some(CursorVisual::HollowBlock),
+            "DECSCUSR 0 asks for the default"
+        );
+    }
+
+    #[test]
+    fn hiding_the_cursor_suppresses_it_and_showing_restores_its_shape() {
+        // S3: `DECTCEM` still suppresses the cursor, and showing it again paints the
+        // shape the program asked for.
+        let mut engine = engine(CursorShape::Underline, true);
+        engine.process(b"\x1b[5 q");
+
+        engine.process(b"\x1b[?25l");
+        assert!(engine.snapshot().cursor.is_none());
+
+        engine.process(b"\x1b[?25h");
+        assert_eq!(painted_shape(&mut engine), Some(CursorVisual::Beam));
+    }
+
+    #[test]
+    fn the_configured_blink_flag_seeds_the_default_style() {
+        // The configured blink flag is the engine's default until a program sets its
+        // own style.
+        assert_eq!(
+            engine(CursorShape::Beam, false).term.cursor_style(),
+            CursorStyle {
+                shape: CursorShape::Beam,
+                blinking: false,
+            }
+        );
+        assert_eq!(
+            engine(CursorShape::Beam, true).term.cursor_style(),
+            CursorStyle {
+                shape: CursorShape::Beam,
+                blinking: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_program_setting_its_own_style_replaces_the_default_blink_flag() {
+        // A program that asks for a steady style outranks the configured flag.
+        let mut engine = engine(CursorShape::Beam, true);
+        engine.process(b"\x1b[2 q");
+        assert_eq!(
+            engine.term.cursor_style(),
+            CursorStyle {
+                shape: CursorShape::Block,
+                blinking: false,
+            }
+        );
+        engine.process(b"\x1b[0 q");
+        assert_eq!(
+            engine.term.cursor_style(),
+            CursorStyle {
+                shape: CursorShape::Beam,
+                blinking: true,
+            }
         );
     }
 }

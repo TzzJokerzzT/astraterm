@@ -15,7 +15,7 @@ pub mod search;
 pub mod snapshot;
 
 pub use alacritty_terminal::index::Side;
-pub use engine::{EngineOptions, SelectionKind, TerminalEngine, TerminalEvent};
+pub use engine::{CursorShape, EngineOptions, SelectionKind, TerminalEngine, TerminalEvent};
 pub use image::{
     ImageMessage, ImagePlacement, ImageProtocol, ImageScanner, ImageStore, MAX_IMAGE_BYTES,
     MAX_PENDING_BYTES, ScanOutput, TerminalNotification,
